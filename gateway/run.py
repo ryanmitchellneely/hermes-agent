@@ -10600,6 +10600,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._start_loop_liveness_guards(self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
+        # P1 refuse-to-serve (T1000 Distillery port): required secrets must
+        # resolve before we bind adapters. Placeholder/unreadable → loud exit.
+        try:
+            from hermes_cli.startup_secrets import assert_gateway_may_bind
+
+            telegram_on = False
+            try:
+                from gateway.config import Platform
+
+                tcfg = (self.config.platforms or {}).get(Platform.TELEGRAM)
+                telegram_on = bool(tcfg and tcfg.enabled)
+            except Exception:
+                telegram_on = bool(
+                    (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+                    or (os.getenv("TELEGRAM_TOKEN") or "").strip()
+                )
+            if telegram_on:
+                under_pytest = bool(os.environ.get("PYTEST_CURRENT_TEST"))
+                if under_pytest:
+                    logger.debug("Startup secrets gate skipped under pytest")
+                else:
+                    assert_gateway_may_bind(telegram_enabled=True)
+                    logger.info("Startup secrets gate: OK (telegram token resolved)")
+        except SystemExit:
+            raise
+        except Exception as _sec_exc:
+            skip = os.environ.get("HERMES_SKIP_STARTUP_SECRETS", "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+            if skip:
+                logger.warning(
+                    "Startup secrets gate error ignored (HERMES_SKIP_STARTUP_SECRETS): %s",
+                    _sec_exc,
+                )
+            else:
+                logger.error("Startup secrets gate failed closed: %s", _sec_exc)
+                raise SystemExit(f"Startup secrets gate failed: {_sec_exc}") from _sec_exc
+
+
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
         # ``hermes setup``, their unit file may still encode the old

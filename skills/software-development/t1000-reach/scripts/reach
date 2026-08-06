@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# t1000-reach — desk router: reach <peer> <verb> [--json] [-- peer-args...]
+# Always prints one reach.receipt.v1 JSON object on stdout.
+# Exit: 0 ok | 1 peer/runtime error | 2 usage/unknown
+set -euo pipefail
+
+# Resolve symlinks so ~/.t1000/bin/reach still finds skill scripts/
+_REACH_SRC="${BASH_SOURCE[0]}"
+while [[ -L "$_REACH_SRC" ]]; do
+  _link="$(readlink "$_REACH_SRC")"
+  if [[ "$_link" == /* ]]; then
+    _REACH_SRC="$_link"
+  else
+    _REACH_SRC="$(cd "$(dirname "$_REACH_SRC")" && pwd)/$_link"
+  fi
+done
+REACH_ROOT="$(cd "$(dirname "$_REACH_SRC")/.." && pwd)"
+# shellcheck source=lib/receipt.sh
+source "$REACH_ROOT/scripts/lib/receipt.sh"
+# shellcheck source=peers/spark.sh
+source "$REACH_ROOT/scripts/peers/spark.sh"
+# shellcheck source=peers/juice.sh
+source "$REACH_ROOT/scripts/peers/juice.sh"
+# shellcheck source=peers/kevin.sh
+source "$REACH_ROOT/scripts/peers/kevin.sh"
+# shellcheck source=peers/pulp.sh
+source "$REACH_ROOT/scripts/peers/pulp.sh"
+# shellcheck source=peers/popper.sh
+source "$REACH_ROOT/scripts/peers/popper.sh"
+# shellcheck source=peers/all.sh
+source "$REACH_ROOT/scripts/peers/all.sh"
+# shellcheck source=peers/_stub.sh
+source "$REACH_ROOT/scripts/peers/_stub.sh"
+
+usage() {
+  cat <<'EOF' >&2
+Usage: reach <peer> <verb> [--json] [-- <peer-args>...]
+       reach peers
+       reach help
+       reach schema
+
+Peers:
+  spark|dgx     status | models | tunnel-up|up | tunnel-down|down   [LIVE A1]
+  juice|j       status | doctor | classify | triage                 [LIVE A2]
+  kevin|chamberlain  status | notify | inbox                        [LIVE A3]
+  pulp          status | ask                                        [LIVE A4]
+  popper|labs   status | labs | findings                            [LIVE A5]
+  carlton       inbox                                               [via kevin inbox]
+  all|mesh      status                                              [LIVE B]
+
+Kevin notify (Chamberlain Telegram on k2vps):
+  reach kevin notify -- --dry-run --subject "Hi" --body "..."
+  REACH_KEVIN_FIRE=1 reach kevin notify -- --fire --subject "Hi" --body "..."
+
+Receipt: reach.receipt.v1 JSON on stdout. Exit 0 only if ok=true.
+EOF
+}
+
+canonicalize_peer() {
+  case "$1" in
+    spark|dgx) echo spark ;;
+    juice|j) echo juice ;;
+    pulp) echo pulp ;;
+    popper|labs) echo popper ;;
+    kevin|chamberlain) echo kevin ;;
+    carlton) echo carlton ;;
+    all|mesh) echo all ;;
+    *) echo "" ;;
+  esac
+}
+
+cmd_peers() {
+  python3 - <<'PY'
+import json
+from datetime import datetime, timezone
+peers = [
+  {"peer":"spark","aliases":["dgx"],"verbs":["status","models","tunnel-up","tunnel-down"],"layer":"L0","status":"live"},
+  {"peer":"juice","aliases":["j"],"verbs":["status","doctor","classify","triage"],"layer":"L0","status":"live"},
+  {"peer":"kevin","aliases":["chamberlain"],"verbs":["status","notify","inbox"],"layer":"L2","status":"live"},
+  {"peer":"pulp","aliases":[],"verbs":["status","ask"],"layer":"L1","status":"live"},
+  {"peer":"popper","aliases":["labs"],"verbs":["status","labs","findings"],"layer":"L0","status":"live"},
+  {"peer":"carlton","aliases":[],"verbs":["inbox"],"layer":"L3","status":"live"},
+  {"peer":"all","aliases":["mesh"],"verbs":["status"],"layer":"L0","status":"live"},
+]
+print(json.dumps({
+  "schema_version": "reach.receipt.v1",
+  "peer": "all",
+  "verb": "peers",
+  "ok": True,
+  "grade": "live",
+  "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+  "layer": "L0",
+  "receipt": {"kind": "local", "id": "reach-peers"},
+  "detail": {"peers": peers},
+}, indent=2))
+PY
+}
+
+cmd_schema() {
+  if [[ -f "$REACH_ROOT/references/receipt.schema.json" ]]; then
+    cat "$REACH_ROOT/references/receipt.schema.json"
+    return 0
+  fi
+  emit_receipt all schema false error L0 none "-" "{}" missing_schema "receipt.schema.json not found"
+  return 1
+}
+
+main() {
+  if [[ $# -lt 1 ]]; then
+    usage
+    emit_receipt all help false error L0 none "-" "{}" usage "missing peer/verb"
+    return 2
+  fi
+
+  # strip optional --json; keep a bare -- as peer-arg separator
+  local args=()
+  local a
+  for a in "$@"; do
+    [[ "$a" == "--json" ]] && continue
+    args+=("$a")
+  done
+  set -- "${args[@]}"
+
+  local peer_in="${1:-}" verb="${2:-}"
+  case "$peer_in" in
+    help|-h|--help)
+      usage
+      emit_receipt all help true live L0 local "reach-help" '{"see":"stderr usage"}'
+      return 0
+      ;;
+    peers)
+      cmd_peers
+      return 0
+      ;;
+    schema)
+      cmd_schema
+      return $?
+      ;;
+  esac
+
+  if [[ -z "$verb" ]]; then
+    usage
+    emit_receipt all "$peer_in" false error L0 none "-" "{}" usage "missing verb"
+    return 2
+  fi
+
+  local peer
+  peer="$(canonicalize_peer "$peer_in")"
+  if [[ -z "$peer" ]]; then
+    emit_receipt all "$verb" false error L0 none "-" \
+      "$(python3 -c 'import json,sys; print(json.dumps({"input":sys.argv[1]}))' "$peer_in")" \
+      unknown_peer "Unknown peer '$peer_in' — try: reach peers"
+    return 2
+  fi
+
+  # remaining args after peer verb; drop optional leading --
+  shift 2 || true
+  if [[ "${1:-}" == "--" ]]; then
+    shift || true
+  fi
+  local -a peer_args=("$@")
+
+  case "$peer" in
+    spark)
+      spark_dispatch "$verb"
+      return $?
+      ;;
+    juice)
+      juice_dispatch "$verb" "${peer_args[@]+"${peer_args[@]}"}"
+      return $?
+      ;;
+    pulp)
+      pulp_dispatch "$verb" "${peer_args[@]+"${peer_args[@]}"}"
+      return $?
+      ;;
+    popper)
+      popper_dispatch "$verb" "${peer_args[@]+"${peer_args[@]}"}"
+      return $?
+      ;;
+    kevin)
+      kevin_dispatch "$verb" "${peer_args[@]+"${peer_args[@]}"}"
+      return $?
+      ;;
+    carlton)
+      # Carlton = agent mail only until Kevin OK — reuse inbox verb surface
+      if [[ "$verb" == "inbox" ]]; then
+        kevin_dispatch inbox "${peer_args[@]+"${peer_args[@]}"}"
+        return $?
+      fi
+      stub_peer carlton "$verb" L3 A3
+      return $?
+      ;;
+    all)
+      all_dispatch "$verb" "${peer_args[@]+"${peer_args[@]}"}"
+      return $?
+      ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# The "juice" launcher name covers TWO DISTINCT CODEBASES:
+#   1. T1000's Electron cockpit (this repo, $ROOT/apps/desktop) — the desktop UI.
+#   2. sovereign_juice, a separate CLI package at
+#      ~/Documents/sovereign-consulting/tools/juice ($JUICE_ROOT below).
+# `juice` with no args (or --doctor) launches (1), the Electron cockpit.
+# `juice status|classify|threshold|r0|ui|review|live|triage` dispatches to (2)
+# via run_juice_cli, importing sovereign_juice from $JUICE_ROOT.
+# Do not assume a claim true of one codebase (e.g. "no Buzz wiring") holds for
+# the other just because both answer to "juice" — see
+# t1000_juice_spark_delineation_2026_07_27 for the recorded wrong-claim incident
+# this conflation already produced.
+set -euo pipefail
+
+ROOT="${T1000_ROOT:-$HOME/Documents/T1000}"
+JUICE_ROOT="$HOME/Documents/sovereign-consulting/tools/juice"
+export HERMES_HOME="${HERMES_HOME:-$HOME/.t1000}"
+export JUICE_T1000_RUNTIME=1
+export HERMES_DESKTOP_HERMES_ROOT="$ROOT"
+export HERMES_DESKTOP_PYTHON="${HERMES_DESKTOP_PYTHON:-$ROOT/venv/bin/python}"
+export PATH="$ROOT/venv/bin:$PATH"
+unset ELECTRON_RUN_AS_NODE
+
+usage() {
+  cat <<'EOF'
+Usage:
+  juice                             Launch the Juice desktop cockpit (Electron).
+  juice status                      Print the Juice capability status (v2 JSON).
+  juice classify --channel C --synthetic   Classify one synthetic comm on stdin (needs the Spark lane).
+  juice r0 <action>                 Run an R0 gate action (eval / rollover* / lock*).
+  juice threshold <phrase|set> --minimum N   Inspect or set the R0 semantic threshold.
+  juice review <status|phrase|sign>   Inspect or re-sign the R0 golden labels.
+  juice live <phrase|authorize|status|revoke>   Authorize read-only classification of REAL comms.
+  juice ui [--port N]               Serve the loopback unlock-ladder web UI.
+  juice --doctor                 Run the Juice and T1000-engine readiness checks.
+  juice --install-user-launcher  Install Juice launchers and T1000 compatibility aliases.
+  juice --help                   Show this help.
+EOF
+}
+
+is_juice_source() {
+  [[ -f "$1/sovereign_juice/__main__.py" && -f "$1/sovereign_juice/status.py" ]]
+}
+
+# Front door to the Python CLI (status / classify / r0 / threshold / ui). Runs
+# from the Juice source with the package importable, inheriting the ambient
+# environment so the Spark lane vars (SPARK_ENABLED, SPARK_BASE_URL, ...) reach
+# classify and r0. Args are forwarded verbatim.
+run_juice_cli() {
+  if ! is_juice_source "$JUICE_ROOT"; then
+    echo "Sovereign Juice source not found at $JUICE_ROOT." >&2
+    exit 1
+  fi
+  cd "$JUICE_ROOT"
+  export PYTHONPATH=".:sovereign_juice${PYTHONPATH:+:$PYTHONPATH}"
+  exec python3 -m sovereign_juice "$@"
+}
+
+juice_status_readable() {
+  local juice_root="$1"
+  local output
+  local -a juice_env=(env -i "HOME=$HOME" "PATH=$PATH" "PYTHONPATH=.:sovereign_juice" "TMPDIR=${TMPDIR:-/tmp}")
+
+  if [[ -n "${JUICE_HOME:-}" ]]; then
+    juice_env+=("JUICE_HOME=$JUICE_HOME")
+  fi
+
+  output=$(
+    cd "$juice_root"
+    "${juice_env[@]}" python3 -m sovereign_juice status
+  ) || return 1
+  STATUS_JSON="$output" python3 - <<'PY'
+import json
+import os
+
+try:
+    status = json.loads(os.environ["STATUS_JSON"])
+except (KeyError, json.JSONDecodeError):
+    raise SystemExit(1)
+if status.get("status_version") != 2 or status.get("display_name") != "Juice":
+    raise SystemExit(1)
+if status.get("boundaries") != ["synthetic-only", "classify-only", "no drafts", "no sends"]:
+    raise SystemExit(1)
+PY
+}
+
+renderer_pid() {
+  local pid
+  command -v lsof >/dev/null 2>&1 || return 1
+  pid=$(lsof -nP -tiTCP:5174 -sTCP:LISTEN 2>/dev/null | sed -n '1p')
+  [[ -n "$pid" ]] || return 1
+  printf '%s\n' "$pid"
+}
+
+renderer_is_owned() {
+  local pid="$1"
+  local cwd command_line
+  cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | sed -n '1p')
+  command_line=$(ps -p "$pid" -o command= 2>/dev/null || true)
+  [[ "$cwd" == "$ROOT/apps/desktop" && "$command_line" == *vite* ]]
+}
+
+launcher_target_is_current() {
+  [[ -L "$1" && "$(readlink "$1")" == "$2" ]]
+}
+
+install_user_launchers() {
+  local bin_dir="$HOME/.local/bin"
+  local -a names=(juice juice-doctor t1000-desktop t1000-doctor)
+  local -a targets=(
+    "$ROOT/scripts/juice"
+    "$ROOT/scripts/juice-doctor"
+    "$ROOT/scripts/t1000-desktop.sh"
+    "$ROOT/scripts/t1000-doctor.sh"
+  )
+  local index link target
+
+  for index in "${!names[@]}"; do
+    link="$bin_dir/${names[$index]}"
+    target="${targets[$index]}"
+    if [[ -e "$link" || -L "$link" ]]; then
+      if launcher_target_is_current "$link" "$target"; then
+        continue
+      fi
+      echo "Refusing to replace existing launcher at $link" >&2
+      return 1
+    fi
+  done
+
+  mkdir -p "$bin_dir"
+  for index in "${!names[@]}"; do
+    link="$bin_dir/${names[$index]}"
+    target="${targets[$index]}"
+    if launcher_target_is_current "$link" "$target"; then
+      echo "Juice launcher already installed at $link"
+      continue
+    fi
+    ln -s "$target" "$link"
+    echo "Installed $link -> $target"
+  done
+}
+
+case "${1:-}" in
+  "") ;;
+  --doctor)
+    exec "$ROOT/scripts/juice-doctor"
+    ;;
+  --install-user-launcher)
+    install_user_launchers
+    exit 0
+    ;;
+  status|classify|threshold|r0|ui|review|live|triage)
+    run_juice_cli "$@"
+    ;;
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! -d "$ROOT/apps/desktop" ]]; then
+  echo "Juice desktop not found at $ROOT/apps/desktop" >&2
+  exit 1
+fi
+
+if [[ ! -x "$HERMES_DESKTOP_PYTHON" ]]; then
+  echo "T1000 engine venv missing. From $ROOT run: uv venv --python 3.12 venv && uv pip install -e . --python ./venv/bin/python" >&2
+  exit 1
+fi
+
+if ! "$HERMES_DESKTOP_PYTHON" -c 'import yaml; import hermes_cli.main' >/dev/null; then
+  echo "T1000 engine venv cannot import yaml and hermes_cli.main." >&2
+  echo "Repair it from $ROOT with: uv pip install -e . --python ./venv/bin/python" >&2
+  exit 1
+fi
+
+if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+  # shellcheck disable=SC1090
+  . "$HOME/.nvm/nvm.sh"
+  nvm use 22 >/dev/null 2>&1 || true
+fi
+
+mkdir -p "$HERMES_HOME"
+
+echo "Juice desktop (T1000 engine)"
+echo "  code:  $ROOT"
+echo "  state: $HERMES_HOME"
+echo "  python: $HERMES_DESKTOP_PYTHON"
+
+if is_juice_source "$JUICE_ROOT"; then
+  echo "  Juice: $JUICE_ROOT"
+  if juice_status_readable "$JUICE_ROOT"; then
+    echo "  Juice status: readable"
+  else
+    echo "Sovereign Juice status command failed from $JUICE_ROOT" >&2
+    exit 1
+  fi
+else
+  echo "Sovereign Juice source not found." >&2
+  echo "Expected $JUICE_ROOT." >&2
+  exit 1
+fi
+
+cd "$ROOT/apps/desktop"
+if active_pid=$(renderer_pid); then
+  if renderer_is_owned "$active_pid"; then
+    echo "Juice renderer: already running (pid $active_pid); opening or focusing Electron"
+    exec npm run dev:electron
+  fi
+  echo "Port 5174 is owned by another process (pid $active_pid); refusing to collide." >&2
+  exit 1
+fi
+
+exec npm run dev

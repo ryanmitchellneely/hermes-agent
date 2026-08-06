@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Fail-loud readiness + desired-state reconciler for the Juice cockpit / T1000 engine.
+#   juice-doctor              report drift (exit 1) / refuse (exit 2)
+#   juice-doctor --fix       converge repairable drift; refuse unsafe HA states
+#   juice-doctor --reconcile-only   skip readiness ladder; run reconciler only
+set -euo pipefail
+
+export HERMES_HOME="${HERMES_HOME:-$HOME/.t1000}"
+ROOT="${T1000_ROOT:-$HOME/Documents/T1000}"
+JUICE_ROOT="$HOME/Documents/sovereign-consulting/tools/juice"
+brain_ready=0
+failures=0
+FIX=0
+RECONCILE_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --fix) FIX=1 ;;
+    --reconcile-only) RECONCILE_ONLY=1 ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: juice-doctor [--fix] [--reconcile-only]
+
+  (default)   Readiness checks + desired-state drift report.
+  --fix       Converge repairable drift (timers, claimed_by, heartbeat agent).
+              Standing HA invariants are REFUSED, never repaired-into.
+  --reconcile-only
+              Skip Juice ladder / Ollama readiness; run reconciler only.
+EOF
+      exit 0
+      ;;
+  esac
+done
+
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/t1000-doctor.XXXXXX")
+trap 'rm -rf "$tmp_dir"' EXIT
+juice_env=(env -i "HOME=$HOME" "PATH=$PATH" "PYTHONPATH=.:sovereign_juice" "TMPDIR=${TMPDIR:-/tmp}")
+
+if [[ -n "${JUICE_HOME:-}" ]]; then
+  juice_env+=("JUICE_HOME=$JUICE_HOME")
+fi
+
+is_juice_source() {
+  [[ -f "$1/sovereign_juice/__main__.py" && -f "$1/sovereign_juice/status.py" ]]
+}
+
+run_reconciler() {
+  local py=""
+  if [[ -x "$ROOT/venv/bin/python" ]]; then
+    py="$ROOT/venv/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    py="$(command -v python3)"
+  else
+    echo "reconciler: no python" >&2
+    return 1
+  fi
+  local args=( -m hermes_cli.reconciler )
+  if [[ "$FIX" -eq 1 ]]; then
+    args+=( --fix )
+    export HERMES_RECONCILER_LIVE="${HERMES_RECONCILER_LIVE:-1}"
+  fi
+  echo "--- desired-state reconciler (fix=$FIX) ---"
+  (
+    cd "$ROOT"
+    PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$py" "${args[@]}"
+  )
+}
+
+echo "Juice doctor (T1000 engine; HERMES_HOME=$HERMES_HOME fix=$FIX)"
+
+if [[ "$RECONCILE_ONLY" -eq 1 ]]; then
+  run_reconciler
+  exit $?
+fi
+
+if curl -sf --max-time 2 http://127.0.0.1:11434/api/tags >"$tmp_dir/ollama-tags.json" 2>/dev/null; then
+  models=$(python3 - "$tmp_dir/ollama-tags.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+names = [model.get("name", "") for model in data.get("models", [])]
+print("\n".join(names))
+PY
+)
+  echo "Ollama: UP"
+  echo "$models" | sed 's/^/  - /'
+  if echo "$models" | rg -q 'hermes3:8b|qwen'; then
+    echo "Ollama: preferred local model present"
+    brain_ready=1
+  else
+    echo "Ollama: up but no hermes3:8b / qwen*; pull one or pick another model in the UI"
+  fi
+else
+  echo "Ollama: DOWN (http://127.0.0.1:11434)"
+fi
+
+# The Juice classify lane runs on the Spark, a *different* service than the chat
+# brain above: exact loopback on 11435 (comprehension.py::_assert_spark_identity).
+# Informational only — status/doctor never touch it, but classify won't run without it.
+if curl -sf --max-time 2 http://127.0.0.1:11435/api/version >"$tmp_dir/spark-version.json" 2>/dev/null; then
+  echo "Juice classify lane (Spark 127.0.0.1:11435): UP"
+else
+  echo "Juice classify lane (Spark 127.0.0.1:11435): DOWN — classify needs the Spark tunnel + SPARK_ENABLED=1 (not required for status/doctor)"
+fi
+
+if command -v codex >/dev/null 2>&1; then
+  echo "Codex CLI: $(command -v codex)"
+  if [[ -f "$HOME/.codex/auth.json" ]]; then
+    echo "Codex auth: present (~/.codex/auth.json)"
+    brain_ready=1
+  else
+    echo "Codex auth: MISSING; run browser login for Codex subscription"
+  fi
+else
+  echo "Codex CLI: not on PATH"
+fi
+
+provider=$(rg -n '^\s*provider:' "$HERMES_HOME/config.yaml" 2>/dev/null | head -1 || true)
+default=$(rg -n '^\s*default:' "$HERMES_HOME/config.yaml" 2>/dev/null | head -1 || true)
+echo "Config model: ${provider:-unknown} / ${default:-unknown}"
+
+if [[ ! -x "$ROOT/venv/bin/hermes" || ! -x "$ROOT/venv/bin/python" ]]; then
+  echo "T1000 engine venv: MISSING"
+  echo "  repair: cd $ROOT && uv venv --python 3.12 venv && uv pip install -e . --python ./venv/bin/python"
+  failures=$((failures + 1))
+elif "$ROOT/venv/bin/python" -c 'import yaml; import hermes_cli.main' >"$tmp_dir/venv-import.log" 2>&1; then
+  echo "T1000 engine venv: OK (yaml + hermes_cli.main importable)"
+else
+  echo "T1000 engine venv: BROKEN (yaml or hermes_cli.main is not importable)"
+  sed 's/^/  /' "$tmp_dir/venv-import.log"
+  echo "  repair: cd $ROOT && uv pip install -e . --python ./venv/bin/python"
+  failures=$((failures + 1))
+fi
+
+if is_juice_source "$JUICE_ROOT"; then
+  echo "Juice source: $JUICE_ROOT"
+  if (
+    cd "$JUICE_ROOT"
+    "${juice_env[@]}" python3 -m sovereign_juice status
+  ) >"$tmp_dir/juice-status.json"; then
+    if python3 - "$tmp_dir/juice-status.json" <<'PY'
+import json
+import re
+import sys
+from datetime import datetime
+
+# The doctor answers one question: is the Juice cockpit well-formed and SAFE to
+# run, and where is it on the unlock ladder? It deliberately does NOT require the
+# capability to be fully promoted -- an un-promoted rung is honest current state,
+# not a failure. It fails closed only on a malformed status or a real safety
+# breach: capability boundaries drifting, or a rung claiming authorization it must
+# not hold. The ladder position is reported for the human, never used to fail.
+EXPECTED_DISPLAY = "Juice"
+EXPECTED_CAPABILITY = "comm_comprehension"
+# The input scope may legitimately widen to real comms once the operator grants an
+# explicit live authorization. The action boundaries never may.
+ALLOWED_INPUT_SCOPES = {"synthetic-only", "live-authorized (real comms, read-only)"}
+IMMUTABLE_BOUNDARIES = ["classify-only", "no drafts", "no sends"]
+EXPECTED_PROMPT = "comm_comprehension_v1.13-sovereign"
+LADDER = ["R0", "R1", "R2", "R3", "R4", "R5"]
+# Rungs that can cause outbound contact or advice. They must never be authorized
+# short of an explicit human promotion that lifts the whole frontier to reach them.
+OUTBOUND_RUNGS = {"R4", "R5"}
+
+
+def is_timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def fail(message):
+    print(f"Juice status: {message}")
+    raise SystemExit(1)
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        status = json.load(handle)
+except (OSError, json.JSONDecodeError) as exc:
+    fail(f"UNREADABLE ({exc})")
+
+# --- Well-formed v2 status (structure) ---
+if status.get("status_version") != 2:
+    fail(f"UNREADABLE (expected status_version 2, got {status.get('status_version')!r})")
+if status.get("display_name") != EXPECTED_DISPLAY:
+    fail("UNREADABLE (unexpected display_name)")
+if status.get("capability_id") != EXPECTED_CAPABILITY:
+    fail("UNREADABLE (unexpected capability_id)")
+
+evaluation = status.get("evaluation")
+verification = status.get("verification")
+rungs = status.get("rungs")
+if not (
+    is_timestamp(status.get("generated_at"))
+    and isinstance(evaluation, dict)
+    # A rollover archives the evaluation artifacts, so between `r0 rollover` and
+    # the next `r0 eval` there is legitimately no evaluation timestamp. Demanding
+    # one there reports a healthy mid-ceremony state as a malformed contract,
+    # which is exactly when an operator least needs a false alarm.
+    and (
+        is_timestamp(evaluation.get("generated_at"))
+        or (evaluation.get("state") == "unmeasured"
+            and evaluation.get("generated_at") is None)
+    )
+    and isinstance(verification, dict)
+    and is_timestamp(verification.get("generated_at"))
+    and isinstance(verification.get("source_digest"), str)
+    and re.fullmatch(r"[a-f0-9]{16}", verification["source_digest"]) is not None
+    and isinstance(rungs, list)
+    and rungs
+):
+    fail("NOT READY (malformed v2 status contract)")
+
+rung_map = {
+    row.get("id"): row
+    for row in rungs
+    if isinstance(row, dict) and isinstance(row.get("id"), str)
+}
+
+# --- Safety contract (load-bearing; fail closed) ---
+boundaries = status.get("boundaries")
+if (
+    not isinstance(boundaries, list)
+    or len(boundaries) != 4
+    or boundaries[0] not in ALLOWED_INPUT_SCOPES
+    or boundaries[1:] != IMMUTABLE_BOUNDARIES
+):
+    fail("UNSAFE (capability boundaries drifted from an authorized input scope / classify-only / no-drafts / no-sends)")
+
+authorized = {rid for rid, row in rung_map.items() if row.get("authorized") is True}
+
+premature = sorted(
+    rid for rid in authorized
+    if not (rung_map[rid].get("built") is True and rung_map[rid].get("verified") is True)
+)
+if premature:
+    fail(f"UNSAFE ({', '.join(premature)} authorized without being built and verified)")
+
+breach = sorted(authorized & OUTBOUND_RUNGS)
+if breach:
+    fail(f"UNSAFE ({', '.join(breach)} authorized -- an outbound-action rung must stay locked)")
+
+frontier = status.get("promotion_frontier", "none")
+frontier_idx = LADDER.index(frontier) if frontier in LADDER else -1
+above = sorted(rid for rid in authorized if rid in LADDER and LADDER.index(rid) > frontier_idx)
+if above:
+    fail(f"UNSAFE ({', '.join(above)} authorized above the promotion frontier {frontier!r})")
+
+# --- Honest ladder read-out (informational; never fatal) ---
+print("Juice status: readable (v2), safety contract intact")
+if status.get("prompt_version") != EXPECTED_PROMPT:
+    print(f"  WARN: prompt version {status.get('prompt_version')!r} (expected {EXPECTED_PROMPT!r}) -- re-review before relying on it")
+else:
+    print(f"  prompt: {status.get('prompt_version')}")
+print(f"  boundaries: {', '.join(boundaries)} [intact]")
+print(f"  frontier: build {status.get('build_frontier')} / promotion {frontier}")
+print(f"  gate: {status.get('current_gate')}")
+print(f"  next: {status.get('next_action')}")
+
+aggregate = evaluation.get("aggregate", {}) if isinstance(evaluation.get("aggregate"), dict) else {}
+controls = status.get("r0_controls", {}) if isinstance(status.get("r0_controls"), dict) else {}
+review = controls.get("review", {}) if isinstance(controls.get("review"), dict) else {}
+threshold = controls.get("threshold", {}) if isinstance(controls.get("threshold"), dict) else {}
+baseline = controls.get("baseline", {}) if isinstance(controls.get("baseline"), dict) else {}
+baseline_state = baseline.get("state", "unknown")
+verification_state = verification.get("state", "unknown")
+minimum = threshold.get("minimum_semantic_passes")
+passed = aggregate.get("passed")
+total = aggregate.get("total")
+threshold_note = f" (threshold >= {minimum})" if isinstance(minimum, int) and not isinstance(minimum, bool) else ""
+# "None/None semantic" reads as a crash; say what is actually true instead.
+score = f"{passed}/{total} semantic" if isinstance(passed, int) and isinstance(total, int) else "not yet measured"
+print(
+    f"  R0 eval: {score}{threshold_note}"
+    f" | review {'signed' if review.get('signed_off') is True else 'unsigned'}"
+    f" | baseline {baseline_state} | verification {verification_state}"
+)
+
+if baseline_state == "locked" and verification_state == "current":
+    print("  R0: OPERATIONAL")
+    print("OPERATIONAL: yes")
+elif baseline_state != "locked":
+    print("  R0: PROVING -- not yet operational (run the R0 eval + lock to promote)")
+    print("OPERATIONAL: no (R0 baseline not yet locked)")
+else:
+    print("  R0: baseline locked -- not yet operational (re-run the source-bound R1/R2 verifier)")
+    print(f"OPERATIONAL: no (R1/R2 verification is {verification_state})")
+
+raise SystemExit(0)
+PY
+    then
+      :
+    else
+      failures=$((failures + 1))
+    fi
+  else
+    echo "Juice status: FAILED (source command exited nonzero)"
+    failures=$((failures + 1))
+  fi
+else
+  echo "Juice source: MISSING"
+  echo "  expected: $JUICE_ROOT"
+  failures=$((failures + 1))
+fi
+
+if [[ "$brain_ready" -eq 0 ]]; then
+  echo "FAIL: neither usable Ollama local model nor Codex auth. Fix one before chatting." >&2
+  failures=$((failures + 1))
+fi
+
+if [[ "$failures" -ne 0 ]]; then
+  echo "FAIL: Juice doctor found $failures readiness issue(s)." >&2
+  # Still run reconciler so drift is surfaced even when readiness fails.
+  set +e
+  run_reconciler
+  rec_rc=$?
+  set -e
+  if [[ "$rec_rc" -gt 1 ]]; then
+    exit "$rec_rc"
+  fi
+  exit 1
+fi
+
+echo "OK: Juice cockpit and T1000 brain lane are healthy and safe (see ladder state above)."
+
+# Desired-state reconciler (P0): report drift / optional --fix. Exit codes:
+#   0 ok · 1 drift · 2 refuse (HA invariant)
+set +e
+run_reconciler
+rec_rc=$?
+set -e
+exit "$rec_rc"

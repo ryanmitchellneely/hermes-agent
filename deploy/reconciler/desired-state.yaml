@@ -1,0 +1,50 @@
+# T1000 / Juice desired state — single source of truth for juice-doctor reconciler.
+# Config = desired state. juice-doctor reports drift; juice-doctor --fix converges
+# (or refuses, when the standing HA invariant would be violated).
+#
+# VPS-first runtime components live here. Mac-resident items are flagged host: mac.
+version: 1
+unit: t1000-juice
+
+# Standing HA invariant (encode as data, not prose):
+#   Mac-primary / VPS-standby. Only one Telegram gateway writer.
+#   Mac gateway must NEVER be hand-started while the VPS is serving.
+#   The reconciler REFUSES (does not "repair into") dual-serve or Mac-start-while-VPS-serves.
+gateway_ha:
+  topology: mac-primary-vps-standby
+  single_writer: true
+  refuse_states:
+    - dual_gateway_live
+    - mac_hand_start_while_vps_serving
+  mac:
+    host: mac
+    launch_agent: ai.hermes.gateway
+    heartbeat_launch_agent: com.ryan.t1000-failover-heartbeat
+    heartbeat_scripts_dir: "~/.t1000/failover"  # not Documents (TCC)
+  vps:
+    host: vps
+    gateway_unit: t1000-gateway.service
+    # Must NOT be enabled-at-boot; watchdog starts/stops only.
+    gateway_enabled_at_boot: false
+    watchdog_timer: t1000-failover-watchdog.timer
+    watchdog_service: t1000-failover-watchdog.service
+    state_dir: /var/lib/t1000-failover
+    claimed_by_when_healthy: mac
+
+# Timers / services that must be armed on the VPS (Juice product + engine HA).
+vps_timers:
+  - name: t1000-failover-watchdog.timer
+    required: true
+    owner: t1000
+  - name: juice-doctor-reconcile.timer
+    required: true
+    owner: t1000
+    note: "reconciler self-heartbeat; surfaces unrepaired drift"
+
+# Reconciler self-observability (Ryan 2026-05-23: heartbeat + surface + auto-alert).
+reconciler:
+  heartbeat_path: "~/.t1000/reconciler/heartbeat.json"
+  drift_alert_path: "~/.t1000/reconciler/last-alert.json"
+  # Unrepaired drift older than this many seconds → alert Ryan (via file + log).
+  unrepaired_alert_after_sec: 900
+  run_interval_sec: 300
