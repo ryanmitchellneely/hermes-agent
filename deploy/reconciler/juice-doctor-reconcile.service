@@ -1,0 +1,30 @@
+# juice-doctor-reconcile — VPS timer that heartbeats the desired-state reconciler.
+# Install: deploy/reconciler/install-vps-timer.sh
+# Runtime: VPS-first. Does not start the Mac gateway.
+# Runs as root so --fix can systemctl enable/disable units; logic is read-only
+# for Telegram and never starts t1000-gateway itself (watchdog owns that).
+
+[Unit]
+Description=T1000/Juice desired-state reconciler (juice-doctor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root required for systemctl enable/disable of timers / gateway-at-boot.
+# Reconciler never starts t1000-gateway (HA: watchdog only).
+User=root
+Group=root
+Environment=HERMES_HOME=/opt/t1000/home
+Environment=T1000_ROOT=/opt/t1000/src
+Environment=T1000_HOST_ROLE=vps
+Environment=HERMES_RECONCILER_LIVE=1
+Environment=PYTHONPATH=/opt/t1000/src
+WorkingDirectory=/opt/t1000/src
+# Exit 0 on clean or repaired; non-zero surfaces drift/refuse to journal.
+# Timer stays armed either way (OnUnitActiveSec).
+ExecStart=/opt/t1000/venv/bin/python -m hermes_cli.reconciler --fix --role vps
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

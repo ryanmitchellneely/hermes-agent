@@ -1,0 +1,11 @@
+[Unit]
+Description=T1000 failover watchdog (Mac heartbeat → promote/demote gateway)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/t1000/src/deploy/failover/vps/watchdog.sh
+Environment=T1000_FAILOVER_DIR=/var/lib/t1000-failover
+Environment=FAIL_AFTER_SEC=180
+Environment=RECOVER_AFTER_SEC=90
+Environment=PROMOTE_DELAY_SEC=25

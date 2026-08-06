@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "t1000-reach/receipt-v1",
+  "title": "reach.receipt.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "peer",
+    "verb",
+    "ok",
+    "grade",
+    "as_of",
+    "layer",
+    "receipt"
+  ],
+  "properties": {
+    "schema_version": { "const": "reach.receipt.v1" },
+    "peer": {
+      "type": "string",
+      "enum": ["spark", "juice", "kevin", "carlton", "pulp", "popper", "all"]
+    },
+    "verb": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "grade": { "type": "string", "enum": ["live", "stale", "error"] },
+    "as_of": { "type": "string", "format": "date-time" },
+    "layer": { "type": "string", "enum": ["L0", "L1", "L2", "L3", "L4"] },
+    "receipt": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["local", "http", "ssh", "path", "message_id", "none"]
+        },
+        "id": { "type": "string" }
+      }
+    },
+    "detail": { "type": "object" },
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

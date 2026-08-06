@@ -1441,6 +1441,27 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # P2 Distillery (T1000 port): two-strike / cooldown / sticky-revert policy.
+    # Opt out with HERMES_MODEL_FAILOVER_POLICY=0.
+    try:
+        import os as _os_failover
+        _policy_on = _os_failover.environ.get("HERMES_MODEL_FAILOVER_POLICY", "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }
+        if _policy_on:
+            from agent.model_failover import default_policy_from_env
+
+            agent._model_failover_policy = default_policy_from_env(
+                preferred_provider=(getattr(agent, "provider", None) or "") or "",
+                preferred_model=(getattr(agent, "model", None) or "") or "",
+                chain=list(agent._fallback_chain or []),
+            )
+        else:
+            agent._model_failover_policy = None
+    except Exception:
+        agent._model_failover_policy = None
+
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).

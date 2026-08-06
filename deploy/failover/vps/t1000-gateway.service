@@ -1,0 +1,40 @@
+[Unit]
+Description=T1000 / Hermes gateway (failover standby on VPS)
+Documentation=file:///opt/t1000/src/deploy/failover/README.md
+After=network-online.target
+Wants=network-online.target
+# Rate-limit crash loops (must live in [Unit], not [Service])
+StartLimitIntervalSec=300
+StartLimitBurst=8
+# Do NOT enable by default — watchdog starts/stops this unit.
+
+[Service]
+Type=simple
+User=t1000
+Group=t1000
+WorkingDirectory=/opt/t1000/home
+Environment=HERMES_HOME=/opt/t1000/home
+Environment=HOME=/opt/t1000/home
+Environment=PATH=/opt/t1000/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=TERM=dumb
+Environment=HERMES_ACCEPT_HOOKS=1
+EnvironmentFile=-/etc/t1000/env
+# Clear stale lock from a previous crash / hard kill before start
+ExecStartPre=/bin/rm -f /opt/t1000/home/gateway.lock /opt/t1000/home/gateway.pid
+ExecStart=/opt/t1000/venv/bin/python -m hermes_cli.main gateway run --replace
+# Telegram may need time after the Mac releases getUpdates
+Restart=on-failure
+RestartSec=20
+TimeoutStartSec=120
+# Drain timeout headroom (gateway warns if stop < drain)
+TimeoutStopSec=240
+KillMode=mixed
+KillSignal=SIGTERM
+
+Nice=5
+MemoryMax=2G
+
+[Install]
+# Intentionally empty WantedBy — not enabled at boot.
+# Watchdog promotes with: systemctl start t1000-gateway.service

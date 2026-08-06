@@ -1932,6 +1932,31 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+
+    # --- optional ModelFailoverPolicy (T1000 Distillery P2) -----------------
+    policy = getattr(agent, "_model_failover_policy", None)
+    if policy is not None and reason is not None:
+        try:
+            from agent.model_failover import FailClass
+
+            reason_name = getattr(reason, "name", str(reason)).lower()
+            if "timeout" in reason_name:
+                fc = FailClass.TIMEOUT
+            elif "rate" in reason_name:
+                fc = FailClass.RATE_LIMIT
+            elif "bill" in reason_name:
+                fc = FailClass.BILLING
+            elif "auth" in reason_name:
+                fc = FailClass.AUTH
+            else:
+                fc = FailClass.OTHER
+            cur = (getattr(agent, "provider", "") or "").strip().lower()
+            if cur:
+                policy.record_failure(cur, fc, model=getattr(agent, "model", "") or "")
+            policy.check_sustained_failover()
+        except Exception:
+            pass
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -2122,6 +2147,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+
+        # P2: start sticky-failover clock for sustained alert
+        try:
+            _pol = getattr(agent, "_model_failover_policy", None)
+            if _pol is not None:
+                _pol.mark_on_fallback(
+                    (getattr(agent, "provider", "") or "").strip().lower(),
+                    model=(getattr(agent, "model", "") or ""),
+                )
+        except Exception:
+            pass
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
