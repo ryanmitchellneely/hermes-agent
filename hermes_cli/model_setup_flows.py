@@ -2023,6 +2023,58 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+def _model_flow_claude_acp(config, current_model=""):
+    """Claude Agent ACP flow using local claude-agent-acp (Max sub)."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.config import load_config, save_config
+
+    del config
+    provider_id = "claude-acp"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = (
+        status.get("resolved_command") or status.get("command") or "claude-agent-acp"
+    )
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+
+    print("  Claude Agent ACP delegates Hermes turns to `claude-agent-acp`.")
+    print("  Claude Code owns Max OAuth/billing; Hermes stays the orchestrating brain.")
+    print("  Each request starts a short-lived ACP session (same pattern as copilot-acp).")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+    print("  If auth fails: run `claude auth login` then retry.")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        print(f"  ⚠ {exc}")
+        print("  Set HERMES_CLAUDE_ACP_COMMAND if the adapter lives outside PATH.")
+        return
+
+    models = list(_PROVIDER_MODELS.get(provider_id) or ["claude-acp"])
+    selected = _prompt_model_selection(
+        models,
+        current=current_model or "claude-acp",
+        header="Claude ACP model hint (passed into the ACP session prompt)",
+    )
+    if not selected:
+        print("No change.")
+        return
+    _save_model_choice(provider_id, selected, base_url=effective_base)
+    print(f"  ✓ Default engine: {provider_id} / {selected}")
+    print("  Tip: keep day-to-day default on xai-oauth/Grok; /model claude-acp when you need Claude.")
+
+
+
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 

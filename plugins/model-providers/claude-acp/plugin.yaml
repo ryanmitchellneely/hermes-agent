@@ -1,0 +1,5 @@
+name: claude-acp-provider
+kind: model-provider
+version: 1.0.0
+description: Claude Code / Claude Max via Claude Agent ACP subprocess
+author: T1000
