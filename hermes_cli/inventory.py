@@ -185,6 +185,12 @@ def build_models_payload(
     """
     from hermes_cli.model_switch import list_authenticated_providers
 
+    _excluded = {
+        str(p).strip().lower()
+        for p in (ctx.excluded_providers or [])
+        if p
+    }
+
     rows = list_authenticated_providers(
         current_provider=ctx.current_provider,
         current_base_url=ctx.current_base_url,
@@ -200,7 +206,9 @@ def build_models_payload(
         excluded_providers=ctx.excluded_providers or [],
     )
 
-    moa_row = _moa_provider_row(ctx.current_provider)
+    moa_row = None
+    if "moa" not in _excluded:
+        moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
         rows = [moa_row] + [r for r in rows if str(r.get("slug", "")).lower() != "moa"]
 

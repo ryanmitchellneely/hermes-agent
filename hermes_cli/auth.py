@@ -96,6 +96,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_CLAUDE_ACP_BASE_URL = "acp://claude"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -231,6 +232,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "claude-acp": ProviderConfig(
+        id="claude-acp",
+        name="Claude Agent ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_CLAUDE_ACP_BASE_URL,
+        base_url_env_var="CLAUDE_ACP_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1846,6 +1854,45 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 or source.startswith("manual:")
             ):
                 return True
+    except Exception:
+        pass
+
+    # 5. model_aliases / providers: blocks — user explicitly routed models here.
+    # Desktop chat pickers use explicit_only=1; without this, a wired Claude ACP
+    # lane (aliases → claude-acp) stays invisible even when the binary is live.
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        providers_map = cfg.get("providers")
+        if isinstance(providers_map, dict) and normalized in {
+            str(k).strip().lower() for k in providers_map.keys()
+        }:
+            return True
+        aliases = cfg.get("model_aliases")
+        if isinstance(aliases, dict):
+            for entry in aliases.values():
+                if not isinstance(entry, dict):
+                    continue
+                if (entry.get("provider") or "").strip().lower() == normalized:
+                    return True
+    except Exception:
+        pass
+
+    # 6. External-process ACP backends (claude-acp, copilot-acp): "configured"
+    # means the local adapter binary is resolvable (auth lives in that process).
+    try:
+        pcfg = PROVIDER_REGISTRY.get(normalized)
+        if pcfg and getattr(pcfg, "auth_type", "") == "external_process":
+            st = get_external_process_provider_status(normalized)
+            if st.get("configured") or st.get("resolved_command"):
+                return True
+        # Env override for Claude ACP is itself an explicit Hermes setup choice.
+        if normalized == "claude-acp" and (
+            os.getenv("HERMES_CLAUDE_ACP_COMMAND", "").strip()
+            or os.getenv("CLAUDE_ACP_PATH", "").strip()
+        ):
+            return True
     except Exception:
         pass
 
@@ -6947,12 +6994,58 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
-def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
-    """Status snapshot for providers that run a local subprocess."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
-    if not pconfig or pconfig.auth_type != "external_process":
-        return {"configured": False}
+def _external_process_launcher(provider_id: str) -> Dict[str, Any]:
+    """Resolve command/args defaults for an external-process provider.
 
+    Copilot ACP speaks ``copilot --acp --stdio``. Claude Agent ACP
+    (``claude-agent-acp``) speaks ACP on stdio with no extra flags and
+    discovers a Buzz-bundled binary when PATH is bare.
+    """
+    pid = (provider_id or "").strip().lower()
+    if pid == "claude-acp":
+        env_cmd = (
+            os.getenv("HERMES_CLAUDE_ACP_COMMAND", "").strip()
+            or os.getenv("CLAUDE_ACP_PATH", "").strip()
+        )
+        home = Path(os.path.expanduser("~"))
+        buzz = home / "Library/Application Support/Buzz/node-tools/bin/claude-agent-acp"
+        candidates = [
+            c for c in [
+                env_cmd,
+                "claude-agent-acp",
+                str(buzz),
+                str(home / ".local/bin/claude-agent-acp"),
+            ]
+            if c
+        ]
+        command = candidates[0] if candidates else "claude-agent-acp"
+        resolved = None
+        for candidate in candidates:
+            p = Path(candidate).expanduser()
+            if p.is_file() and os.access(p, os.X_OK):
+                resolved = str(p)
+                command = str(p)
+                break
+            which = shutil.which(candidate)
+            if which:
+                resolved = which
+                command = candidate if candidate == which else candidate
+                # prefer absolute resolved path for spawn
+                command = which
+                break
+        raw_args = os.getenv("HERMES_CLAUDE_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else []
+        return {
+            "command": command,
+            "args": args,
+            "resolved_command": resolved,
+            "missing_hint": (
+                "Install @agentclientprotocol/claude-agent-acp "
+                "(or use the Buzz-bundled binary) and/or set HERMES_CLAUDE_ACP_COMMAND."
+            ),
+        }
+
+    # Default / copilot-acp
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -6960,11 +7053,32 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     )
     raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    resolved = shutil.which(command) if command else None
+    return {
+        "command": command,
+        "args": args,
+        "resolved_command": resolved,
+        "missing_hint": (
+            f"Could not find the Copilot CLI command '{command}'. "
+            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        ),
+    }
+
+
+def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
+    """Status snapshot for providers that run a local subprocess."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "external_process":
+        return {"configured": False}
+
+    launcher = _external_process_launcher(provider_id)
+    command = launcher["command"]
+    args = list(launcher["args"] or [])
+    resolved_command = launcher.get("resolved_command")
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    resolved_command = shutil.which(command) if command else None
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
@@ -6994,7 +7108,10 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "claude-acp"}:
+        return get_external_process_provider_status(target)
+    pconfig_pre = PROVIDER_REGISTRY.get(target)
+    if pconfig_pre and pconfig_pre.auth_type == "external_process":
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -7177,25 +7294,24 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
+    launcher = _external_process_launcher(provider_id)
+    command = launcher["command"]
+    args = list(launcher["args"] or [])
+    resolved_command = launcher.get("resolved_command")
     if not resolved_command and not base_url.startswith("acp+tcp://"):
+        # Try which again on final command string
+        resolved_command = shutil.which(command) if command else None
+    if not resolved_command and not base_url.startswith("acp+tcp://"):
+        hint = launcher.get("missing_hint") or f"Could not find external process command '{command}'."
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            hint,
             provider=provider_id,
-            code="missing_copilot_cli",
+            code="missing_external_process_cli",
         )
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
@@ -7203,7 +7319,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     }
 
 
-# =============================================================================
+
 # CLI Commands — login / logout
 # =============================================================================
 

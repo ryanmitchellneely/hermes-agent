@@ -70,7 +70,7 @@ def _resolve_requests_verify() -> bool | str:
 # Only these are stripped — Ollama-style "model:tag" colons (e.g. "qwen3.5:27b")
 # are preserved so the full model name reaches cache lookups and server queries.
 _PROVIDER_PREFIXES: frozenset[str] = frozenset({
-    "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
+    "openrouter", "nous", "openai-codex", "copilot", "copilot-acp", "claude-acp",
     "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek", "deepinfra",
     "opencode-zen", "opencode-go", "ai-gateway", "kilocode", "alibaba", "novita",
     "qwen-oauth",
@@ -407,6 +407,9 @@ DEFAULT_CONTEXT_LENGTHS = {
     # fuzzy-match collisions (e.g. "anthropic/claude-sonnet-4" is a
     # substring of "anthropic/claude-sonnet-4.6").
     # OpenRouter-prefixed models resolve via OpenRouter live API or models.dev.
+    # Claude Agent ACP short ids (picker / aliases) — must beat generic "claude".
+    "opus[1m]": 1000000,
+    "claude-fable-5[1m]": 1000000,
     "claude-fable-5": 1000000,
     "claude-fable": 1000000,
     "claude-opus-5": 1000000,
@@ -2892,6 +2895,29 @@ def get_model_context_length(
                 or_ctx == 32768 and _model_name_suggests_kimi(model)
             ):
                 return or_ctx
+
+    # Claude Agent ACP — Max-sub short ids / aliases. models.dev has no
+    # "claude-acp" provider row; without this, "default" falls to 256k and
+    # Hermes compresses ~8× too early against Claude's real 1M ceiling.
+    if effective_provider == "claude-acp":
+        m = (model or "").strip().lower()
+        if m in {
+            "",
+            "default",
+            "claude-acp",
+            "opus",
+            "opus[1m]",
+            "fable",
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-opus-5",
+        }:
+            return 1000000
+        if m in {"sonnet", "claude-sonnet-5", "claude-sonnet-4-6"}:
+            return 1000000
+        if m in {"haiku", "claude-haiku-4-5", "claude-haiku-4.5"}:
+            return 200000
+        # fall through to substring table for anything else
 
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context

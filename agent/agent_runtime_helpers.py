@@ -2258,6 +2258,17 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
+    if agent.provider == "claude-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://claude"):
+        from agent.claude_acp_client import ClaudeACPClient
+
+        client = ClaudeACPClient(**client_kwargs)
+        _ra().logger.info(
+            "Claude ACP client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 

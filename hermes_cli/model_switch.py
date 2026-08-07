@@ -2353,10 +2353,25 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Anthropic external creds check failed: %s", exc)
+        # External-process ACP backends (copilot-acp, claude-acp): "creds"
+        # means the local adapter binary is resolvable. Auth itself lives
+        # inside the subprocess (Claude Max / Copilot CLI login).
+        if not has_creds and (
+            overlay.auth_type == "external_process"
+            or hermes_slug in {"copilot-acp", "claude-acp"}
+            or pid in {"copilot-acp", "claude-acp"}
+        ):
+            try:
+                from hermes_cli.auth import get_external_process_provider_status
+                st = get_external_process_provider_status(hermes_slug if hermes_slug in {"copilot-acp", "claude-acp"} else pid)
+                if st.get("configured") or st.get("logged_in") or st.get("resolved_command"):
+                    has_creds = True
+            except Exception as exc:
+                logger.debug("External-process status check failed for %s: %s", hermes_slug, exc)
         if not has_creds:
             continue
 
-        if hermes_slug in {"openai-codex", "copilot", "copilot-acp"}:
+        if hermes_slug in {"openai-codex", "copilot", "copilot-acp", "claude-acp"}:
             # Use live OAuth-backed discovery so the gateway /model picker
             # matches what the user's authenticated Codex/Copilot backend
             # actually serves — including ChatGPT-Pro-only Codex slugs
