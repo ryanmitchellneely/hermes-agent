@@ -826,18 +826,45 @@ _BACKENDS: dict[str, _SharedACPBackend] = {}
 _BACKENDS_LOCK = threading.Lock()
 
 
-def _backend_key(command: str, args: list[str], cwd: str) -> str:
-    return f"{command}\0{json.dumps(list(args), separators=(',', ':'))}\0{cwd}"
+def _resolve_pool_scope() -> str:
+    """Conversation scope for the backend pool.
+
+    Without this, two Desktop chats sharing a cwd would share one Claude ACP
+    session and leak continuity across threads. Prefer durable Hermes session
+    ids; fall back to a process-stable default for one-shot CLI.
+    """
+    for env_name in (
+        "HERMES_SESSION_ID",
+        "HERMES_SESSION_KEY",
+        "HERMES_UI_SESSION_ID",
+        "HERMES_GATEWAY_SESSION",
+    ):
+        val = (os.getenv(env_name) or "").strip()
+        if val and val not in {"1", "true", "True"}:
+            return val
+    return "default"
+
+
+def _backend_key(command: str, args: list[str], cwd: str, scope: str) -> str:
+    return (
+        f"{scope}\0{command}\0"
+        f"{json.dumps(list(args), separators=(',', ':'))}\0{cwd}"
+    )
 
 
 def _acquire_backend(*, command: str, args: list[str], cwd: str) -> _SharedACPBackend:
-    key = _backend_key(command, args, cwd)
+    scope = _resolve_pool_scope()
+    key = _backend_key(command, args, cwd, scope)
     with _BACKENDS_LOCK:
         backend = _BACKENDS.get(key)
         if backend is None:
             backend = _SharedACPBackend(command=command, args=args, cwd=cwd)
             _BACKENDS[key] = backend
-            logger.info("Claude ACP backend created key_cwd=%s", cwd)
+            logger.info(
+                "Claude ACP backend created scope=%s cwd=%s",
+                scope,
+                cwd,
+            )
         else:
             # Refresh behavioral knobs without dropping the live session.
             backend.permission_mode = _resolve_permission_mode()
@@ -859,13 +886,12 @@ def dispose_all_claude_acp_backends() -> int:
 
 
 class ClaudeACPClient:
-
     """Minimal OpenAI-client-compatible facade for Claude Agent ACP.
 
-    Process + ACP session are reused across chat.completions.create calls on
-    the same client instance (one Hermes agent turn-loop). On context
-    compression / non-prefix history changes the session is recycled so Claude
-    does not see duplicated transcripts.
+    Process + ACP session live on a module-level ``_SharedACPBackend``, scoped
+    per Hermes conversation + cwd, so they survive ``reuse_evict`` without
+    cross-chat bleed. Prefix-stable turns send deltas only; compression /
+    non-prefix history recycles the ACP session.
     """
 
     def __init__(
@@ -1000,10 +1026,11 @@ class ClaudeACPClient:
     def close(self) -> None:
         """Soft-close: Hermes reuse_evict calls this every turn.
 
-        Must NOT kill the ACP subprocess — that lives on ``_SharedACPBackend``
-        so the next ClaudeACPClient can resume the same session.
+        Must NOT kill the ACP subprocess (pooled backend) and must NOT flip
+        ``is_closed`` — Hermes' request-client cache treats is_closed clients
+        as dead and rebuilds every call. Soft close is a no-op on purpose.
         """
-        self.is_closed = True
+        return
 
     def dispose(self) -> None:
         """Hard-kill the pooled backend (idle tests / explicit shutdown)."""

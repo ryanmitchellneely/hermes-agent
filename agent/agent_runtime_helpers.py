@@ -4011,6 +4011,22 @@ def force_close_tcp_sockets(client: Any) -> int:
     Returns the number of sockets shut down. (Field kept as
     ``tcp_force_closed=N`` in the log line for backwards-compatible parsing.)
     """
+    # ACP facades own a local subprocess, not an httpx pool. Sweeping them is
+    # a no-op and can race soft-close reuse of the pooled Claude/Copilot ACP
+    # backend — skip entirely.
+    try:
+        from agent.claude_acp_client import ClaudeACPClient
+    except Exception:  # pragma: no cover
+        ClaudeACPClient = ()  # type: ignore
+    try:
+        from agent.copilot_acp_client import CopilotACPClient
+    except Exception:  # pragma: no cover
+        CopilotACPClient = ()  # type: ignore
+    if ClaudeACPClient and isinstance(client, ClaudeACPClient):
+        return 0
+    if CopilotACPClient and isinstance(client, CopilotACPClient):
+        return 0
+
     import socket as _socket
 
     shutdown_count = 0

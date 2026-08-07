@@ -85,6 +85,23 @@ ACP short ids resolve to **1M** in Hermes metadata (`opus[1m]`,
 `claude-fable-5[1m]`, …) so the compressor/counter matches Claude's real ceiling
 instead of falling through to the 256k default.
 
+## Caches (what actually applies)
+
+| Layer | What it does | Status |
+|-------|----------------|--------|
+| **ACP process/session pool** | Keeps `claude-agent-acp` alive across Hermes `reuse_evict` | ✅ scoped by `HERMES_SESSION_ID` + cwd |
+| **Delta prompts** | After turn 1, only new messages are sent into the live ACP session | ✅ |
+| **Claude Code internal cache** | Prefix/tool cache *inside* the ACP session | ✅ only if process stays warm |
+| **Hermes request-client cache** | Reuses the OpenAI-shaped facade when not closed | ✅ soft `close()` is a no-op |
+| **`prompt_caching:` in config.yaml** | Anthropic HTTP `cache_control` markers | ❌ N/A on ACP (no HTTP) |
+| **OpenRouter response cache** | N/A on this lane | ❌ |
+| **Context compressor** | Compacts Hermes transcript at `threshold × context_length` | ✅ uses 1M for opus[1m] |
+
+**Idle:** backends recycle after `model.claude_acp.idle_seconds` (default 900).
+
+**Do not** share one ACP backend across Desktop chats — pool key includes the
+Hermes session id so continuity stays per-conversation.
+
 ## Files
 
 - `agent/claude_acp_client.py`
