@@ -447,9 +447,26 @@ def _build_openai_tool_call(
 
 
 def _completion_to_stream_chunks(completion: SimpleNamespace) -> list[SimpleNamespace]:
-    """Convert a one-shot ACP response into OpenAI-style stream chunks."""
+    """Convert a one-shot ACP response into OpenAI-style stream chunks.
+
+    Fallback when a caller forces stream=True but we already have the full
+    completion (error-retry paths). Prefer ``_iter_live_stream_chunks`` for
+    real-time thought/message delivery.
+    """
     choice = completion.choices[0]
     message = choice.message
+    chunks: list[SimpleNamespace] = []
+
+    reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    if reasoning:
+        chunks.append(
+            _openai_stream_chunk(
+                model=completion.model,
+                reasoning=str(reasoning),
+                finish_reason=None,
+            )
+        )
+
     tool_call_deltas = None
     if message.tool_calls:
         tool_call_deltas = []
@@ -466,30 +483,132 @@ def _completion_to_stream_chunks(completion: SimpleNamespace) -> list[SimpleName
                 )
             )
 
-    delta = SimpleNamespace(
-        role="assistant",
-        content=message.content or None,
-        tool_calls=tool_call_deltas,
-        reasoning_content=message.reasoning_content,
-        reasoning=message.reasoning,
+    if message.content or tool_call_deltas:
+        chunks.append(
+            _openai_stream_chunk(
+                model=completion.model,
+                content=message.content or None,
+                tool_calls=tool_call_deltas,
+                finish_reason=choice.finish_reason,
+            )
+        )
+    else:
+        chunks.append(
+            _openai_stream_chunk(
+                model=completion.model,
+                finish_reason=choice.finish_reason or "stop",
+            )
+        )
+
+    chunks.append(
+        SimpleNamespace(
+            choices=[],
+            model=completion.model,
+            usage=completion.usage,
+        )
     )
-    data_chunk = SimpleNamespace(
+    return chunks
+
+
+def _openai_stream_chunk(
+    *,
+    model: str | None,
+    content: str | None = None,
+    reasoning: str | None = None,
+    tool_calls: list | None = None,
+    finish_reason: str | None = None,
+    role: str | None = "assistant",
+) -> SimpleNamespace:
+    delta = SimpleNamespace(
+        role=role,
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=reasoning,
+        reasoning=reasoning,
+    )
+    return SimpleNamespace(
         choices=[
             SimpleNamespace(
                 index=0,
                 delta=delta,
-                finish_reason=choice.finish_reason,
+                finish_reason=finish_reason,
             )
         ],
-        model=completion.model,
+        model=model,
         usage=None,
     )
-    usage_chunk = SimpleNamespace(
-        choices=[],
-        model=completion.model,
-        usage=completion.usage,
-    )
-    return [data_chunk, usage_chunk]
+
+
+def _acp_content_text(content: Any) -> str:
+    """Pull display text out of an ACP content block (text | thought | nested)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, dict):
+        return str(content)
+    for key in ("text", "thought", "thinking", "content", "message", "title"):
+        val = content.get(key)
+        if isinstance(val, str) and val:
+            return val
+        if isinstance(val, dict):
+            nested = _acp_content_text(val)
+            if nested:
+                return nested
+    return ""
+
+
+def _format_acp_activity(kind: str, update: dict[str, Any]) -> str | None:
+    """Turn tool_call / plan ACP updates into short thinking-panel lines."""
+    if kind == "tool_call":
+        title = (
+            str(update.get("title") or "").strip()
+            or str(update.get("toolName") or update.get("name") or "").strip()
+            or str(update.get("kind") or "tool").strip()
+        )
+        status = str(update.get("status") or "").strip()
+        path = ""
+        raw_input = update.get("rawInput") or update.get("input") or {}
+        if isinstance(raw_input, dict):
+            for k in ("path", "file_path", "filePath", "command", "pattern", "query"):
+                if raw_input.get(k):
+                    path = str(raw_input.get(k))
+                    break
+        line = f"▸ {title}"
+        if path:
+            # keep activity scannable
+            short = path if len(path) <= 80 else ("…" + path[-77:])
+            line += f"  {short}"
+        if status and status not in {"pending", "in_progress"}:
+            line += f"  ({status})"
+        return line + "\n"
+    if kind == "tool_call_update":
+        status = str(update.get("status") or "").strip()
+        title = str(update.get("title") or update.get("toolCallId") or "").strip()
+        if status in {"completed", "failed", "cancelled"}:
+            mark = "✓" if status == "completed" else "✗"
+            return f"{mark} {title or 'tool'} {status}\n"
+        return None
+    if kind == "plan":
+        entries = update.get("entries") or update.get("plan") or []
+        if not isinstance(entries, list) or not entries:
+            return None
+        lines = ["Plan:"]
+        for entry in entries[:12]:
+            if isinstance(entry, dict):
+                text = str(entry.get("content") or entry.get("title") or entry.get("text") or "").strip()
+                st = str(entry.get("status") or "").strip()
+                bullet = "•"
+                if st in {"completed", "done"}:
+                    bullet = "✓"
+                elif st in {"in_progress", "active"}:
+                    bullet = "→"
+                if text:
+                    lines.append(f"  {bullet} {text}")
+            elif isinstance(entry, str) and entry.strip():
+                lines.append(f"  • {entry.strip()}")
+        return ("\n".join(lines) + "\n") if len(lines) > 1 else None
+    return None
 
 
 def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
@@ -700,6 +819,18 @@ class ClaudeACPClient:
             effective_timeout = max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
 
         messages_list = list(messages or [])
+
+        if stream:
+            return self._iter_live_stream(
+                messages_list,
+                timeout_seconds=effective_timeout,
+                acp_model=acp_model,
+                acp_effort=effort,
+                hermes_model_hint=model,
+                tools=tools,
+                tool_choice=tool_choice,
+            )
+
         response_text, reasoning_text = self._run_prompt(
             messages_list,
             timeout_seconds=effective_timeout,
@@ -727,14 +858,132 @@ class ClaudeACPClient:
         )
         finish_reason = "tool_calls" if tool_calls else "stop"
         choice = SimpleNamespace(message=assistant_message, finish_reason=finish_reason)
-        completion = SimpleNamespace(
+        return SimpleNamespace(
             choices=[choice],
             usage=usage,
             model=model or "claude-acp",
         )
-        if stream:
-            return _completion_to_stream_chunks(completion)
-        return completion
+
+    def _iter_live_stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        timeout_seconds: float,
+        acp_model: str | None,
+        acp_effort: str | None,
+        hermes_model_hint: str | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+    ):
+        """Yield OpenAI-style chunks as ACP session/update events arrive.
+
+        Thought chunks → ``delta.reasoning_content`` (Desktop Thinking accordion).
+        Message chunks → ``delta.content``.
+        Native tool/plan activity → short reasoning lines (Claude Desktop vibe).
+        """
+        model_name = hermes_model_hint or "claude-acp"
+        live_q: queue.Queue[tuple[str, Any]] = queue.Queue()
+        _DONE = object()
+        result_box: dict[str, Any] = {}
+
+        def _on_live(kind: str, text: str) -> None:
+            if text:
+                live_q.put((kind, text))
+
+        def _worker() -> None:
+            try:
+                text, reasoning = self._run_prompt(
+                    messages,
+                    timeout_seconds=timeout_seconds,
+                    acp_model=acp_model,
+                    acp_effort=acp_effort,
+                    hermes_model_hint=hermes_model_hint,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    on_live_delta=_on_live,
+                )
+                result_box["text"] = text
+                result_box["reasoning"] = reasoning
+            except Exception as exc:
+                result_box["error"] = exc
+            finally:
+                live_q.put((_DONE, None))
+
+        thread = threading.Thread(target=_worker, daemon=True, name="claude-acp-stream")
+        thread.start()
+
+        saw_role = False
+        while True:
+            kind, payload = live_q.get()
+            if kind is _DONE:
+                break
+            if not saw_role:
+                # First chunk carries role so OpenAI-shaped consumers open the turn.
+                saw_role = True
+                role = "assistant"
+            else:
+                role = None
+            if kind in {"thought", "activity"}:
+                yield _openai_stream_chunk(
+                    model=model_name,
+                    reasoning=str(payload),
+                    role=role,
+                )
+            elif kind == "message":
+                yield _openai_stream_chunk(
+                    model=model_name,
+                    content=str(payload),
+                    role=role,
+                )
+
+        thread.join(timeout=5)
+        if "error" in result_box:
+            raise result_box["error"]
+
+        response_text = str(result_box.get("text") or "")
+        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+
+        # If the live path somehow missed the final text (e.g. only tool_call
+        # blocks with no agent_message_chunk), emit cleaned remainder once.
+        # We don't re-emit reasoning — live path already streamed it.
+        if tool_calls:
+            tool_call_deltas = []
+            for index, tool_call in enumerate(tool_calls):
+                tool_call_deltas.append(
+                    SimpleNamespace(
+                        index=index,
+                        id=getattr(tool_call, "id", None),
+                        type=getattr(tool_call, "type", "function"),
+                        function=SimpleNamespace(
+                            name=getattr(tool_call.function, "name", None),
+                            arguments=getattr(tool_call.function, "arguments", None),
+                        ),
+                    )
+                )
+            yield _openai_stream_chunk(
+                model=model_name,
+                content=cleaned_text or None,
+                tool_calls=tool_call_deltas,
+                finish_reason="tool_calls",
+                role=None if saw_role else "assistant",
+            )
+        else:
+            yield _openai_stream_chunk(
+                model=model_name,
+                finish_reason="stop",
+                role=None if saw_role else "assistant",
+            )
+
+        yield SimpleNamespace(
+            choices=[],
+            model=model_name,
+            usage=SimpleNamespace(
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+            ),
+        )
 
     def _run_prompt(
         self,
@@ -746,6 +995,7 @@ class ClaudeACPClient:
         hermes_model_hint: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
+        on_live_delta: Any = None,
     ) -> tuple[str, str]:
         with self._lock:
             try:
@@ -757,6 +1007,7 @@ class ClaudeACPClient:
                     hermes_model_hint=hermes_model_hint,
                     tools=tools,
                     tool_choice=tool_choice,
+                    on_live_delta=on_live_delta,
                 )
             except Exception:
                 # Dead/broken session — hard reset and retry once cold.
@@ -770,6 +1021,7 @@ class ClaudeACPClient:
                     tools=tools,
                     tool_choice=tool_choice,
                     force_full=True,
+                    on_live_delta=on_live_delta,
                 )
 
     def _run_prompt_unlocked(
@@ -783,6 +1035,7 @@ class ClaudeACPClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         force_full: bool = False,
+        on_live_delta: Any = None,
     ) -> tuple[str, str]:
         now = time.monotonic()
         if (
@@ -867,6 +1120,7 @@ class ClaudeACPClient:
             timeout_seconds=timeout_seconds,
             text_parts=text_parts,
             reasoning_parts=reasoning_parts,
+            on_live_delta=on_live_delta,
         )
 
         self._sent_message_count = len(messages)
@@ -1035,6 +1289,7 @@ class ClaudeACPClient:
         timeout_seconds: float,
         text_parts: list[str] | None = None,
         reasoning_parts: list[str] | None = None,
+        on_live_delta: Any = None,
     ) -> Any:
         proc = self._active_process
         inbox = self._inbox
@@ -1067,6 +1322,7 @@ class ClaudeACPClient:
                 cwd=self._acp_cwd,
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
+                on_live_delta=on_live_delta,
             ):
                 continue
 
@@ -1107,6 +1363,7 @@ class ClaudeACPClient:
         cwd: str,
         text_parts: list[str] | None,
         reasoning_parts: list[str] | None,
+        on_live_delta: Any = None,
     ) -> bool:
         method = msg.get("method")
         if not isinstance(method, str):
@@ -1115,15 +1372,47 @@ class ClaudeACPClient:
         if method == "session/update":
             params = msg.get("params") or {}
             update = params.get("update") or {}
-            kind = str(update.get("sessionUpdate") or "").strip()
-            content = update.get("content") or {}
-            chunk_text = ""
-            if isinstance(content, dict):
-                chunk_text = str(content.get("text") or "")
-            if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
-                text_parts.append(chunk_text)
-            elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
-                reasoning_parts.append(chunk_text)
+            if not isinstance(update, dict):
+                return True
+            kind = str(
+                update.get("sessionUpdate") or update.get("kind") or ""
+            ).strip()
+            content = update.get("content")
+            chunk_text = _acp_content_text(content)
+            # Some agents put text at the update root.
+            if not chunk_text:
+                chunk_text = _acp_content_text(update)
+
+            if kind in {"agent_message_chunk", "agent_message", "message"}:
+                if chunk_text and text_parts is not None:
+                    text_parts.append(chunk_text)
+                    if on_live_delta:
+                        try:
+                            on_live_delta("message", chunk_text)
+                        except Exception:
+                            pass
+            elif kind in {
+                "agent_thought_chunk",
+                "agent_thought",
+                "thought",
+                "thought_message_chunk",
+            }:
+                if chunk_text and reasoning_parts is not None:
+                    reasoning_parts.append(chunk_text)
+                    if on_live_delta:
+                        try:
+                            on_live_delta("thought", chunk_text)
+                        except Exception:
+                            pass
+            elif kind in {"tool_call", "tool_call_update", "plan"}:
+                activity = _format_acp_activity(kind, update)
+                if activity and reasoning_parts is not None:
+                    reasoning_parts.append(activity)
+                    if on_live_delta:
+                        try:
+                            on_live_delta("activity", activity)
+                        except Exception:
+                            pass
             return True
 
         if process.stdin is None:
@@ -1172,7 +1461,6 @@ class ClaudeACPClient:
                 denied = get_write_denied_error(str(path))
                 if denied:
                     raise PermissionError(denied)
-                # Auto mode (or fs write capability): still enforce Hermes path safety.
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(str(params.get("content") or ""), encoding="utf-8")
                 response = {
