@@ -281,15 +281,44 @@ def _permission_granted(message_id: Any, params: dict[str, Any]) -> dict[str, An
     options = params.get("options") if isinstance(params, dict) else None
     if not isinstance(options, list):
         options = []
-    for want in ("allow_always", "allow_once"):
+
+    def _opt_id(opt: dict[str, Any]) -> Any:
+        return opt.get("optionId") or opt.get("option_id") or opt.get("id") or opt.get("value")
+
+    def _opt_kind(opt: dict[str, Any]) -> str:
+        return str(
+            opt.get("kind")
+            or opt.get("optionId")
+            or opt.get("name")
+            or opt.get("label")
+            or ""
+        ).strip().lower()
+
+    # Prefer permanent allow, then once. Match kind OR optionId OR name/label.
+    for want in ("allow_always", "allow_once", "allow", "approve", "yes"):
         for opt in options:
             if not isinstance(opt, dict):
                 continue
-            kind = str(opt.get("kind") or opt.get("optionId") or "").strip().lower()
-            option_id = opt.get("optionId") or opt.get("option_id") or opt.get("id")
-            if kind == want or str(option_id or "").strip().lower() == want:
+            kind = _opt_kind(opt)
+            option_id = _opt_id(opt)
+            oid = str(option_id or "").strip().lower()
+            if want in kind or oid == want or want in oid:
                 if option_id is None:
-                    continue
+                    option_id = want
+                logger.info(
+                    "Claude ACP permission GRANT kind=%s optionId=%s options=%s",
+                    kind,
+                    option_id,
+                    [
+                        {
+                            "kind": o.get("kind"),
+                            "optionId": o.get("optionId") or o.get("option_id"),
+                            "name": o.get("name"),
+                        }
+                        for o in options
+                        if isinstance(o, dict)
+                    ],
+                )
                 return {
                     "jsonrpc": "2.0",
                     "id": message_id,
@@ -300,8 +329,37 @@ def _permission_granted(message_id: Any, params: dict[str, Any]) -> dict[str, An
                         }
                     },
                 }
-    # No allow option advertised — fall back to cancelled so the session
-    # doesn't hang waiting for a selection that isn't offered.
+
+    # Last resort: first option that does not look like reject/cancel.
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        kind = _opt_kind(opt)
+        if any(x in kind for x in ("reject", "deny", "cancel", "no")):
+            continue
+        option_id = _opt_id(opt)
+        if option_id is None:
+            continue
+        logger.info(
+            "Claude ACP permission GRANT fallback optionId=%s kind=%s",
+            option_id,
+            kind,
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": message_id,
+            "result": {
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": option_id,
+                }
+            },
+        }
+
+    logger.warning(
+        "Claude ACP permission DENY — no allow option in %s",
+        options,
+    )
     return _permission_denied(message_id)
 
 
@@ -708,7 +766,100 @@ class _ACPChatNamespace:
         self.completions = _ACPChatCompletions(client)
 
 
+
+class _SharedACPBackend:
+    """Process + ACP session shared across Hermes client lifetimes.
+
+    Hermes creates ``ClaudeACPClient(shared=False)`` and ``close()``s it after
+    every ``chat_completion_request`` (reuse_evict). Session reuse must therefore
+    live here — not on the facade instance — or every turn respawns
+    ``claude-agent-acp`` and in-flight permission requests abort.
+    """
+
+    def __init__(self, *, command: str, args: list[str], cwd: str):
+        self.command = command
+        self.args = list(args)
+        self.cwd = cwd
+        self.lock = threading.RLock()
+        self.active_process: subprocess.Popen[str] | None = None
+        self.inbox: queue.Queue[dict[str, Any]] | None = None
+        self.stderr_tail: deque[str] = deque(maxlen=40)
+        self.next_id = 0
+        self.session_id: str | None = None
+        self.applied_model: str | None = None
+        self.applied_effort: str | None = None
+        self.sent_messages_json: str | None = None
+        self.sent_message_count = 0
+        self.last_used_at = 0.0
+        self.idle_seconds = _resolve_idle_seconds()
+        self.permission_mode = _resolve_permission_mode()
+        self.reader_threads: list[threading.Thread] = []
+
+    def teardown(self) -> None:
+        proc = self.active_process
+        self.active_process = None
+        self.inbox = None
+        self.session_id = None
+        self.applied_model = None
+        self.applied_effort = None
+        self.sent_messages_json = None
+        self.sent_message_count = 0
+        self.reader_threads = []
+        if proc is None:
+            return
+        try:
+            if proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+_BACKENDS: dict[str, _SharedACPBackend] = {}
+_BACKENDS_LOCK = threading.Lock()
+
+
+def _backend_key(command: str, args: list[str], cwd: str) -> str:
+    return f"{command}\0{json.dumps(list(args), separators=(',', ':'))}\0{cwd}"
+
+
+def _acquire_backend(*, command: str, args: list[str], cwd: str) -> _SharedACPBackend:
+    key = _backend_key(command, args, cwd)
+    with _BACKENDS_LOCK:
+        backend = _BACKENDS.get(key)
+        if backend is None:
+            backend = _SharedACPBackend(command=command, args=args, cwd=cwd)
+            _BACKENDS[key] = backend
+            logger.info("Claude ACP backend created key_cwd=%s", cwd)
+        else:
+            # Refresh behavioral knobs without dropping the live session.
+            backend.permission_mode = _resolve_permission_mode()
+            backend.idle_seconds = _resolve_idle_seconds()
+        return backend
+
+
+def dispose_all_claude_acp_backends() -> int:
+    """Hard-kill every pooled ACP backend (tests / shutdown)."""
+    with _BACKENDS_LOCK:
+        items = list(_BACKENDS.items())
+        _BACKENDS.clear()
+    n = 0
+    for _key, backend in items:
+        with backend.lock:
+            backend.teardown()
+        n += 1
+    return n
+
+
 class ClaudeACPClient:
+
     """Minimal OpenAI-client-compatible facade for Claude Agent ACP.
 
     Process + ACP session are reused across chat.completions.create calls on
@@ -738,52 +889,130 @@ class ClaudeACPClient:
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
+        # Shared across Hermes reuse_evict client create/close cycles.
+        self._backend = _acquire_backend(
+            command=self._acp_command,
+            args=self._acp_args,
+            cwd=self._acp_cwd,
+        )
 
-        self._lock = threading.RLock()
-        self._active_process: subprocess.Popen[str] | None = None
-        self._inbox: queue.Queue[dict[str, Any]] | None = None
-        self._stderr_tail: deque[str] = deque(maxlen=40)
-        self._next_id = 0
-        self._session_id: str | None = None
-        self._applied_model: str | None = None
-        self._applied_effort: str | None = None
-        self._sent_messages_json: str | None = None
-        self._sent_message_count = 0
-        self._last_used_at = 0.0
-        self._idle_seconds = _resolve_idle_seconds()
-        self._permission_mode = _resolve_permission_mode()
-        self._reader_threads: list[threading.Thread] = []
+    # --- proxies onto the pooled backend (session reuse) -------------------
+    @property
+    def _lock(self) -> threading.RLock:
+        return self._backend.lock
+
+    @property
+    def _active_process(self) -> subprocess.Popen[str] | None:
+        return self._backend.active_process
+
+    @_active_process.setter
+    def _active_process(self, value: subprocess.Popen[str] | None) -> None:
+        self._backend.active_process = value
+
+    @property
+    def _inbox(self) -> queue.Queue[dict[str, Any]] | None:
+        return self._backend.inbox
+
+    @_inbox.setter
+    def _inbox(self, value: queue.Queue[dict[str, Any]] | None) -> None:
+        self._backend.inbox = value
+
+    @property
+    def _stderr_tail(self) -> deque[str]:
+        return self._backend.stderr_tail
+
+    @_stderr_tail.setter
+    def _stderr_tail(self, value: deque[str]) -> None:
+        self._backend.stderr_tail = value
+
+    @property
+    def _next_id(self) -> int:
+        return self._backend.next_id
+
+    @_next_id.setter
+    def _next_id(self, value: int) -> None:
+        self._backend.next_id = value
+
+    @property
+    def _session_id(self) -> str | None:
+        return self._backend.session_id
+
+    @_session_id.setter
+    def _session_id(self, value: str | None) -> None:
+        self._backend.session_id = value
+
+    @property
+    def _applied_model(self) -> str | None:
+        return self._backend.applied_model
+
+    @_applied_model.setter
+    def _applied_model(self, value: str | None) -> None:
+        self._backend.applied_model = value
+
+    @property
+    def _applied_effort(self) -> str | None:
+        return self._backend.applied_effort
+
+    @_applied_effort.setter
+    def _applied_effort(self, value: str | None) -> None:
+        self._backend.applied_effort = value
+
+    @property
+    def _sent_messages_json(self) -> str | None:
+        return self._backend.sent_messages_json
+
+    @_sent_messages_json.setter
+    def _sent_messages_json(self, value: str | None) -> None:
+        self._backend.sent_messages_json = value
+
+    @property
+    def _sent_message_count(self) -> int:
+        return self._backend.sent_message_count
+
+    @_sent_message_count.setter
+    def _sent_message_count(self, value: int) -> None:
+        self._backend.sent_message_count = value
+
+    @property
+    def _last_used_at(self) -> float:
+        return self._backend.last_used_at
+
+    @_last_used_at.setter
+    def _last_used_at(self, value: float) -> None:
+        self._backend.last_used_at = value
+
+    @property
+    def _idle_seconds(self) -> float:
+        return self._backend.idle_seconds
+
+    @property
+    def _permission_mode(self) -> str:
+        return self._backend.permission_mode
+
+    @property
+    def _reader_threads(self) -> list[threading.Thread]:
+        return self._backend.reader_threads
+
+    @_reader_threads.setter
+    def _reader_threads(self, value: list[threading.Thread]) -> None:
+        self._backend.reader_threads = value
 
     def close(self) -> None:
+        """Soft-close: Hermes reuse_evict calls this every turn.
+
+        Must NOT kill the ACP subprocess — that lives on ``_SharedACPBackend``
+        so the next ClaudeACPClient can resume the same session.
+        """
+        self.is_closed = True
+
+    def dispose(self) -> None:
+        """Hard-kill the pooled backend (idle tests / explicit shutdown)."""
         with self._lock:
             self._teardown_process_unlocked()
-            self.is_closed = True
+        self.is_closed = True
 
     def _teardown_process_unlocked(self) -> None:
-        proc = self._active_process
-        self._active_process = None
-        self._inbox = None
-        self._session_id = None
-        self._applied_model = None
-        self._applied_effort = None
-        self._sent_messages_json = None
-        self._sent_message_count = 0
-        self._reader_threads = []
-        if proc is None:
-            return
-        try:
-            if proc.stdin:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        self._backend.teardown()
 
     def _create_chat_completion(
         self,
@@ -1423,9 +1652,15 @@ class ClaudeACPClient:
 
         if method == "session/request_permission":
             mode = self._permission_mode
+            p = params if isinstance(params, dict) else {}
             if mode == "auto":
-                response = _permission_granted(message_id, params if isinstance(params, dict) else {})
+                response = _permission_granted(message_id, p)
             else:
+                logger.info(
+                    "Claude ACP permission DENY mode=%s tool=%s",
+                    mode,
+                    (p.get("toolCall") or p.get("tool_call") or p) if isinstance(p, dict) else p,
+                )
                 response = _permission_denied(message_id)
         elif method == "fs/read_text_file":
             try:
