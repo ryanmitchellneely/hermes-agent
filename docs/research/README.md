@@ -12,3 +12,4 @@ Deferred experiment **plans** (also under `~/.hermes/plans/`):
 - [`../plans/2026-08-07-k2-devbot-local-spark.md`](../plans/2026-08-07-k2-devbot-local-spark.md) — DevBot
 
 Student-lab golden/eval files live outside this repo: `~/Documents/student-lab/docs/` (no git yet).
+| [`UNFINISHED-WORK-2026-08-07.md`](UNFINISHED-WORK-2026-08-07.md) | Continuity ledger — open PRs, dirty trees, session trails |
