@@ -17,7 +17,7 @@
 | Item | Where | Board | Next |
 |------|--------|-------|------|
 | **EA one-queue + interrupt ≤3/day** | [#4348](https://github.com/joinsov/kevin-real-estate-tools/pull/4348) · worktree `teammate-ea-one-queue` clean | `t_ced7480f` · parent `t_4e9cc69a` | **root-tests FAIL** (pytest green) → fix → merge → then nudges `t_a02c40c1` |
-| **DevBot selftest** | [#4352](https://github.com/joinsov/kevin-real-estate-tools/pull/4352) checks **green** | pairs `t_d11fa676` | Merge when you want; refresh stale SPRINT.md (#4350 already **merged**) |
+| **DevBot selftest** | [#4352](https://github.com/joinsov/kevin-real-estate-tools/pull/4352) | pairs `t_d11fa676` | **MERGED** 2026-08-08 squash `dc2f7153f` |
 | **Claude ACP Max lane** | T1000 `ryan/herald-0.20-cutover` (pushed) | `t_e863f674` **done** | Picker refresh after Desktop thrash; Grok stays default |
 | **Research corpus** (signal-log, plans dual-write, indexes) | commits `00674e8c6` + `fe5426300` **pushed** | `t_498126c6` done | Done |
 
@@ -27,7 +27,7 @@
 |----|--------|
 | #4346 #4347 #4349 #4350 #4351 | **MERGED** |
 | #4348 | **OPEN** — one-queue + interrupt (root-tests red) |
-| #4352 | **OPEN** — DevBot selftest (green) |
+| #4352 | **MERGED** `dc2f7153f` |
 
 ---
 
@@ -73,7 +73,7 @@
 
 ## P3 — Aged open PRs (GitHub keeps them; not this week’s brain)
 
-Focus **#4348 + #4352**. Rest still exist if needed:
+Focus **#4348** next. Rest still exist if needed:
 
 - Arctic/legal cluster #4275–#4281 · phone #2872 · drafts #3790/#3755 · etc.  
 - `gh pr list --repo joinsov/kevin-real-estate-tools --author @me --state open`
@@ -110,7 +110,7 @@ Don’t reopen zombie 403 tabs.
 ## Ryan checklist (agent continuity only)
 
 1. **#4348** — fix root-tests → merge EA  
-2. **#4352** — merge DevBot selftest when convenient  
+2. ~~#4352~~ merged  
 3. Optional: Desktop Kanban plugin; Kevin Spark pull when he confirms  
 4. Optional: B17/B18 only on explicit kickoff  
 5. Ignore SBS/David/Gate/invoice **in this file** — desk board owns that  
