@@ -1,0 +1,19 @@
+# HUMAN: Kevin Spark model-pack pull + supervised DevBot (Ryan Spark ≠ Kevin)
+
+```yaml
+id: mesh_done_card:t_d11fa676@0
+source_kind: mesh_done_card
+source_path: t_d11fa676
+source_ref: t_d11fa676@0
+board: mesh
+captured_at: 2026-08-09T13:02:57Z
+status: draft
+status_changed_at: 2026-08-09T13:02:57Z
+superseded_by: null
+```
+
+**Session:** @session:default/20260807_153211_3806ee (same Claude ACP session tail)
+
+Set `status:` above to `filed` or `skipped` once reviewed (the sweep reads your edit back and never re-drafts mesh_done_card rows it has already seen).
+
+## notes
