@@ -1,0 +1,45 @@
+# Distillery intake sweep — source/board config.
+#
+# Design: docs/research/distillery-intake-sweep-design.md (mesh t_216ac84b)
+# Script: scripts/distillery_intake_sweep.py
+#
+# Nothing in the sweep hardcodes `mesh`, a repo path, or a skill name — every
+# one of those is a value read from this file. Multi-board v2 is "add a slug to
+# `boards:`" and nothing else.
+
+# Board source list — mesh-only for v1. Adding a board here is the *entire*
+# mechanism for scope expansion.
+boards:
+  - mesh
+
+sources:
+  plans:
+    enabled: true
+    path: "~/.hermes/plans"
+
+  signal_log:
+    enabled: true
+    # repo-relative — resolved against --repo-root
+    path: "docs/research/signal-log/entries"
+
+  mesh_done_cards:
+    enabled: true
+    # {board} is substituted per entry in `boards:` above
+    db_template: "~/.t1000/kanban/boards/{board}/kanban.db"
+    title_exclude_patterns:
+      # pr-kanban-sync wrapper cards — process bookkeeping, not artifacts
+      - "^HUMAN review: PR #"
+
+  skill_references:
+    enabled: true
+    trees:
+      - "~/.t1000/profiles/worker/skills/software-development/local-inference-fleet/references"
+      # additional references/ trees are added here, never in the script
+
+filters:
+  signal_log:
+    # `watch` stays IN — still citation-worthy (design §2)
+    exclude_posture: [ignore]
+    exclude_bucket: [noise]
+
+staleness_days: 5
