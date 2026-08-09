@@ -154,17 +154,32 @@ Related mesh todos from crucible sprint: `t_92726064` estate ledger · `t_43bef3
 
 ## 7. Signal log entries (research → steals)
 
-Under `T1000/docs/research/signal-log/entries/` (uncommitted):
+Under `T1000/docs/research/signal-log/entries/`. **Refreshed 2026-08-09** — this section had gone
+stale at 5 entries while 7 more existed on disk, i.e. the cold-start map was hiding more than half
+the corpus. Re-check it whenever `INDEX.md` grows.
 
 | ID | Title | Rank | Wire |
 |----|-------|------|------|
-| SIG-20260806-01 | Latent Space inference eng | P0 | B17 plan |
+| SIG-20260809-01 | **Repair pass beats 6× memory** (danpacary) | **P0** | `t_6506193d` A/B/C incl. blind-retry control; reframes `t_43e997d2` |
+| SIG-20260808-06 | DS4-Flash fork +27% (Entrpi v0.5.6) | **P0** | `t_43e997d2` (fork propose) · `t_716141c4` (upstream DSpark = 1.01×, CUDA has no spec path) |
+| SIG-20260808-05 | Hermes Agent Dock v0.2.1 | P1 | `t_647eb43e` side-channel; 2 steals ✅ likely already in schema |
+| SIG-20260808-04 | sparkDash multi-Spark monitor | P1 | 🟡 partial — scoreboard live, `t_d0277c0b` tok/s gap |
+| SIG-20260808-03 | Cross-model KV transfer (NVIDIA) | P1 | `t_c9399728` sticky-model prefill tax |
+| SIG-20260808-02 | Codex Router | P1 | ✅ **shipped** — B22 parent/child split · `t_cf82f21c` alias purge |
+| SIG-20260808-01 | Cloudflare Computer | watch P2 | none — preview only |
+| SIG-20260807-04 | Oh-My-Hermes | P1 | 🟡 router verbs via `t_d754cc37` |
+| SIG-20260807-03 | McNab 32× Spark | P0 | B17 Phase C2 → decomposed `t_fd210e86` |
+| SIG-20260807-02 | Prime Agent | P1 | skill `agent-harness-compare` · `t_b6d1a13d` /refine |
 | SIG-20260807-01 | kimi-k3-in-c | watch | none |
-| SIG-20260807-02 | Prime Agent | P1 | skill agent-harness-compare |
-| SIG-20260807-03 | McNab 32× Spark | P0 | B17 Phase C2 |
-| SIG-20260807-04 | Oh-My-Hermes | P1 | router verbs open |
+| SIG-20260806-01 | Latent Space inference eng | P0 | B17 plan · `t_01ac807e` |
 
-Rollup: `STEALS.md` · process: `README.md`.
+Rollup: `STEALS.md` (card-verified 2026-08-08) · process: `README.md` · skill: `signal-log`.
+
+**⚠️ Durability (checked 2026-08-09):** only `SIG-20260806-01` is git-tracked. **The other 11 entries
+are untracked**, and `INDEX.md`/`STEALS.md` are modified-uncommitted, on branch
+`ryan/herald-0.20-cutover`. The research intake therefore exists **only on this Mac's disk** — and
+FileVault is OFF on this machine. Card `t_498126c6` (blocked on Ryan OK to commit) is the fix; it is
+the single highest-consequence blocked item in the research lane.
 
 ---
 
@@ -179,7 +194,7 @@ Index there; Sun/Wed cron path. Not mesh free-fire.
 
 | Item | Action |
 |------|--------|
-| `T1000/docs/research/signal-log/**` uncommitted | `t_498126c6` — commit when Ryan OK |
+| `T1000/docs/research/signal-log/**` uncommitted — **11 of 12 entries untracked** (verified 2026-08-09), disk-only, FileVault OFF | `t_498126c6` — commit when Ryan OK |
 | `AGENT-HARNESS-RESEARCH-INDEX.md` **merge conflict markers** | File on **k2** board (not mesh product) — fix before trust |
 | `PORTFOLIO.md` priority table stale vs board | refreshed same night as this index |
 | sovereign-consulting estate branch dirty extras | `t_f4cd0a55` human push |
@@ -220,3 +235,13 @@ Index there; Sun/Wed cron path. Not mesh free-fire.
 ---
 
 *End index. Update this file when a new plan/skill/major research pack lands; add one mesh comment on the REF card.*
+
+## 2026-08-09 — Fleet PM deep dive + dual-box endgame (added by ryan-claude)
+
+| You need… | Open first |
+|-----------|------------|
+| Fleet 1-by-1 verdicts + auth-cliff dates + spec index | `docs/research/fleet-roadmap-2026-08-09/00-FLEET-ROADMAP.md` |
+| Dual-box wave state (W0-W4, all closed except W4 ack) | `~/.t1000/kanban/ROADMAP-DUAL-BOX-2026-08-09.md` |
+| **B-vs-D decision packet for Kevin's ack** | `docs/research/fleet-roadmap-2026-08-09/W4-DECISION-PACKET.md` → ack on mesh `t_a97cf1e6` |
+| Product specs (router / review-agent / job-gen / local-first / reliability / chip-gates) | `docs/research/fleet-roadmap-2026-08-09/spec-*.md` |
+| PM recon evidence (Juice/Herald/EA · Pulp/Popper/student/advisory · factory · K2 stack) | `docs/research/fleet-roadmap-2026-08-09/pm-*-report.md` |
