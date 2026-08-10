@@ -1936,6 +1936,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     config=diag_config,
                 )
             }
+            oldest_ready = None  # board-wide gauge doesn't apply to single-task mode
         else:
             # Fleet mode: pull all non-archived tasks + their events/runs.
             rows = list(conn.execute(
@@ -1944,6 +1945,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             ids = [r["id"] for r in rows]
             if not ids:
                 diags_by_task = {}
+                oldest_ready = None
             else:
                 placeholders = ",".join(["?"] * len(ids))
                 ev_by = {i: [] for i in ids}
@@ -1971,6 +1973,11 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     )
                     if dl:
                         diags_by_task[tid] = dl
+                # Board-wide gauge (t_e2f6312c): the oldest ready+unclaimed
+                # task regardless of whether it's crossed the diagnostic's
+                # own threshold — lets a cockpit trust silence as "clean,"
+                # not "not computed."
+                oldest_ready = kd.oldest_ready_unclaimed(rows, ev_by)
 
         # Severity filter.
         sev = getattr(args, "severity", None)
@@ -1996,16 +2003,34 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 }
 
     if getattr(args, "json", False):
-        out_json = [
-            {
-                "task_id": tid,
-                **meta.get(tid, {}),
-                "diagnostics": [d.to_dict() for d in dl],
-            }
-            for tid, dl in diags_by_task.items()
-        ]
+        out_json = {
+            "tasks": [
+                {
+                    "task_id": tid,
+                    **meta.get(tid, {}),
+                    "diagnostics": [d.to_dict() for d in dl],
+                }
+                for tid, dl in diags_by_task.items()
+            ],
+            "oldest_ready_unclaimed": oldest_ready,
+        }
         print(json.dumps(out_json, indent=2, ensure_ascii=False))
         return 0
+
+    # Board-wide gauge line — fleet mode only, printed even when clean so
+    # a glance can trust silence over the age number as "nothing ready and
+    # unclaimed," not "not computed."
+    if not getattr(args, "task", None):
+        if oldest_ready is None:
+            print("Oldest ready+unclaimed: none")
+        else:
+            age = oldest_ready["age_seconds"]
+            age_str = f"{age / 3600:.1f}h" if age >= 3600 else f"{int(age / 60)}m"
+            print(
+                f"Oldest ready+unclaimed: {age_str} "
+                f"({oldest_ready['task_id']} @{oldest_ready['assignee']})"
+            )
+        print()
 
     if not diags_by_task:
         print("No active diagnostics on this board.")

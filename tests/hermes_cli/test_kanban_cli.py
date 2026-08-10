@@ -113,6 +113,49 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# diagnostics --json / human: oldest_ready_unclaimed gauge wiring (t_e2f6312c)
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_json_reports_oldest_ready_unclaimed(kanban_home):
+    import re
+
+    out1 = kc.run_slash("create 'watch me sit ready' --assignee demo")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m
+    tid = m.group(1)
+
+    raw = kc.run_slash("diagnostics --json")
+    payload = json.loads(raw)
+    assert isinstance(payload["tasks"], list)
+    assert payload["oldest_ready_unclaimed"]["task_id"] == tid
+    assert payload["oldest_ready_unclaimed"]["assignee"] == "demo"
+    assert payload["oldest_ready_unclaimed"]["age_seconds"] >= 0
+
+
+def test_diagnostics_human_output_shows_oldest_ready_line(kanban_home):
+    import re
+
+    out1 = kc.run_slash("create 'watch me sit ready too' --assignee demo")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m
+    tid = m.group(1)
+
+    out = kc.run_slash("diagnostics")
+    assert f"Oldest ready+unclaimed:" in out
+    assert tid in out
+
+
+def test_diagnostics_reports_none_on_a_clean_board(kanban_home):
+    raw = kc.run_slash("diagnostics --json")
+    payload = json.loads(raw)
+    assert payload["oldest_ready_unclaimed"] is None
+
+    out = kc.run_slash("diagnostics")
+    assert "Oldest ready+unclaimed: none" in out
+
+
+# ---------------------------------------------------------------------------
 # reclaim + reassign CLI smoke tests
 # ---------------------------------------------------------------------------
 

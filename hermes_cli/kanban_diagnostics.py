@@ -955,6 +955,88 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+# Event kinds that put a task into ``ready`` status. ``created`` covers
+# tasks born ready; ``promoted`` covers parent-done auto-promotion;
+# ``reclaimed`` covers TTL/crash recovery; ``unblocked`` covers
+# human-driven resumes.
+_READY_TRANSITION_KINDS = {"created", "promoted", "reclaimed", "unblocked"}
+
+
+def _last_ready_transition_ts(task, events: Iterable[Any]) -> int:
+    """Timestamp of the most recent event that put ``task`` into ``ready``.
+
+    Falls back to ``created_at`` on the task row when no qualifying event
+    is found (very old task or truncated event history) — better to
+    occasionally over-count an ancient task's age than under-count it.
+    Returns 0 when neither source yields a timestamp.
+    """
+    last_ready_ts = 0
+    for ev in events:
+        if _event_kind(ev) in _READY_TRANSITION_KINDS:
+            last_ready_ts = max(last_ready_ts, _event_ts(ev))
+    if last_ready_ts == 0:
+        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+    return last_ready_ts
+
+
+def _is_stranded_candidate(task) -> Optional[str]:
+    """Return the task's assignee if it's eligible for stranded-in-ready
+    accounting (status ``ready``, no live claim, non-blank assignee), else
+    ``None``.
+
+    Truly unassigned tasks are excluded on purpose: the dispatcher's own
+    ``skipped_unassigned`` signal already covers that case, and this stays
+    the single selection rule shared by the per-task diagnostic and the
+    board-wide oldest-ready gauge below.
+    """
+    if _task_field(task, "status") != "ready":
+        return None
+    if _task_field(task, "claim_lock"):
+        return None
+    assignee = _task_field(task, "assignee") or ""
+    if not assignee.strip():
+        return None
+    return assignee
+
+
+def oldest_ready_unclaimed(
+    tasks: Iterable[Any],
+    events_by_id: dict,
+    *,
+    now: Optional[int] = None,
+) -> Optional[dict]:
+    """Board-wide gauge: the single oldest ``ready``+unclaimed+assigned
+    task, independent of ``stranded_threshold_seconds``.
+
+    ``_rule_stranded_in_ready`` only speaks once a task crosses the
+    threshold — silence before that point is indistinguishable from
+    "nothing is ready-and-unclaimed" from a cockpit glance. This is the
+    raw number so a human or another alert can watch the trend, not just
+    the trip.
+
+    Returns ``None`` when no task on the board qualifies.
+    """
+    now_ts = int(now if now is not None else time.time())
+    oldest: Optional[dict] = None
+    for task in tasks:
+        assignee = _is_stranded_candidate(task)
+        if assignee is None:
+            continue
+        task_id = _task_field(task, "id")
+        last_ready_ts = _last_ready_transition_ts(task, events_by_id.get(task_id, []))
+        if last_ready_ts == 0:
+            continue
+        age_seconds = now_ts - last_ready_ts
+        if oldest is None or age_seconds > oldest["age_seconds"]:
+            oldest = {
+                "task_id": task_id,
+                "assignee": assignee,
+                "ready_since": last_ready_ts,
+                "age_seconds": int(age_seconds),
+            }
+    return oldest
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
     claiming it.
@@ -985,39 +1067,11 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     threshold_seconds = float(
         cfg.get("stranded_threshold_seconds", 30 * 60)
     )
-    status = _task_field(task, "status")
-    if status != "ready":
-        return []
-    # Skip tasks with a live claim — they're being worked on, even if
-    # the worker hasn't reported progress yet (run-level liveness
-    # extends the claim TTL; we don't want to second-guess that here).
-    if _task_field(task, "claim_lock"):
-        return []
-    assignee = _task_field(task, "assignee") or ""
-    if not assignee.strip():
-        # Unassigned tasks: the dispatcher's ``skipped_unassigned`` is
-        # already the right signal. A separate diagnostic here would
-        # double-flag the same condition.
+    assignee = _is_stranded_candidate(task)
+    if assignee is None:
         return []
 
-    # Find the most recent event that put this task into ready.
-    # ``created`` covers tasks born ready; ``promoted`` covers parent-
-    # done auto-promotion; ``reclaimed`` covers TTL/crash recovery;
-    # ``unblocked`` covers human-driven resumes.
-    READY_TRANSITION_KINDS = {
-        "created", "promoted", "reclaimed", "unblocked",
-    }
-    last_ready_ts = 0
-    for ev in events:
-        if _event_kind(ev) in READY_TRANSITION_KINDS:
-            t = _event_ts(ev)
-            last_ready_ts = max(last_ready_ts, t)
-
-    # Fallback: if no qualifying event exists (very old task or events
-    # truncated), fall back to ``created_at`` on the task row. Better
-    # to occasionally over-flag an ancient task than miss a stranded one.
-    if last_ready_ts == 0:
-        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+    last_ready_ts = _last_ready_transition_ts(task, events)
     if last_ready_ts == 0:
         return []
 

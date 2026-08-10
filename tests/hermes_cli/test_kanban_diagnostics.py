@@ -198,6 +198,59 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].data["assignee"] == "demo"
 
 
+# ---------------------------------------------------------------------------
+# oldest_ready_unclaimed — board-wide gauge (t_e2f6312c)
+# ---------------------------------------------------------------------------
+
+
+def test_oldest_ready_unclaimed_picks_the_oldest_across_the_board():
+    now = 100_000
+    tasks = [
+        _task(id="t_a", status="ready", assignee="demo", claim_lock=None),
+        _task(id="t_b", status="ready", assignee="demo", claim_lock=None),
+    ]
+    events_by_id = {
+        "t_a": [_event("created", ts=now - 5 * 60)],
+        "t_b": [_event("created", ts=now - 47 * 60)],
+    }
+    oldest = kd.oldest_ready_unclaimed(tasks, events_by_id, now=now)
+    assert oldest["task_id"] == "t_b"
+    assert oldest["age_seconds"] == 47 * 60
+    assert oldest["assignee"] == "demo"
+
+
+def test_oldest_ready_unclaimed_returns_none_when_board_is_clean():
+    now = 100_000
+    tasks = [
+        # Running: has a claim, so it's being worked, not stranded.
+        _task(id="t_running", status="ready", assignee="demo", claim_lock="worker-1"),
+        # Truly unassigned: covered by the dispatcher's own signal, not this gauge.
+        _task(id="t_unassigned", status="ready", assignee="", claim_lock=None),
+        # Not ready at all.
+        _task(id="t_done", status="done", assignee="demo", claim_lock=None),
+    ]
+    events_by_id = {
+        "t_running": [_event("created", ts=now - 3600)],
+        "t_unassigned": [_event("created", ts=now - 3600)],
+        "t_done": [_event("created", ts=now - 3600)],
+    }
+    assert kd.oldest_ready_unclaimed(tasks, events_by_id, now=now) is None
+
+
+def test_oldest_ready_unclaimed_ignores_threshold_reports_any_age():
+    """Unlike the stranded_in_ready diagnostic, the gauge has no minimum
+    age — it reports the current oldest even at zero, so a cockpit can
+    trust silence means "no ready+unclaimed tasks," not "not computed."""
+    now = 100_000
+    tasks = [_task(id="t_fresh", status="ready", assignee="demo", claim_lock=None)]
+    events_by_id = {"t_fresh": [_event("created", ts=now - 5)]}
+    oldest = kd.oldest_ready_unclaimed(tasks, events_by_id, now=now)
+    assert oldest == {
+        "task_id": "t_fresh",
+        "assignee": "demo",
+        "ready_since": now - 5,
+        "age_seconds": 5,
+    }
 
 
 # ---------------------------------------------------------------------------
