@@ -1,0 +1,22 @@
+[Unit]
+Description=DS4 liveness watchdog (one-shot heartbeat check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ryan-lab
+Group=ds4-ops
+ExecStart=/usr/local/libexec/ds4-watchdog.sh
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ds4-watchdog
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
