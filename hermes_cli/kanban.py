@@ -2658,16 +2658,54 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-        )
+
+    # AUDIT-2026-08-08-worker-cap-and-lab.md, follow-up (1): this CLI path
+    # used to call dispatch_once() without ever checking the gateway's
+    # singleton `.dispatcher.lock` — a concurrent gateway tick and a CLI
+    # `kanban dispatch` invocation could each read "under cap" and each
+    # spawn, bursting past kanban.max_in_progress_per_profile even though
+    # dispatch_once() itself is internally consistent per call. --dry-run
+    # makes no spawns/writes (only its own per-profile counter, for
+    # reporting), so it's exempt and always allowed to run for visibility.
+    lock_handle = None
+    if not args.dry_run:
+        try:
+            from gateway.kanban_watchers import (
+                _acquire_singleton_lock,
+                _release_singleton_lock,
+            )
+            lock_path = kb.kanban_home() / "kanban" / ".dispatcher.lock"
+            lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+        except Exception:
+            lock_handle, lock_state = None, "unavailable"
+        if lock_state == "contended":
+            msg = (
+                "kanban: dispatcher lock is held by a running gateway "
+                "(its embedded dispatcher owns this board) — skipping CLI "
+                "dispatch to avoid a duplicate-spawn race. The gateway will "
+                "pick up ready tasks on its own next tick."
+            )
+            if getattr(args, "json", False):
+                print(json.dumps({"skipped_locked": True, "reason": msg}, indent=2))
+            else:
+                print(msg)
+            return 0
+
+    try:
+        with kb.connect_closing() as conn:
+            res = kb.dispatch_once(
+                conn,
+                dry_run=args.dry_run,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+            )
+    finally:
+        if lock_handle is not None:
+            from gateway.kanban_watchers import _release_singleton_lock
+            _release_singleton_lock(lock_handle)
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,

@@ -94,3 +94,99 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+# ---------------------------------------------------------------------------
+# AUDIT-2026-08-08-worker-cap-and-lab.md follow-up (1): CLI dispatch must
+# flock the same `.dispatcher.lock` a running gateway holds — a concurrent
+# gateway tick and an unguarded CLI dispatch could each see "under cap" and
+# each spawn, bursting past kanban.max_in_progress_per_profile even though
+# dispatch_once() is internally consistent per call.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_dispatch_skips_when_gateway_holds_dispatcher_lock(isolated_kanban_home, monkeypatch):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+    called = {"dispatch_once": False}
+
+    def fake_dispatch_once(conn, **kwargs):
+        called["dispatch_once"] = True
+        return kanban_db.DispatchResult()
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._acquire_singleton_lock",
+        lambda path: (None, "contended"),
+    )
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
+    rc = kb_cli._cmd_dispatch(args)
+
+    assert rc == 0
+    assert called["dispatch_once"] is False, (
+        "must not call dispatch_once while the gateway holds the lock"
+    )
+
+
+def test_cli_dispatch_acquires_and_releases_lock_when_free(isolated_kanban_home, monkeypatch):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        kanban_db, "dispatch_once", lambda conn, **kw: kanban_db.DispatchResult()
+    )
+
+    sentinel = object()
+    acquired = {}
+    released = {}
+
+    def fake_acquire(path):
+        acquired["path"] = path
+        return sentinel, "held"
+
+    def fake_release(handle):
+        released["handle"] = handle
+
+    monkeypatch.setattr("gateway.kanban_watchers._acquire_singleton_lock", fake_acquire)
+    monkeypatch.setattr("gateway.kanban_watchers._release_singleton_lock", fake_release)
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
+    rc = kb_cli._cmd_dispatch(args)
+
+    assert rc == 0
+    assert acquired.get("path") is not None
+    assert released.get("handle") is sentinel, "must release the lock it acquired"
+
+
+def test_cli_dispatch_dry_run_bypasses_lock_check(isolated_kanban_home, monkeypatch):
+    """--dry-run makes no spawns/writes, so it must never even touch the
+    dispatcher lock — it stays usable for visibility while a gateway owns
+    the board."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+    called = {"dispatch_once": False}
+
+    def fake_dispatch_once(conn, **kwargs):
+        called["dispatch_once"] = True
+        return kanban_db.DispatchResult()
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+
+    def fail_if_called(path):
+        raise AssertionError("dry-run must not touch the dispatcher lock at all")
+
+    monkeypatch.setattr("gateway.kanban_watchers._acquire_singleton_lock", fail_if_called)
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    rc = kb_cli._cmd_dispatch(args)
+
+    assert rc == 0
+    assert called["dispatch_once"] is True
+
+
