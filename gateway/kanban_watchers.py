@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -23,6 +24,34 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+# Written every tick, unconditionally, regardless of whether anything spawned
+# or a tick raised — the loop dying silently (2026-08-10 incident: dispatcher
+# stopped claiming for ~16h with no crash, no traceback, gateway itself
+# healthy) is invisible from log lines alone, since a zero-activity tick was
+# never logged at all. An external watcher checking this file's mtime is the
+# only thing that can tell "idle" from "dead" (mesh t_e2f6312c).
+_DISPATCHER_HEARTBEAT_PATH = (
+    Path.home() / ".t1000" / "logs" / "kanban_dispatcher_status.json"
+)
+
+
+def _write_dispatcher_heartbeat(**fields: Any) -> None:
+    """Best-effort, atomic (.tmp + replace) — must never be able to break the
+    dispatcher loop it is reporting on."""
+    try:
+        path = _DISPATCHER_HEARTBEAT_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": time.time(),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **fields,
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001 — heartbeat writer must never crash the loop
+        logger.exception("kanban dispatcher: heartbeat write failed")
 
 
 def _resolve_auto_decompose_settings(
@@ -1536,6 +1565,11 @@ class GatewayKanbanWatchersMixin:
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
+
+            # Unconditional — fires whether this tick spawned, was idle, or
+            # hit the generic Exception handler above. Only real shutdown
+            # (CancelledError, re-raised) skips it. See _DISPATCHER_HEARTBEAT_PATH.
+            _write_dispatcher_heartbeat(interval_s=interval, bad_ticks=bad_ticks)
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
