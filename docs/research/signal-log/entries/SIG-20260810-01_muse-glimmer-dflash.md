@@ -201,6 +201,51 @@ model's real ceiling on Apple Silicon, or whether Ollama/GGUF's Metal backend is
 throughput on the table against a native path (MLX ships its own `30b-mlx` tag at the same 21GB —
 untested here, a candidate follow-up if the vision capability sees real use).
 
+**MLX follow-up, same day (per Ryan's ask, and a live worked example of the new
+`model-bench-preflight.md` doctrine catching a wrong read before it shipped):**
+
+Ollama's `muse-glimmer:30b-mlx` tag is **not real MLX** — verified same model ID (`ef32a55b4976`)
+as `30b-nvfp4-dflash`, an alias to the identical GGUF blob. Real MLX execution needs Apple's own
+toolchain, entirely separate from Ollama. Found genuine weights at
+`mlx-community/Muse-Glimmer-30B-4bit` (ungated, real safetensors, verified before downloading).
+
+`mlx_lm` rejected it (`model_type muse_glimmer not supported`) — wrong tool, this is a
+vision-language model; the repo's own README named `mlx-vlm` as correct. `mlx-vlm` rejected it too,
+on a more precise error: `No module named mlx_vlm.speculative.drafters.muse_glimmer` — fired even
+with no `--draft-model` flag passed, meaning Muse Glimmer's config self-declares its paired drafter
+and `mlx-vlm`'s model registry needs that submodule to exist just to recognize the base
+architecture at all. Checked for a version gate before concluding incompatible: PyPI-stable
+`mlx-vlm` is **0.6.10** (confirmed current PyPI latest); the mlx-community conversion README says
+it used **0.6.12**. Installed straight from GitHub main — landed on **0.6.11**, still one point
+short. **Genuine, precisely-diagnosed software lag** (model launched today; the tooling hasn't
+caught up across *two separate ecosystems* now — Ollama on ryan-spark, `mlx-vlm` on the Mac), not
+a hardware or model-quality finding. Did not attempt to patch/stub the missing module — that's
+writing code for someone else's library, out of scope for a bench spike. Cleaned up the 21GB
+download. **Revisit trigger: check again once `mlx-vlm` ships ≥0.6.12 publicly.** Until then the
+corrected GGUF/Ollama number (20.7 tok/s, decode-only, real code output) stands as the best
+measured figure on this hardware.
+
+**RESOLVED same day (Fable, on Ryan's "take a look and fix this"):** the missing 0.6.12 was
+findable — **mlx-vlm PR #1838 "Add Muse Glimmer model support"**, open/unmerged, authored by the
+repo owner himself (purely additive, 9 files, +1337; due-diligence checked before installing).
+`pip install git+...@refs/pull/1838/head` → 0.6.12, model loads and generates under real MLX.
+
+**MLX measured (python API, native `generation_tps`, temp 0, 256 tok, 3 runs, single load):
+12.3 / 12.8 / 13.1 → avg 12.7 tok/s** (prompt ~80 tps). **Real MLX is ~40% *slower* than
+Ollama/GGUF-Metal (20.7) for this model today** — the "native path must be faster on Apple
+Silicon" prior fails for a launch-day model riding an hours-old support PR. Condition caveat: this
+conversion's chat template **hard-pins "Reasoning strength: high"** (`thinking_mode=disabled`,
+`reasoning_effort=none`, and plain all render identically), so MLX ran reasoning-mode — but 12.7
+also loses to Ollama's reasoning-mode figures (~15–18), so the verdict is robust to the mismatch.
+Output verified code-like in all runs despite the reasoning channel.
+
+**Standing:** Ollama `nvfp4` (20.7 tok/s + working vision) is the serving path for this model on
+the MBP. MLX weights removed (reproducible); `mlx-vlm` left at the PR build. **Revisit after
+PR #1838 + #1839 merge and a re-converted repo** (the current conversion may predate #1839's
+embed_norm quant fix; launch-day MLX conversions typically improve). This full arc — alias-tag
+catch → wrong-toolkit catch → version-gate catch → PR-source fix → honest negative — is the worked
+example `model-bench-preflight.md` exists for.
+
 **Disposition:** dflash tag removed (unambiguous). Plain `nvfp4` (19GB) **kept** on the MBP —
 not for throughput, but as the only local vision option on the fleet; 19GB is cheap on a
 438GB-free Mac and there's no confirmed near-term vision use case yet, so this is a soft call,
