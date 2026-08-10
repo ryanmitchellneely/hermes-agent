@@ -1498,9 +1498,13 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
+    # Provider-aware: ACP backends don't natively bind Hermes tools, so they
+    # get an addendum on how to actually reach the board (<tool_call> blocks).
+    from agent.prompt_builder import build_kanban_guidance
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        build_kanban_guidance(getattr(agent, "provider", None))
+        if "kanban_show" in agent.valid_tool_names
+        else ""
     )
 
     # Check tool requirements

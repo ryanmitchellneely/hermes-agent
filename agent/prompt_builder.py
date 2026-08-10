@@ -211,7 +211,7 @@ KANBAN_GUIDANCE = (
     "You have been assigned ONE task from "
     "the shared board at `~/.hermes/kanban.db`. Your task id is in "
     "`$HERMES_KANBAN_TASK`; your workspace is `$HERMES_KANBAN_WORKSPACE`. "
-    "The `kanban_*` tools in your schema are your primary coordination surface — "
+    "The `kanban_*` tools are your primary coordination surface — "
     "they write directly to the shared SQLite DB and work regardless of terminal "
     "backend (local/docker/modal/ssh).\n"
     "\n"
@@ -307,8 +307,9 @@ KANBAN_GUIDANCE = (
     "\n"
     "## Do NOT\n"
     "\n"
-    "- Do not shell out to `hermes kanban <verb>` for board operations. Use "
-    "the `kanban_*` tools — they work across all terminal backends.\n"
+    "- Do not shell out to `hermes kanban <verb>` for board operations unless "
+    "a section below explicitly sanctions it as a fallback. Use the "
+    "`kanban_*` tools — they work across all terminal backends.\n"
     "- Do not complete a task you didn't actually finish. Block it.\n"
     "- Do not call `clarify` to ask questions. You are running headless — "
     "there is no live user to answer. The call will time out and the task "
@@ -321,6 +322,58 @@ KANBAN_GUIDANCE = (
     "for short reasoning subtasks inside your own run; board tasks are for "
     "cross-agent handoffs that outlive one API loop."
 )
+
+# Appended to KANBAN_GUIDANCE only for ACP-backed workers. On an ACP backend
+# the model-facing tool surface belongs to the backend agent (Claude Code /
+# Copilot), so Hermes tools are NOT natively bound — they are forwarded as
+# text in the "Available tools (OpenAI function schema)" preamble and reached
+# by emitting <tool_call> blocks, which the client parses back into real tool
+# calls (agent/claude_acp_client.py `_extract_tool_calls_from_text`, wired at
+# `_create_chat_completion`). Without this section the base guidance reads as
+# a promise of tools the backend cannot see, and workers conclude the board is
+# unreachable after one native call fails.
+_ACP_PROVIDERS = frozenset({"claude-acp", "copilot-acp"})
+
+KANBAN_ACP_TOOL_GUIDANCE = (
+    "\n"
+    "\n"
+    "## Reaching the board on this (ACP) backend\n"
+    "\n"
+    "Your model runs behind an ACP backend, so `kanban_*` is **not** in the "
+    "backend's own native tool list — those tools live on the Hermes side and "
+    "are forwarded to you in the `Available tools (OpenAI function schema)` "
+    "block. Call one by emitting a `<tool_call>` block as your message text:\n"
+    "\n"
+    "    <tool_call>{\"id\":\"c1\",\"type\":\"function\","
+    "\"function\":{\"name\":\"kanban_complete\","
+    "\"arguments\":\"{\\\"summary\\\": \\\"what I shipped\\\"}\"}}</tool_call>\n"
+    "\n"
+    "`arguments` must be a JSON **string**, not a nested object. Hermes parses "
+    "the block, runs the tool, and returns the result as a normal tool "
+    "message — so the documented lifecycle above works unchanged.\n"
+    "\n"
+    "- If the backend answers `No such tool available: kanban_<verb>`, you "
+    "attempted a native call. The tool exists; re-issue it as a `<tool_call>` "
+    "text block.\n"
+    "- Emit board `<tool_call>` blocks as their own message rather than mixed "
+    "into a turn that also uses the backend's native tools.\n"
+    "- **Sanctioned CLI fallback** — only after the block protocol has failed "
+    "twice: `hermes kanban --board $HERMES_KANBAN_BOARD <verb> "
+    "$HERMES_KANBAN_TASK ...` (`--board` goes BEFORE the verb). It writes to "
+    "the same DB, so it is a real terminal state; note in your handoff that "
+    "you used it so the binding defect stays visible."
+)
+
+
+def build_kanban_guidance(provider: Optional[str] = None) -> str:
+    """KANBAN_GUIDANCE, plus the ACP addendum when the backend needs it.
+
+    Kept as a function (not a constant) because the correct text depends on
+    the resolved provider, which isn't known at import time.
+    """
+    if (provider or "").strip().lower() in _ACP_PROVIDERS:
+        return KANBAN_GUIDANCE + KANBAN_ACP_TOOL_GUIDANCE
+    return KANBAN_GUIDANCE
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
