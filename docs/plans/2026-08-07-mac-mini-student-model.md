@@ -86,6 +86,11 @@ Juice's evidence store, so the R0 contract stays literally intact). It unblocks 
 halves Phase C's compute, and still never persists message bodies. **A is the safe default if
 Ryan prefers zero judgments-at-rest.** Do not implement C without a re-scoped authorization.
 
+> **✅ RULED: B** (Ryan, 2026-08-10, in-session — recorded on mesh card `t_8a9f0987`). Pointer +
+> classification, store under `~/Documents/student-lab/`, bodies never stored. Implementation note
+> for the builder: the capture/comprehension code is write-Ryan-only (sovereign-consulting), so the
+> build hands Ryan a reviewed patch plus the student-lab scaffold rather than committing directly.
+
 ---
 
 ## Grounded facts (re-probed 2026-08-07 from the LIVE home)
