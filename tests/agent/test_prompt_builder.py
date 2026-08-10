@@ -921,3 +921,58 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 
 
+
+# =========================================================================
+# Kanban guidance — ACP backends need the <tool_call> addendum
+# =========================================================================
+
+
+class TestBuildKanbanGuidance:
+    """ACP backends don't natively bind Hermes tools (MESH-INFRA t_3323c114).
+
+    The base guidance promises `kanban_*` tools; on an ACP backend those are
+    forwarded as text and reached via <tool_call> blocks. Without the
+    addendum a worker hits `No such tool available: kanban_create` and
+    concludes the board is unreachable.
+    """
+
+    def test_non_acp_provider_gets_base_guidance_unchanged(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE, build_kanban_guidance
+
+        for provider in (None, "", "openrouter", "anthropic", "ollama"):
+            assert build_kanban_guidance(provider) == KANBAN_GUIDANCE
+
+    @pytest.mark.parametrize("provider", ["claude-acp", "copilot-acp"])
+    def test_acp_providers_get_addendum(self, provider):
+        from agent.prompt_builder import (
+            KANBAN_ACP_TOOL_GUIDANCE,
+            KANBAN_GUIDANCE,
+            build_kanban_guidance,
+        )
+
+        text = build_kanban_guidance(provider)
+        assert text.startswith(KANBAN_GUIDANCE)
+        assert KANBAN_ACP_TOOL_GUIDANCE in text
+
+    def test_provider_match_is_case_and_space_insensitive(self):
+        from agent.prompt_builder import build_kanban_guidance
+
+        assert build_kanban_guidance("  Claude-ACP ") == build_kanban_guidance(
+            "claude-acp"
+        )
+
+    def test_addendum_names_the_call_shape_and_fallback(self):
+        from agent.prompt_builder import build_kanban_guidance
+
+        text = build_kanban_guidance("claude-acp")
+        # The mechanism that actually works.
+        assert "<tool_call>" in text
+        assert "No such tool available" in text
+        # --board precedes the verb; wrong order is a real CLI failure.
+        assert "hermes kanban --board" in text
+
+    def test_base_do_not_no_longer_flatly_forbids_the_cli(self):
+        """The sanctioned fallback must not contradict the Do-NOT section."""
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        assert "unless a section below explicitly sanctions it" in KANBAN_GUIDANCE
