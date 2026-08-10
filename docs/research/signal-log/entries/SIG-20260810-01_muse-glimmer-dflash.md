@@ -22,7 +22,7 @@ related_plans:
 status: done
 distill: none
 updated: 2026-08-10
-status_note: "CLOSED 2026-08-10 — see §6/§7. ryan-spark (0.31.2): NEGATIVE-FINAL, HTTP 412 manifest-phase gate, whole-model-family, 'may be in pre-release,' zero bytes transferred, box/120b unaffected — revisit when Ollama lifts the gate. Ryan's MBP (upgraded 0.23.0→0.32.7): pulls/loads clean, real dflash speculation confirmed via native Ollama telemetry (60-74% acceptance) but MEASURED NET SLOWER (~10-28%) than plain decode — dflash tag removed. Vision smoke test PASSED (first working local vision model on the fleet). Plain nvfp4 tag (19GB) kept on the MBP for vision only, not throughput (12-18 tok/s, far below both Mac-tier leaders) — Ryan's call if he wants it gone."
+status_note: "CLOSED 2026-08-10 — see §6/§7. ryan-spark (0.31.2): NEGATIVE-FINAL, HTTP 412 manifest-phase gate, whole-model-family, 'may be in pre-release,' zero bytes transferred, box/120b unaffected — revisit when Ollama lifts the gate. Ryan's MBP (upgraded 0.23.0→0.32.7): pulls/loads clean. First A/B pass had a real methodology bug (wall-clock timing + reasoning silently eating the token budget) that Ryan caught by cross-checking against published community numbers — CORRECTED via native eval_count/eval_duration + think:false: baseline 20.7 tok/s (not 15.0), dflash 14.0 tok/s post-warmup (not 10.8), still net negative but the drafter barely fires for code at all (near-zero draft attempts vs 60-74% acceptance in the reasoning-heavy run) — the slowdown is a structural dual-model tax, not overhead-vs-benefit. Vision smoke test PASSED. Plain nvfp4 tag kept on the MBP for vision only — Ryan's call if he wants it gone."
 ```
 
 ## 1. Claim
@@ -155,29 +155,51 @@ pre-release."* Did not upgrade spark's Ollama to force it through — that box s
 and 120b engine swaps got, not a side effect of a spike. Box verified untouched: 120b resident
 65GB/100% GPU/Forever, 51GB available, no stray blobs.
 
-**Ryan's MBP (upgraded 0.23.0 → 0.32.7 via brew): full A/B ran.** Both tags pulled and loaded
-clean. A/B (temp 0, `reasoning_effort=medium`, 256 tok, ISO-dates bench prompt, 3 runs each):
+**Ryan's MBP (upgraded 0.23.0 → 0.32.7 via brew): full A/B ran, then corrected.** Both tags
+pulled and loaded clean. First pass used wall-clock timing around the OpenAI-compat endpoint with
+`reasoning_effort=medium` — **Ryan flagged the numbers looked low against published community
+figures, and he was right.** Two real methodology flaws: (1) wall-clock around the whole HTTP call
+instead of Ollama's native `eval_count`/`eval_duration` (decode-only — the convention every other
+bench this session used); (2) `reasoning_effort=medium` let the model burn the *entire* 256-token
+budget on invisible chain-of-thought in some runs (confirmed directly: an unscoped call returned
+`response=""` with all 256 tokens consumed by thinking, nothing visible produced).
+
+**Redone properly**: native `/api/generate`, `eval_count`/`eval_duration`, `think:false` (forces
+real code output), temp 0, 3 runs each, model already warm (`load_duration` ~0.04s, ruling out a
+cold-start artifact):
 
 | Arm | Run 1 | Run 2 | Run 3 | Avg |
 |---|---|---|---|---|
-| baseline (no drafter) | 18.1 | 14.7 | 12.3 | **15.0 tok/s** |
-| dflash (drafter on) | 7.9 | 11.9 | 12.5 | **10.8 tok/s** |
+| baseline (no drafter) | 20.9 | 20.8 | 20.4 | **20.7 tok/s** |
+| dflash (drafter on) | 13.0* | 13.7 | 14.3 | **14.0 tok/s** (runs 2–3) |
 
-The drafter genuinely engaged — native Ollama `speculate_stats` logged real acceptance (60–74%,
-avg_draft 1.0–1.7, max_draft up to 4, comparable to DSpark's 72–73% on DS4) — but decode came out
-**~28% slower** overall, and still **~10% slower** even excluding run 1's likely cold-start/draft-load
-cost (runs 2–3 only: 13.5 vs 12.2). **Verdict: dflash REJECTED on this pairing/hardware.** Same shape
-as the 120b/EAGLE3 finding — decent acceptance does not guarantee a net win once draft+verify
-overhead is counted, this time on Apple Silicon unified memory rather than CUDA. Removed the tag.
+\* run 1 folds in the model-swap cost (6.4s `load_duration` reported, but first-call decode is
+still visibly slower than runs 2–3 — some load spillover into the decode timer itself).
+
+**The corrected numbers changed the *mechanism*, not the verdict.** With `think:false`, the
+drafter barely fires for code at all: `speculate_stats` shows run 1 `iterations=251 drafted=7
+accepted=5`, runs 2–3 `iterations=255 drafted=1 accepted=1` — essentially opting out. Compare the
+original reasoning-heavy run: `iterations=126–157 drafted=147–218`, 60–74% acceptance, hundreds of
+real draft attempts. **The drafter is evidently tuned for predictable reasoning/filler tokens, not
+code** — for actual code generation it does almost nothing. And yet decode is *still* ~32% slower
+than baseline (14.0 vs 20.7) with next-to-zero real speculation happening. This is not "decent
+acceptance, overhead still loses" (true only for the reasoning workload) — it's **a structural
+throughput tax the dflash tag carries on code content regardless of whether the drafter does
+anything useful.** Verdict unchanged: dflash rejected, tag removed. But 20.7 tok/s — not 15.0 —
+is the honest baseline number for what this model does on the MBP with real code output.
 
 **Vision smoke test: PASS.** A synthetic test image (blue rectangle + red circle) was captioned
 correctly and specifically: *"a solid blue rectangular shape on the left and a solid red
 oval/circular shape on the right."* This is the fleet's first working local vision model.
 
-**Text/code throughput, for the record: 12–18 tok/s** — well below both Mac-tier leaders
-(qwen3.6 quality-king 31.2, qwen3-coder speed-king 71.1), confirming §3(c)'s architectural
-prediction. **Not** proposed for the coder lane — per §5's own "do not," that would need to earn
-the coder goldens on its own merits, out of scope here.
+**Text/code throughput, corrected: ~20.7 tok/s** — still below both Mac-tier leaders (qwen3.6
+quality-king 31.2, qwen3-coder speed-king 71.1), confirming §3(c)'s architectural prediction, but
+meaningfully better than the original flawed reading. **Not** proposed for the coder lane — per
+§5's own "do not," that would need to earn the coder goldens on its own merits, out of scope here.
+Open question this correction surfaces but does not answer: whether 20.7 tok/s is close to this
+model's real ceiling on Apple Silicon, or whether Ollama/GGUF's Metal backend is itself leaving
+throughput on the table against a native path (MLX ships its own `30b-mlx` tag at the same 21GB —
+untested here, a candidate follow-up if the vision capability sees real use).
 
 **Disposition:** dflash tag removed (unambiguous). Plain `nvfp4` (19GB) **kept** on the MBP —
 not for throughput, but as the only local vision option on the fleet; 19GB is cheap on a
