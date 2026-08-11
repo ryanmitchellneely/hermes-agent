@@ -1,10 +1,10 @@
 {
   "name": "hermes",
-  "productName": "Hermes",
+  "productName": "T1000",
   "private": true,
   "version": "0.17.0",
-  "description": "Native desktop shell for Hermes Agent.",
-  "author": "Nous Research",
+  "description": "Native desktop shell for T1000 (fork of Nous Hermes Agent).",
+  "author": "Ryan Neely",
   "type": "module",
   "main": "dist/electron-main.mjs",
   "engines": {
@@ -163,18 +163,19 @@
   },
   "build": {
     "electronVersion": "40.10.2",
-    "appId": "com.nousresearch.hermes",
-    "productName": "Hermes",
-    "executableName": "Hermes",
+    "appId": "com.ryan.t1000",
+    "productName": "T1000",
+    "executableName": "T1000",
     "protocols": [
       {
-        "name": "Hermes Protocol",
+        "name": "T1000 Protocol",
         "schemes": [
+          "t1000",
           "hermes"
         ]
       }
     ],
-    "artifactName": "Hermes-${version}-${os}-${arch}.${ext}",
+    "artifactName": "T1000-${version}-${os}-${arch}.${ext}",
     "icon": "assets/icon",
     "directories": {
       "output": "release"
@@ -210,12 +211,22 @@
       "entitlements": "electron/entitlements.mac.plist",
       "entitlementsInherit": "electron/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "CFBundleDisplayName": "Hermes",
-        "CFBundleExecutable": "Hermes",
-        "CFBundleName": "Hermes",
-        "NSAudioCaptureUsageDescription": "Hermes uses audio capture for voice conversations.",
-        "NSCameraUsageDescription": "Hermes uses the camera when a plugin or feature you enable requests it.",
-        "NSMicrophoneUsageDescription": "Hermes uses the microphone for voice input and voice conversations."
+        "CFBundleDisplayName": "T1000",
+        "CFBundleExecutable": "T1000",
+        "CFBundleName": "T1000",
+        "NSAudioCaptureUsageDescription": "T1000 uses audio capture for voice conversations.",
+        "NSCameraUsageDescription": "T1000 uses the camera when a plugin or feature you enable requests it.",
+        "NSMicrophoneUsageDescription": "T1000 uses the microphone for voice input and voice conversations.",
+        "LSEnvironment": {
+          "HERMES_HOME": "/Users/ryan/.t1000",
+          "HERMES_DESKTOP_HERMES_ROOT": "/Users/ryan/Documents/T1000",
+          "HERMES_DESKTOP_PYTHON": "/Users/ryan/Documents/T1000/venv/bin/python",
+          "HERMES_DESKTOP_APP_NAME": "T1000",
+          "HERMES_DESKTOP_VARIANT": "t1000",
+          "MallocNanoZone": "0"
+        },
+        "NSDocumentsFolderUsageDescription": "T1000 reads the local T1000 engine checkout and project files you open.",
+        "NSHumanReadableCopyright": "Copyright \u00a9 2026 Ryan Neely"
       },
       "gatekeeperAssess": false,
       "hardenedRuntime": true,
@@ -225,7 +236,7 @@
       ]
     },
     "dmg": {
-      "title": "Install Hermes",
+      "title": "Install T1000",
       "backgroundColor": "#f5f5f7",
       "iconSize": 96,
       "window": {

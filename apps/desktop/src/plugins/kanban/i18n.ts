@@ -95,6 +95,16 @@ type KanbanMessages = {
   tokUnit: string
   couldNotEstimate: string
   complexity: Record<'L' | 'M' | 'S', string>
+  /** local = good for desk locals; frontier = Grok/Claude; either = try local first. */
+  lane: Record<'either' | 'frontier' | 'local', string>
+  laneTip: Record<'either' | 'frontier' | 'local', string>
+  useModel: string
+  appliedModel: string
+  suggestedModel: string
+  localReady: string
+  localDown: string
+  alts: string
+  riskFlag: string
   introBody: string
   introGotIt: string
   // drawer — activity prose
@@ -278,12 +288,26 @@ const en: KanbanMessages = {
   estimating: 'Estimating…',
   reEstimate: 'Re-estimate',
   makesModelCall: 'makes a model call',
-  estimateTip: 'Rough token + complexity estimate from the auxiliary model — makes a model call.',
-  estimateTipLong: 'Runs a quick auxiliary-model call to estimate tokens + complexity. A rough guide, not a bill.',
+  estimateTip: 'Estimates tokens and recommends a model from your desk (local-first when safe). Makes a model call.',
+  estimateTipLong:
+    'Auxiliary model estimates size, then picks a concrete model from your catalog. Local (DS4 / Spark 120B / MBP) is preferred when risk is low; frontier (Grok / Claude ACP) only when needed.',
   roughEstimate: 'Rough estimate',
   tokUnit: 'tok',
   couldNotEstimate: 'Could not estimate',
   complexity: { S: 'Small', M: 'Medium', L: 'Large' },
+  lane: { local: 'Local', either: 'Either', frontier: 'Frontier' },
+  laneTip: {
+    local: 'Low risk — pin a local model (DS4, Spark 120B, or MBP coder).',
+    either: 'Local can try; frontier if the quality bar is high.',
+    frontier: 'Ambiguous, architectural, or high-stakes — Grok 4.5 or Claude Max (ACP).'
+  },
+  useModel: 'Use this model',
+  appliedModel: 'Model pinned on card',
+  suggestedModel: 'Suggested',
+  localReady: 'Local ready',
+  localDown: 'Local offline',
+  alts: 'Also',
+  riskFlag: 'Risk signals',
   introBody:
     'You don’t run the cards — agents do. Put a card in Ready with an assignee and an agent picks it up within a minute. No assignee, no run. Triage: an agent rewrites the idea into a proper task first. Todo: waiting on other cards. Scheduled: waiting on a timer. Running and Review: the agents’ lanes, hands off. Blocked: it’s waiting on you. Results come back on the card.',
   introGotIt: 'Got it',
@@ -470,12 +494,26 @@ const ja: KanbanMessages = {
   estimating: '見積もり中…',
   reEstimate: '再見積もり',
   makesModelCall: 'モデル呼び出しあり',
-  estimateTip: '補助モデルによるトークン数と複雑度の概算 — モデル呼び出しを行います。',
-  estimateTipLong: '補助モデルを呼び出してトークン数と複雑度を概算します。目安であり、請求ではありません。',
+  estimateTip: '補助モデルによるトークン数・複雑度・ローカル/フロンティア判定の概算 — モデル呼び出しを行います。',
+  estimateTipLong:
+    '補助モデルを呼び出してトークン数・複雑度、およびローカルLLM向きかフロンティア向きかを概算します。目安であり、請求ではありません。',
   roughEstimate: '概算',
   tokUnit: 'tok',
   couldNotEstimate: '見積もりできませんでした',
   complexity: { S: '小', M: '中', L: '大' },
+  lane: { local: 'ローカル向き', either: 'どちらでも可', frontier: 'フロンティア' },
+  laneTip: {
+    local: '低リスク — ローカル（DS4 / Spark 120B / MBP）を優先。',
+    either: 'ローカル可。品質要求が高ければフロンティア。',
+    frontier: '曖昧・設計・高リスク — Grok 4.5 / Claude ACP。'
+  },
+  useModel: 'このモデルを使う',
+  appliedModel: 'カードにモデルを固定しました',
+  suggestedModel: '推奨',
+  localReady: 'ローカル準備OK',
+  localDown: 'ローカルオフライン',
+  alts: '他',
+  riskFlag: 'リスクあり',
   introBody:
     'カードはあなたではなくエージェントが実行します。担当を設定したカードを Ready に置くと、1分以内にエージェントが取得します。担当がなければ実行されません。トリアージ: エージェントがまずアイデアを適切なタスクに書き直します。Todo: 他のカード待ち。スケジュール: タイマー待ち。実行中とレビュー: エージェントのレーンなので手を出さないでください。ブロック: あなたの対応待ちです。結果はカードに戻ってきます。',
   introGotIt: '了解',
@@ -660,12 +698,25 @@ const zh: KanbanMessages = {
   estimating: '估算中…',
   reEstimate: '重新估算',
   makesModelCall: '会调用模型',
-  estimateTip: '由辅助模型对令牌数和复杂度的粗略估算 — 会调用模型。',
-  estimateTipLong: '快速调用辅助模型来估算令牌数和复杂度。仅供参考，并非账单。',
+  estimateTip: '由辅助模型对令牌数、复杂度和本地/前沿车道的粗略估算 — 会调用模型。',
+  estimateTipLong: '快速调用辅助模型来估算令牌数、复杂度，以及是否适合本地 LLM 还是前沿模型。仅供参考，并非账单。',
   roughEstimate: '粗略估算',
   tokUnit: 'tok',
   couldNotEstimate: '无法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  lane: { local: '适合本地', either: '两者皆可', frontier: '前沿模型' },
+  laneTip: {
+    local: '低风险 — 优先本地（DS4 / Spark 120B / MBP）。',
+    either: '可用本地；质量要求高时用前沿。',
+    frontier: '模糊/架构/高风险 — Grok 4.5 或 Claude ACP。'
+  },
+  useModel: '使用此模型',
+  appliedModel: '已固定到卡片',
+  suggestedModel: '建议',
+  localReady: '本地就绪',
+  localDown: '本地离线',
+  alts: '也可',
+  riskFlag: '有风险信号',
   introBody:
     '卡片不由你运行，而是由代理运行。把带有负责人的卡片放入“就绪”，代理会在一分钟内领取。没有负责人就不会运行。分诊：代理先把想法改写成合适的任务。待办：等待其他卡片。已排期：等待计时器。运行中与审查：这是代理的通道，请勿插手。受阻：正在等你。结果会回到卡片上。',
   introGotIt: '知道了',
@@ -848,12 +899,25 @@ const zhHant: KanbanMessages = {
   estimating: '估算中…',
   reEstimate: '重新估算',
   makesModelCall: '會呼叫模型',
-  estimateTip: '由輔助模型對 token 數與複雜度的粗略估算 — 會呼叫模型。',
-  estimateTipLong: '快速呼叫輔助模型來估算 token 數與複雜度。僅供參考，並非帳單。',
+  estimateTip: '由輔助模型對 token 數、複雜度與本地/前沿車道的粗略估算 — 會呼叫模型。',
+  estimateTipLong: '快速呼叫輔助模型來估算 token 數、複雜度，以及是否適合本地 LLM 還是前沿模型。僅供參考，並非帳單。',
   roughEstimate: '粗略估算',
   tokUnit: 'tok',
   couldNotEstimate: '無法估算',
   complexity: { S: '小', M: '中', L: '大' },
+  lane: { local: '適合本地', either: '兩者皆可', frontier: '前沿模型' },
+  laneTip: {
+    local: '低風險 — 優先本地（DS4 / Spark 120B / MBP）。',
+    either: '可用本地；品質要求高時用前沿。',
+    frontier: '模糊/架構/高風險 — Grok 4.5 或 Claude ACP。'
+  },
+  useModel: '使用此模型',
+  appliedModel: '已固定到卡片',
+  suggestedModel: '建議',
+  localReady: '本地就緒',
+  localDown: '本地離線',
+  alts: '也可',
+  riskFlag: '有風險信號',
   introBody:
     '卡片不由你執行，而是由代理執行。把有負責人的卡片放入「就緒」，代理會在一分鐘內領取。沒有負責人就不會執行。分類：代理先把想法改寫成合適的任務。待辦：等待其他卡片。已排程：等待計時器。執行中與審查：這是代理的通道，請勿插手。受阻：正在等你。結果會回到卡片上。',
   introGotIt: '知道了',

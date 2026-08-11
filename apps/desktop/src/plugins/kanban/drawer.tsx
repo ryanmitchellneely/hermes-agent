@@ -468,14 +468,15 @@ function AttachmentsSection({
   )
 }
 
-// Rough effort estimate via the auxiliary (auto-routed) model. Tokens +
-// complexity, never dollars — providers don't report cost reliably. Gated
-// behind an explicit click + disclaimer since it makes a model call. The
-// control keeps a stable footprint (spinner swaps in place) so there's no
-// layout jump when it runs.
+// Effort estimate: tokens are secondary. The useful output is a concrete
+// model pick from the desk catalog (local-first when risk is low), with one
+// click to pin it on the card.
 function EstimateSection({ id }: { id: string }) {
   const k = useKanban()
+  const qc = useQueryClient()
+  const slug = useValue($boardSlug)
   const [result, setResult] = useState<null | TaskEstimate>(null)
+  const [applied, setApplied] = useState(false)
 
   const est = useMutation({
     mutationFn: () => estimateTask(id),
@@ -483,26 +484,128 @@ function EstimateSection({ id }: { id: string }) {
     onSuccess: r => {
       if (r.ok) {
         setResult(r)
+        setApplied(false)
       } else {
         host.notify({ kind: 'warning', message: r.reason || k.couldNotEstimate })
       }
     }
   })
 
+  const applyMut = useMutation({
+    mutationFn: async (s: NonNullable<TaskEstimate['suggestion']>) => {
+      await patchTask(id, {
+        model_override: s.model,
+        provider_override: s.provider,
+        ...(s.effort ? { reasoning_effort: s.effort } : {})
+      })
+    },
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: () => {
+      setApplied(true)
+      host.notify({ kind: 'info', message: k.appliedModel })
+      void qc.invalidateQueries({ queryKey: taskKey(slug, id) })
+      void qc.invalidateQueries({ queryKey: ['kanban', 'board', slug] })
+    }
+  })
+
   // A new task resets the cached estimate (the drawer reuses one instance).
-  useEffect(() => setResult(null), [id])
+  useEffect(() => {
+    setResult(null)
+    setApplied(false)
+  }, [id])
+
+  const suggestion = result?.ok ? result.suggestion : null
+  const lane = suggestion?.lane || result?.lane || null
 
   return (
     <Section label={k.estimate}>
       {result?.ok ? (
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2 text-[0.8125rem]">
-            <span className="font-medium tabular-nums text-(--ui-text-secondary)">
+        <div className="flex flex-col gap-2">
+          {suggestion && (
+            <div className="flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-secondary) px-2.5 py-2">
+              <div className="flex items-center gap-2">
+                <span className="text-[0.625rem] uppercase tracking-wide text-(--ui-text-quaternary)">
+                  {k.suggestedModel}
+                </span>
+                {lane && (
+                  <span
+                    className={
+                      lane === 'local'
+                        ? 'rounded bg-emerald-500/15 px-1.5 py-0.5 text-[0.625rem] font-medium text-emerald-600 dark:text-emerald-400'
+                        : lane === 'frontier'
+                          ? 'rounded bg-violet-500/15 px-1.5 py-0.5 text-[0.625rem] font-medium text-violet-600 dark:text-violet-400'
+                          : 'rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 text-[0.625rem] font-medium text-(--ui-text-secondary)'
+                    }
+                  >
+                    {k.lane[lane as 'local' | 'frontier' | 'either'] ?? lane}
+                  </span>
+                )}
+                {result.risky && (
+                  <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[0.625rem] font-medium text-amber-700 dark:text-amber-400">
+                    {k.riskFlag}
+                  </span>
+                )}
+                <span className="ml-auto text-[0.625rem] text-(--ui-text-quaternary)">
+                  {suggestion.local_ok ? k.localReady : result.local_readiness?.summary || k.localDown}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-medium text-foreground">
+                  {suggestion.label}
+                </span>
+                <Button
+                  disabled={applyMut.isPending || applied}
+                  onClick={() => applyMut.mutate(suggestion)}
+                  size="xs"
+                  variant={lane === 'local' ? 'secondary' : 'outline'}
+                >
+                  <Codicon name={applied ? 'check' : 'rocket'} size="0.75rem" spinning={applyMut.isPending} />
+                  {applied ? k.appliedModel : k.useModel}
+                </Button>
+              </div>
+              {(suggestion.why || result.rationale) && (
+                <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-tertiary)">
+                  {suggestion.why || result.rationale}
+                </p>
+              )}
+              {suggestion.alternatives && suggestion.alternatives.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                  <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.alts}</span>
+                  {suggestion.alternatives.slice(0, 3).map(alt => (
+                    <button
+                      className="rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
+                      key={`${alt.provider}:${alt.model}`}
+                      onClick={() =>
+                        applyMut.mutate({
+                          ...suggestion,
+                          ...alt,
+                          lane: (alt.lane as 'local' | 'frontier' | 'either') || suggestion.lane,
+                          alternatives: suggestion.alternatives
+                        })
+                      }
+                      type="button"
+                    >
+                      {alt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="flex flex-wrap items-center gap-2 text-[0.75rem] text-(--ui-text-tertiary)">
+            <span className="tabular-nums">
               ~{compactNumber(result.est_tokens)} {k.tokUnit}
+              {result.complexity ? ` · ${k.complexity[result.complexity] ?? result.complexity}` : ''}
             </span>
-            {result.complexity && (
-              <span className="text-(--ui-text-tertiary)">
-                · {k.complexity[result.complexity] ?? result.complexity}
+            {!suggestion && lane && (
+              <span
+                className={
+                  lane === 'local'
+                    ? 'rounded bg-emerald-500/15 px-1.5 py-0.5 text-[0.625rem] font-medium text-emerald-600 dark:text-emerald-400'
+                    : 'rounded bg-violet-500/15 px-1.5 py-0.5 text-[0.625rem] font-medium text-violet-600 dark:text-violet-400'
+                }
+              >
+                {k.lane[lane as 'local' | 'frontier' | 'either'] ?? lane}
               </span>
             )}
             <Tip label={k.reEstimate}>
@@ -518,9 +621,6 @@ function EstimateSection({ id }: { id: string }) {
               </Button>
             </Tip>
           </div>
-          {result.rationale && (
-            <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">{result.rationale}</p>
-          )}
         </div>
       ) : (
         <div className="flex items-center gap-2">

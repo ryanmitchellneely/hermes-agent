@@ -150,13 +150,55 @@ export interface KanbanProject {
 }
 
 /** POST /tasks/:id/estimate — rough auxiliary-model estimate (never dollars). */
+export interface LocalEndpointReadiness {
+  id: string
+  name: string
+  ready: boolean
+  base_url?: string
+  models?: string[]
+  latency_ms?: null | number
+  error?: null | string
+}
+
+export interface LocalModelReadiness {
+  any_ready: boolean
+  ready_count: number
+  total: number
+  summary: string
+  endpoints: LocalEndpointReadiness[]
+}
+
+/** Concrete model the estimator recommends for this card (local-first when safe). */
+export interface EstimateSuggestion {
+  lane: 'either' | 'frontier' | 'local'
+  provider: string
+  model: string
+  label: string
+  effort?: null | string
+  why?: null | string
+  local_ok?: boolean
+  alternatives?: Array<{
+    label: string
+    lane?: string
+    model: string
+    provider: string
+  }>
+}
+
 export interface TaskEstimate {
   ok: boolean
   reason?: null | string
   est_tokens?: number
   complexity?: 'L' | 'M' | 'S' | null
+  /** Suggested compute lane: local LLM candidate vs frontier cloud. */
+  lane?: 'either' | 'frontier' | 'local' | null
   rationale?: null | string
   model?: null | string
+  /** Live probe of configured local OpenAI-compatible endpoints (DS4/Spark/MBP). */
+  local_readiness?: LocalModelReadiness | null
+  /** Concrete model pick from the desk catalog — prefer this over bare S/M/L. */
+  suggestion?: EstimateSuggestion | null
+  risky?: boolean
 }
 export interface BoardsResponse {
   boards: BoardMeta[]

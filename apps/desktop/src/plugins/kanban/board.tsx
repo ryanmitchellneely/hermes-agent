@@ -585,6 +585,15 @@ function NewTaskDialog({
     onSuccess: r => {
       if (r.ok) {
         setEstimate(r)
+        // Auto-fill the model field with the local-first suggestion so create
+        // pins it without a second click. User can still override via the picker.
+        if (r.suggestion?.model) {
+          setModelOverride({
+            effort: r.suggestion.effort || '',
+            model: r.suggestion.model,
+            provider: r.suggestion.provider || ''
+          })
+        }
       } else {
         host.notify({ kind: 'warning', message: r.reason || k.couldNotEstimate })
       }
@@ -788,12 +797,34 @@ function NewTaskDialog({
           <div className="mr-auto flex items-center gap-1 text-[0.75rem] text-(--ui-text-tertiary)">
             {estimate?.ok ? (
               <>
-                <Tip label={estimate.rationale || k.roughEstimate}>
-                  <span className="font-medium tabular-nums text-(--ui-text-secondary)">
-                    ~{compactNumber(estimate.est_tokens)} {k.tokUnit}
-                    {estimate.complexity ? ` · ${k.complexity[estimate.complexity] ?? estimate.complexity}` : ''}
-                  </span>
-                </Tip>
+                <div className="flex max-w-[18rem] flex-col gap-0.5">
+                  {estimate.suggestion ? (
+                    <Tip label={estimate.suggestion.why || estimate.rationale || k.roughEstimate}>
+                      <span className="flex items-center gap-1.5">
+                        <span
+                          className={
+                            estimate.suggestion.lane === 'local'
+                              ? 'rounded bg-emerald-500/15 px-1.5 py-0.5 text-[0.6875rem] font-medium text-emerald-600 dark:text-emerald-400'
+                              : 'rounded bg-violet-500/15 px-1.5 py-0.5 text-[0.6875rem] font-medium text-violet-600 dark:text-violet-400'
+                          }
+                        >
+                          {estimate.suggestion.label}
+                        </span>
+                        <span className="tabular-nums text-(--ui-text-quaternary)">
+                          ~{compactNumber(estimate.est_tokens)} {k.tokUnit}
+                        </span>
+                      </span>
+                    </Tip>
+                  ) : (
+                    <Tip label={estimate.rationale || k.roughEstimate}>
+                      <span className="font-medium tabular-nums text-(--ui-text-secondary)">
+                        ~{compactNumber(estimate.est_tokens)} {k.tokUnit}
+                        {estimate.complexity ? ` · ${k.complexity[estimate.complexity] ?? estimate.complexity}` : ''}
+                        {estimate.lane ? ` · ${k.lane[estimate.lane] ?? estimate.lane}` : ''}
+                      </span>
+                    </Tip>
+                  )}
+                </div>
                 <Tip label={k.reEstimate}>
                   <Button
                     aria-label={k.reEstimate}
