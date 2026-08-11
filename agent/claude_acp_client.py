@@ -1475,12 +1475,27 @@ class ClaudeACPClient:
                 acp_effort=acp_effort,
             )
             return
+        # Recent Claude models default thinking.display to "omitted" (signature-
+        # only; empty thought text). ACP then never emits agent_thought_chunk,
+        # so Desktop's Thinking accordion stays empty even at high effort.
+        # Pass summarized via session/new _meta so the SDK streams thought text.
+        # See claude-agent-acp toAcpNotifications thinking_delta branch.
         session = (
             self._request_unlocked(
                 "session/new",
                 {
                     "cwd": self._acp_cwd,
                     "mcpServers": [],
+                    "_meta": {
+                        "claudeCode": {
+                            "options": {
+                                "thinking": {
+                                    "type": "adaptive",
+                                    "display": "summarized",
+                                },
+                            },
+                        },
+                    },
                 },
                 timeout_seconds=timeout_seconds,
             )
