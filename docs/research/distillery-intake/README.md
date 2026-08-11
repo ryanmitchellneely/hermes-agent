@@ -106,6 +106,49 @@ flip to `stale` five days later in one batch. Either bulk-triage the backlog
 (`--mark … =skipped` on what is genuinely history) or expect one loud stale
 report the first time the threshold passes.
 
+## Review batches (cluster + judge pass)
+
+Reading 160+ raw draft rows one file at a time doesn't scale. The review
+agent pre-judges a small batch per run and lets you accept/defer in bulk.
+
+- **Design:** `../fleet-roadmap-2026-08-09/spec-distillery-review.md` (mesh
+  card `t_216ac84b` spec parent; card `t_0d8b422e` = "C2", this script)
+- **Script:** `scripts/distillery_review_agent.py` (repo SoT)
+  · dual-written to `~/.t1000/scripts/distillery_review_agent.py`
+- **Tests:** `tests/scripts/test_distillery_review_agent.py`
+
+```bash
+cd ~/Documents/T1000
+
+# Judge the next batch for real (candidates only — never touches index.json)
+# but write nothing. Prints the proposed clusters/verdicts/rationales.
+./venv/bin/python scripts/distillery_review_agent.py --dry-run
+
+# Real run: writes docs/research/distillery-intake/reviews/<date>.md and
+# records the batch's row ids in ~/.t1000/cache/distillery-review-pending.json
+# so they aren't re-drafted into tomorrow's batch before you've decided.
+./venv/bin/python scripts/distillery_review_agent.py
+```
+
+Selects up to 8 rows (`status` in `{draft, stale}`, stale-oldest-first then
+draft-oldest-first, skipping anything already sitting in an undecided prior
+batch), sends title/summary/source_kind/source_path/notes to the
+house-pinned local judge (`gpt-oss:120b` on Ryan Spark, `keep_alive` ≤30m,
+no other model touched — see the script's module docstring for why it hits
+Ollama's native `/api/chat` rather than the `/v1/chat/completions` path the
+spec names), and renders one `reviews/<date>.md` file with a
+human-editable `decision:` field per row — same round-trip idiom as
+`status:` above. Edit `decision: approve` to accept a row's proposed
+verdict (`file`/`skip`/`supersede`); leave it blank to defer.
+
+**v1 scope note (card C2 only):** this script never writes `index.json` —
+applying `decision: approve` rows (`--apply`, `distillery_intake_sweep.py
+--mark`, `FILED-LOG.md`) and cron wiring are separate follow-on cards (C3,
+C4) and are not implemented yet. Running the commands above is safe against
+the real backlog: `--dry-run` writes nothing at all, and a real run only
+ever writes a new `reviews/<date>.md` plus the pending-cache — it cannot
+flip any row's status.
+
 ## Not in scope
 
 No K2 Distillery rebuild, no `PATTERN-LEDGER`/`k2-hub` imports, no Buzz wiring,
