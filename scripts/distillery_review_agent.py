@@ -75,6 +75,11 @@ JUDGE_BASE = "http://127.0.0.1:11435"
 JUDGE_MODEL = "gpt-oss:120b"
 JUDGE_KEEP_ALIVE = "30m"
 JUDGE_TIMEOUT_S = 300.0
+# Must match the ryan-spark residency manifest's pinned context_length for
+# gpt-oss:120b (~/Documents/sovereign-consulting/tools/spark-residency/manifest/ryan-spark.yaml).
+# Omitting num_ctx lets Ollama pick its own default on load, which drifts off the
+# pin and evicts hermes3:8b-16k.
+JUDGE_NUM_CTX = 65536
 
 CANDIDATE_STATUSES = ("stale", "draft")  # sort priority order, not a filter set
 DEFAULT_BATCH_SIZE = 8
@@ -198,7 +203,7 @@ def call_judge(rows: list[dict]) -> dict:
         "stream": False,
         "keep_alive": JUDGE_KEEP_ALIVE,
         "format": "json",
-        "options": {"temperature": 0.2},
+        "options": {"temperature": 0.2, "num_ctx": JUDGE_NUM_CTX},
     }
     data = json.dumps(payload).encode()
     req = urllib.request.Request(

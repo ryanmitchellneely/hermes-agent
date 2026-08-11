@@ -161,7 +161,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
+from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length, is_local_endpoint
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
@@ -8401,6 +8401,26 @@ def _build_call_kwargs(
     effective_base = base_url or (
         _current_custom_base_url() if provider == "custom" else ""
     )
+    # Ollama context window — mirrors the main chat path's agent._ollama_num_ctx
+    # injection (agent_init.py). Auxiliary calls (compression, title generation,
+    # curator, MoA slots, ...) build their own client/kwargs and never went
+    # through that path, so a local Ollama endpoint hit from here silently fell
+    # back to Ollama's own default num_ctx (the model's max context) instead of
+    # the desk-pinned window — the exact drift this fix closes for gpt-oss:120b
+    # on Ryan Spark (t_3d9c8dfe).
+    ollama_num_ctx: Optional[int] = None
+    if is_local_endpoint(effective_base):
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _model_cfg = load_config_readonly().get("model", {})
+            _ctx_override = (
+                _model_cfg.get("ollama_num_ctx") if isinstance(_model_cfg, dict) else None
+            )
+            if _ctx_override is not None:
+                ollama_num_ctx = int(_ctx_override)
+        except Exception:
+            logger.debug("_build_call_kwargs: ollama_num_ctx config lookup failed", exc_info=True)
     profile_body: Dict[str, Any] = {}
     profile_reasoning_extra: Dict[str, Any] = {}
     profile_top_level: Dict[str, Any] = {}
@@ -8422,6 +8442,7 @@ def _build_call_kwargs(
                     supports_reasoning=reasoning_config is not None,
                     model=model,
                     base_url=effective_base,
+                    ollama_num_ctx=ollama_num_ctx,
                 )
             )
             profile_reasoning_extra = profile_reasoning_extra or {}
