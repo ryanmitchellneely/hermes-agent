@@ -482,6 +482,14 @@ def _hermetic_environment(tmp_path, monkeypatch):
             hermes_state_mod, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
         )
 
+    # 3c. Redirect the cross-board model-call telemetry store. It deliberately
+    #     does NOT live under HERMES_HOME (it is cross-profile), so the
+    #     redirect above does not cover it — and the emit sites sit in the
+    #     conversation loop and the aux client, which the suite exercises
+    #     constantly. Without this every test run appends fake rows to the
+    #     developer's real ~/.t1000/telemetry and skews the rollups it feeds.
+    monkeypatch.setenv("T1000_TELEMETRY_DIR", str(tmp_path / "t1000_telemetry"))
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")

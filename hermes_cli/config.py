@@ -1715,17 +1715,36 @@ def apply_custom_provider_extra_headers_to_client_kwargs(
     client_kwargs["default_headers"] = merged
 
 
+def _coerce_positive_context_length(raw_ctx: Any) -> Optional[int]:
+    """Return a positive int context length, or None if missing/invalid."""
+    if raw_ctx is None or isinstance(raw_ctx, bool):
+        return None
+    try:
+        ctx = int(raw_ctx)
+    except (TypeError, ValueError):
+        return None
+    return ctx if ctx > 0 else None
+
+
 def get_custom_provider_context_length(
     model: str,
     base_url: str,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Optional[int]:
-    """Look up a per-model ``context_length`` override from ``custom_providers``.
+    """Look up a ``context_length`` override from ``custom_providers`` / ``providers``.
 
-    Matches any entry whose normalized route identity equals ``base_url`` and
-    returns ``custom_providers[i].models.<model>.context_length`` if present and
-    valid.  Returns ``None`` when no override applies.
+    Matches any entry whose normalized route identity equals ``base_url``.
+    Resolution order for a matched entry:
+
+    1. ``models.<model>.context_length`` (dict-shaped per-model override)
+    2. entry-level ``context_length`` when ``model`` is listed under ``models``
+       (list-shaped ``providers.*.models: [name, ...]`` normalizes to
+       ``{name: {}}`` — empty dicts still count as listed)
+    3. entry-level ``context_length`` when ``models`` is empty/missing
+       (provider default for that endpoint)
+
+    Returns ``None`` when no override applies.
 
     This is the single source of truth for custom-provider context overrides,
     used by:
@@ -1738,6 +1757,11 @@ def get_custom_provider_context_length(
     Before this helper existed, the lookup was duplicated in ``run_agent.py``'s
     startup path only; every other path (notably ``/model`` switch) fell back
     to the 128K default.  See #15779.
+
+    Provider-level ``context_length`` with list-shaped models was historically
+    dropped (``models`` became ``{name: {}}`` and step 1 found no nested
+    length) — that left local DS4/Ollama endpoints reporting 32k and failing
+    the 64k Hermes floor even when config said 65k/100k.
     """
     if not model or not base_url:
         return None
@@ -1763,20 +1787,33 @@ def get_custom_provider_context_length(
         if not entry_url or entry_url != target_url:
             continue
         models = entry.get("models")
-        if not isinstance(models, dict):
-            continue
-        model_cfg = models.get(model)
-        if not isinstance(model_cfg, dict):
-            continue
-        raw_ctx = model_cfg.get("context_length")
-        if raw_ctx is None:
-            continue
-        try:
-            ctx = int(raw_ctx)
-        except (TypeError, ValueError):
-            continue
-        if ctx > 0:
-            return ctx
+
+        # 1) Per-model nested override (dict value with context_length).
+        if isinstance(models, dict):
+            model_cfg = models.get(model)
+            if isinstance(model_cfg, dict):
+                ctx = _coerce_positive_context_length(model_cfg.get("context_length"))
+                if ctx is not None:
+                    return ctx
+
+        # 2–3) Provider-level context_length for listed models (or open endpoint).
+        if isinstance(models, dict):
+            model_listed = model in models
+            models_empty = len(models) == 0
+        elif isinstance(models, list):
+            model_listed = model in models
+            models_empty = len(models) == 0
+        elif models is None:
+            model_listed = False
+            models_empty = True
+        else:
+            model_listed = False
+            models_empty = False
+
+        if model_listed or models_empty:
+            ctx = _coerce_positive_context_length(entry.get("context_length"))
+            if ctx is not None:
+                return ctx
     return None
 
 

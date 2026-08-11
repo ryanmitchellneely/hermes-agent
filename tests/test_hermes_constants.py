@@ -393,8 +393,48 @@ class TestResolvePerModelReasoningEffort:
         assert result == {"enabled": True, "effort": "high"}
 
 
+    def test_ollama_tag_family_peels_ctx_suffix(self):
+        """``qwen2.5-coder:32b`` override covers ``qwen2.5-coder:32b-64k``.
 
+        Desk failure class: override listed bare 32b, live pin used the
+        derived 64k ctx tag, resolve fell through to global xhigh → Ollama
+        HTTP 400 (t_3a7f19db).
+        """
+        from hermes_constants import (
+            resolve_per_model_reasoning_effort,
+            resolve_reasoning_config,
+        )
 
+        overrides = {"qwen2.5-coder:32b": "none", "hermes3:8b": "none"}
+        assert resolve_per_model_reasoning_effort(
+            "qwen2.5-coder:32b-64k", overrides
+        ) == {"enabled": False}
+        assert resolve_per_model_reasoning_effort(
+            "hermes3:8b-16k", overrides
+        ) == {"enabled": False}
+        # Exact still wins when both present
+        overrides2 = {
+            "qwen2.5-coder:32b": "high",
+            "qwen2.5-coder:32b-64k": "none",
+        }
+        assert resolve_per_model_reasoning_effort(
+            "qwen2.5-coder:32b-64k", overrides2
+        ) == {"enabled": False}
+
+        cfg = {
+            "agent": {
+                "reasoning_effort": "xhigh",
+                "reasoning_overrides": {"qwen2.5-coder:32b": "none"},
+            }
+        }
+        assert resolve_reasoning_config(cfg, "qwen2.5-coder:32b-64k") == {
+            "enabled": False
+        }
+        # Unrelated models still get global
+        assert resolve_reasoning_config(cfg, "grok-4.5") == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
 
 class TestResolveReasoningConfig:
     """Tests for resolve_reasoning_config() — the single shared chokepoint

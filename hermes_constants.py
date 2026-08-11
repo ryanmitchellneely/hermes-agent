@@ -1061,6 +1061,41 @@ def _canonical_model_variants(model: str) -> list[str]:
     return variants
 
 
+def _ollama_tag_family_variants(model: str) -> list[str]:
+    """Generate shorter Ollama tag family keys for override matching.
+
+    Local Ollama derived tags often append a context window suffix the
+    operator never listed in ``agent.reasoning_overrides``::
+
+        config key:  qwen2.5-coder:32b
+        live model:  qwen2.5-coder:32b-64k   # falls through → global xhigh → 400
+
+    Peel trailing ``-<digits>k`` segments from the tag (repeatable) so a
+    single override covers the family. Does not invent bare-base matches
+    (``qwen2.5-coder`` alone) — that would be too broad across sizes.
+    """
+    import re
+
+    raw = (model or "").strip()
+    if not raw or ":" not in raw:
+        return []
+    # provider/model:tag → keep full string; only peel after final colon.
+    base, tag = raw.rsplit(":", 1)
+    if not tag:
+        return []
+    variants: list[str] = []
+    peeled = tag
+    # qwen2.5-coder:32b-64k → 32b ; hermes3:8b-16k → 8b
+    while True:
+        nxt = re.sub(r"-\d+k$", "", peeled, flags=re.IGNORECASE)
+        if nxt == peeled:
+            break
+        peeled = nxt
+        if peeled:
+            variants.append(f"{base}:{peeled}")
+    return variants
+
+
 def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> dict | None:
     """Lookup a per-model reasoning_effort override with spelling-tolerance.
 
@@ -1081,13 +1116,26 @@ def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> di
     3. Strip provider prefix (bare model name only)
     4. Strip aggregator prefix (middle segment only)
     5. Prepend known aggregator prefixes to bare/single-slash variants
+    6. Ollama tag-family peel (``:32b-64k`` → ``:32b``) so derived ctx
+       tags inherit the base override (desk ``t_3a7f19db`` class)
 
     First non-None parse_reasoning_effort result wins.
     """
     if not overrides or not isinstance(overrides, dict) or not model:
         return None
 
+    seen: set[str] = set()
+    candidates: list[str] = []
     for variant in _canonical_model_variants(model):
+        if variant not in seen:
+            seen.add(variant)
+            candidates.append(variant)
+        for fam in _ollama_tag_family_variants(variant):
+            if fam not in seen:
+                seen.add(fam)
+                candidates.append(fam)
+
+    for variant in candidates:
         if variant in overrides:
             result = parse_reasoning_effort(overrides[variant])
             if result is not None:

@@ -6001,7 +6001,9 @@ def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     """Return the current platform's unpacked Electron app executable."""
     release_dir = desktop_dir / "release"
     if sys.platform == "darwin":
-        candidates = list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
+        # T1000 fork brands as T1000.app; upstream is Hermes.app — accept either.
+        candidates = list(release_dir.glob("mac*/T1000.app/Contents/MacOS/T1000"))
+        candidates += list(release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes"))
     elif sys.platform == "win32":
         candidates = [
             release_dir / "win-unpacked" / "Hermes.exe",
