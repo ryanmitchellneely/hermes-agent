@@ -728,6 +728,43 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def resolve_board_default_workspace_kind(
+    board: Optional[str] = None,
+    *,
+    meta: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return the board policy for omitted ``workspace_kind`` on create.
+
+    MESH-INFRA-2: code-bearing boards must isolate workers without every
+    author remembering ``--workspace worktree``. Resolution order:
+
+    1. Explicit ``board.json`` ``default_workspace_kind`` when valid.
+    2. ``worktree`` when the board is project-scoped (``project_id`` set).
+    3. ``worktree`` when ``default_workdir`` is inside a git repo.
+    4. Otherwise ``scratch``.
+
+    Explicit per-task ``workspace_kind`` always wins over this policy.
+    """
+    if meta is None:
+        try:
+            meta = read_board_metadata(board)
+        except Exception:
+            return "scratch"
+    explicit = str(meta.get("default_workspace_kind") or "").strip().lower()
+    if explicit in VALID_WORKSPACE_KINDS:
+        return explicit
+    if str(meta.get("project_id") or "").strip():
+        return "worktree"
+    workdir = str(meta.get("default_workdir") or "").strip()
+    if workdir:
+        try:
+            if _git_toplevel(Path(workdir).expanduser()):
+                return "worktree"
+        except (OSError, ValueError, TypeError):
+            pass
+    return "scratch"
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -749,6 +786,10 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         # primary repo) and ``default_workdir`` mirrors the project's primary
         # path so the persistent-workspace inheritance path keeps working.
         "project_id": None,
+        # Optional board-level workspace default for creates that omit
+        # workspace_kind. When unset, ``resolve_board_default_workspace_kind``
+        # auto-derives worktree from project_id / git default_workdir.
+        "default_workspace_kind": None,
         "created_at": None,
         "archived": False,
     }
@@ -777,6 +818,7 @@ def write_board_metadata(
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    default_workspace_kind: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -786,6 +828,10 @@ def write_board_metadata(
     ``project_id``: ``None`` leaves it unchanged; empty string clears the
     project scope; a value sets it (not validated here — the caller resolves
     it against ``projects_db``).
+
+    ``default_workspace_kind``: ``None`` leaves unchanged; empty string
+    clears (fall back to auto-derive); a valid kind sets the explicit
+    board policy used when creates omit ``workspace_kind``.
     """
     _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
@@ -807,6 +853,17 @@ def write_board_metadata(
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
     if project_id is not None:
         meta["project_id"] = str(project_id) if project_id else None
+    if default_workspace_kind is not None:
+        raw_kind = str(default_workspace_kind).strip().lower()
+        if not raw_kind:
+            meta["default_workspace_kind"] = None
+        elif raw_kind not in VALID_WORKSPACE_KINDS:
+            raise ValueError(
+                f"default_workspace_kind must be one of "
+                f"{sorted(VALID_WORKSPACE_KINDS)}, got {default_workspace_kind!r}"
+            )
+        else:
+            meta["default_workspace_kind"] = raw_kind
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -828,6 +885,7 @@ def create_board(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
+    default_workspace_kind: Optional[str] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -846,6 +904,7 @@ def create_board(
         color=color,
         default_workdir=default_workdir,
         project_id=project_id,
+        default_workspace_kind=default_workspace_kind,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -2999,7 +3058,7 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
-    workspace_kind: str = "scratch",
+    workspace_kind: Optional[str] = None,
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
@@ -3073,6 +3132,15 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    # Omitted workspace_kind → board policy (MESH-INFRA-2). Explicit values
+    # (including scratch) win, so ops cards can still force a throwaway dir.
+    board_slug_for_policy = board if board else None
+    try:
+        board_slug_for_policy = board if board else get_current_board()
+    except Exception:
+        board_slug_for_policy = board
+    if workspace_kind is None:
+        workspace_kind = resolve_board_default_workspace_kind(board_slug_for_policy)
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -3088,7 +3156,7 @@ def create_task(
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None:
         try:
-            _bmeta = read_board_metadata(board if board else get_current_board())
+            _bmeta = read_board_metadata(board_slug_for_policy or get_current_board())
             _board_project = (_bmeta.get("project_id") or "").strip()
             if _board_project:
                 project_id = _board_project
@@ -3165,10 +3233,20 @@ def create_task(
                             workspace_kind = "worktree"
 
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
+            # Cross-profile creators often cannot resolve the board's project_id
+            # in their own projects.db. Do not crash — drop the dangling id, but
+            # still apply worktree isolation from the board's git default_workdir
+            # so mesh code cards stay isolated without per-card discipline.
             project_id = None
+            if workspace_kind == "scratch":
+                try:
+                    _fb_meta = read_board_metadata(
+                        board_slug_for_policy or get_current_board()
+                    )
+                    if resolve_board_default_workspace_kind(meta=_fb_meta) == "worktree":
+                        workspace_kind = "worktree"
+                except Exception:
+                    pass
         else:
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
@@ -3183,6 +3261,36 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    # Stop minting dir:<main-repo> cards for parallelizable code. When the
+    # caller points ``dir:`` at the board's git default_workdir (or that
+    # path's toplevel), rewrite to a fresh per-task worktree instead of
+    # sharing the main checkout.
+    if workspace_kind == "dir" and workspace_path:
+        try:
+            requested = Path(str(workspace_path)).expanduser().resolve(strict=False)
+            _bmeta_dir = read_board_metadata(
+                board_slug_for_policy or get_current_board()
+            )
+            dwd = str(_bmeta_dir.get("default_workdir") or "").strip()
+            dwd_path = (
+                Path(dwd).expanduser().resolve(strict=False) if dwd else None
+            )
+            repo_of_requested = _git_toplevel(requested)
+            rewrite = False
+            if dwd_path is not None and requested == dwd_path and repo_of_requested:
+                rewrite = True
+            elif repo_of_requested is not None and requested == repo_of_requested:
+                # dir:<repo-root> is the same anti-pattern even when the board
+                # default_workdir is unset or points elsewhere.
+                rewrite = True
+            if rewrite:
+                workspace_kind = "worktree"
+                workspace_path = None
+                if project_repo is None and repo_of_requested is not None:
+                    project_repo = str(repo_of_requested)
+        except (OSError, ValueError, TypeError):
+            pass
 
     parents = tuple(p for p in parents if p)
 
@@ -3308,15 +3416,14 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
-                # Project-linked worktree: a fresh worktree dir under the repo
-                # plus a deterministic branch (project slug + task id). Together
-                # these kill the random ``wt/<task-id>`` worker fallback and the
-                # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
+                # Project-linked or dir→worktree-rewritten path: a fresh
+                # worktree dir under the repo plus (when project resolves) a
+                # deterministic branch (project slug + task id).
+                if workspace_kind == "worktree" and project_repo and not workspace_path:
+                    workspace_path = os.path.join(
+                        project_repo, ".worktrees", task_id
+                    )
                 if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
-                            project_repo, ".worktrees", task_id
-                        )
                     if not branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
@@ -11239,6 +11346,136 @@ def gc_worker_logs(
         except OSError:
             continue
     return removed
+
+
+def gc_stale_worktrees(
+    conn: sqlite3.Connection,
+    *,
+    older_than_seconds: int = 14 * 24 * 3600,
+    board: Optional[str] = None,
+) -> dict[str, int]:
+    """Remove per-task git worktrees for terminal tasks past retention.
+
+    MESH-INFRA-2 disk policy: worktree isolation is cheap at create time but
+    unbounded growth is not. Only touches paths that look like Hermes
+    per-task worktrees (``…/.worktrees/<task_id>``) for tasks in
+    ``done``/``archived`` whose ``completed_at`` (or ``created_at`` fallback)
+    is older than ``older_than_seconds``.
+
+    Never deletes the main checkout, never walks outside ``.worktrees/``,
+    and never removes a worktree still referenced by a non-terminal task.
+    Returns counts: ``{removed, skipped, errors}``.
+    """
+    cutoff = int(time.time()) - int(older_than_seconds)
+    rows = conn.execute(
+        """
+        SELECT id, workspace_kind, workspace_path, branch_name,
+               completed_at, created_at, status
+        FROM tasks
+        WHERE workspace_kind = 'worktree'
+          AND status IN ('done', 'archived')
+        """
+    ).fetchall()
+    removed = 0
+    skipped = 0
+    errors = 0
+    # Paths still claimed by non-terminal worktree tasks — never remove.
+    live_paths: set[str] = set()
+    for live in conn.execute(
+        """
+        SELECT workspace_path FROM tasks
+        WHERE workspace_kind = 'worktree'
+          AND status NOT IN ('done', 'archived')
+          AND workspace_path IS NOT NULL
+        """
+    ).fetchall():
+        try:
+            live_paths.add(
+                str(Path(live["workspace_path"]).expanduser().resolve(strict=False))
+            )
+        except (OSError, TypeError, ValueError):
+            continue
+
+    for row in rows:
+        stamp = row["completed_at"] or row["created_at"] or 0
+        if int(stamp) > cutoff:
+            skipped += 1
+            continue
+        raw = row["workspace_path"]
+        if not raw:
+            skipped += 1
+            continue
+        try:
+            path = Path(str(raw)).expanduser().resolve(strict=False)
+        except (OSError, TypeError, ValueError):
+            skipped += 1
+            continue
+        # Safety: only ``…/.worktrees/<task_id>`` shaped paths for THIS task.
+        if path.name != row["id"] or path.parent.name != ".worktrees":
+            skipped += 1
+            continue
+        if str(path) in live_paths:
+            skipped += 1
+            continue
+        if not path.exists():
+            skipped += 1
+            continue
+        repo_root = path.parent.parent
+        try:
+            # Prefer git's own remover so the worktree registry stays clean.
+            result = subprocess.run(
+                [
+                    "git", "-C", str(repo_root),
+                    "worktree", "remove", "--force", str(path),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                check=False,
+            )
+            if result.returncode != 0 and path.exists():
+                # Fall back to rmtree if git refused (already unregistered).
+                import shutil
+
+                shutil.rmtree(path, ignore_errors=True)
+            if path.exists():
+                errors += 1
+                continue
+            # Best-effort: drop the local task branch if it still exists and
+            # is not checked out elsewhere.
+            branch = (row["branch_name"] or "").strip()
+            if branch:
+                subprocess.run(
+                    [
+                        "git", "-C", str(repo_root),
+                        "branch", "-D", branch,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+            removed += 1
+        except Exception:
+            errors += 1
+    # Prune stale worktree admin entries left behind by forced removes.
+    try:
+        board_meta = read_board_metadata(board)
+        dwd = str(board_meta.get("default_workdir") or "").strip()
+        if dwd:
+            subprocess.run(
+                ["git", "-C", dwd, "worktree", "prune"],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+    except Exception:
+        pass
+    return {"removed": removed, "skipped": skipped, "errors": errors}
 
 
 # ---------------------------------------------------------------------------

@@ -188,6 +188,32 @@ def _print_project(proj) -> None:
             print(f"   {mark} {f.path}{label}")
 
 
+def _sync_board_default_workdir(proj, board_slug: str) -> None:
+    """Best-effort: scope the bound board to this project.
+
+    Sets ``project_id`` (so create_task inherits it) and points
+    ``default_workdir`` at the primary repo (worktree anchor). Failures
+    here are non-fatal — the binding itself already succeeded.
+    """
+    try:
+        from hermes_cli import kanban_db as kb
+
+        slug = kb._normalize_board_slug(board_slug)
+        if not slug:
+            return
+        if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
+            return
+        kwargs: dict = {"project_id": proj.id}
+        if proj.primary_path:
+            kwargs["default_workdir"] = proj.primary_path
+        # Prefer worktree isolation on code-bearing boards; leave
+        # default_workspace_kind unset so auto-derive still works if the
+        # operator later clears project_id.
+        kb.write_board_metadata(slug, **kwargs)
+    except Exception:
+        pass
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         with pdb.connect_closing() as conn:
@@ -211,6 +237,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if proj is None:
         print("project: vanished after create", file=sys.stderr)
         return 2
+    if args.board:
+        _sync_board_default_workdir(proj, args.board)
     print(f"Created project {proj.slug} ({pid})")
     _print_project(proj)
     return 0
@@ -305,31 +333,23 @@ def _cmd_restore(args, conn, proj) -> int:
 
 @_with_project
 def _cmd_bind_board(args, conn, proj) -> int:
+    prev_board = (proj.board_slug or "").strip()
     pdb.update_project(conn, proj.id, board_slug=args.board)
     if args.board.strip():
         print(f"Bound {proj.slug} -> board {args.board}")
         _sync_board_default_workdir(proj, args.board)
     else:
+        # Clear project scope on the previously bound board when unbinding.
+        if prev_board:
+            try:
+                from hermes_cli import kanban_db as kb
+
+                slug = kb._normalize_board_slug(prev_board)
+                if slug and (slug == kb.DEFAULT_BOARD or kb.board_exists(slug)):
+                    meta = kb.read_board_metadata(slug)
+                    if meta.get("project_id") == proj.id:
+                        kb.write_board_metadata(slug, project_id="")
+            except Exception:
+                pass
         print(f"Unbound board from {proj.slug}")
     return 0
-
-
-def _sync_board_default_workdir(proj, board_slug: str) -> None:
-    """Best-effort: point the bound board's default_workdir at the primary repo.
-
-    Keeps kanban task worktrees anchored to the project's repo. Failures here
-    are non-fatal — the binding itself already succeeded.
-    """
-    if not proj.primary_path:
-        return
-    try:
-        from hermes_cli import kanban_db as kb
-
-        slug = kb._normalize_board_slug(board_slug)
-        if not slug:
-            return
-        if slug != kb.DEFAULT_BOARD and not kb.board_exists(slug):
-            return
-        kb.write_board_metadata(slug, default_workdir=proj.primary_path)
-    except Exception:
-        pass
