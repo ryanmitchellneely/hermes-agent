@@ -34,7 +34,6 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_kanban_completion
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -251,16 +250,30 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
-    """Return a rejection reason when a goal-mode terminal handoff is premature."""
+def _goal_mode_handoff_rejection(
+    task, evidence: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(rejection, fail_open_note)`` for a goal-mode terminal handoff.
+
+    Mirrors the twin helper in hermes_cli/kanban.py: ``rejection`` is set only
+    when the judge genuinely says not-done; ``fail_open_note`` is set only when
+    the handoff was allowed despite an unreachable judge, so the caller can
+    leave a trace instead of accepting unverified work silently.
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
-        return None
-    verdict = "done"
-    reason = ""
+        return None, None
+    # Imported INSIDE the helper, matching the twin in hermes_cli/kanban.py: a
+    # module-level import binds the name at import time, so monkeypatching the
+    # source (the only way to exercise this gate end-to-end) would never reach
+    # it. Delegates to the shared gate so the retry / transport-fail-open /
+    # audit-note semantics live in exactly one place.
+    from hermes_cli.goals import judge_kanban_completion
+
     try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
+        allowed, reason, fail_open_note = judge_kanban_completion(
+            task.title,
+            task.body or "",
+            evidence,
         )
     except Exception as judge_exc:
         # Keep the existing fail-open semantics: an unavailable/broken
@@ -270,7 +283,8 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+        return None, None
+    return (None if allowed else reason), fail_open_note
 
 
 # ---------------------------------------------------------------------------
@@ -752,10 +766,18 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            rejection, fail_open_note = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
             )
+            if fail_open_note:
+                try:
+                    kb.add_comment(conn, tid, author="goal-judge", body=fail_open_note)
+                except Exception:
+                    logger.warning(
+                        "could not record goal-judge fail-open comment on %s",
+                        tid, exc_info=True,
+                    )
             if rejection is not None:
                 return tool_error(
                     f"Goal completion rejected by judge: {rejection}. "
@@ -937,7 +959,15 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection, fail_open_note = _goal_mode_handoff_rejection(task, summary)
+            if fail_open_note:
+                try:
+                    kb.add_comment(conn, tid, author="goal-judge", body=fail_open_note)
+                except Exception:
+                    logger.warning(
+                        "could not record goal-judge fail-open comment on %s",
+                        tid, exc_info=True,
+                    )
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "

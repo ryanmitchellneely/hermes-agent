@@ -2215,27 +2215,43 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
-    """Apply the goal judge to every terminal worker handoff, including review."""
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task], evidence: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Apply the goal judge to every terminal worker handoff, including review.
+
+    Returns ``(rejection, fail_open_note)``. ``rejection`` is a reason string
+    when the judge genuinely says the work is not done, else None.
+    ``fail_open_note`` is non-None only when the handoff was ALLOWED despite the
+    judge being unreachable — the caller records it on the board so an
+    unverified acceptance leaves a trace instead of being indistinguishable
+    from a real pass.
+    """
     if task is None or not task.goal_mode:
-        return None
+        return None, None
     try:
         from agent.auxiliary_client import get_text_auxiliary_client
 
         client, model = get_text_auxiliary_client("goal_judge")
     except Exception:
-        return None
+        return None, None
     if client is None or not model:
-        return None
+        return None, None
 
-    from hermes_cli.goals import judge_goal
+    # Delegate to the shared gate rather than calling judge_goal directly.
+    # judge_goal reports an unreachable judge as ("continue", ...,
+    # transport_failed=True), so a caller that unpacks `verdict, reason, _, _, _`
+    # turns a network blip into "your finished work is rejected" (t_4123e041).
+    # judge_kanban_completion owns that distinction plus the bounded retry and
+    # the fail-open audit note, in ONE place, so this helper and its twin in
+    # tools/kanban_tools.py cannot drift apart again.
+    from hermes_cli.goals import judge_kanban_completion
 
-    verdict = "done"
-    reason = ""
     try:
-        verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-            last_response=evidence.strip(),
+        allowed, reason, fail_open_note = judge_kanban_completion(
+            task.title,
+            task.body or "",
+            evidence,
         )
     except Exception as judge_exc:
         import logging as _logging
@@ -2245,7 +2261,8 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+        return None, None
+    return (None if allowed else reason), fail_open_note
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -2283,7 +2300,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(
+            rejection, fail_open_note = _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
             )
@@ -2295,6 +2312,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 )
                 failed.append(tid)
                 continue
+            if fail_open_note:
+                try:
+                    kb.add_comment(conn, tid, author="goal-judge", body=fail_open_note)
+                except Exception:
+                    import logging as _logging
+
+                    _logging.getLogger(__name__).warning(
+                        "could not record goal-judge fail-open comment on %s",
+                        tid, exc_info=True,
+                    )
+                print(f"kanban: {fail_open_note}", file=sys.stderr)
 
             if not kb.complete_task(
                 conn, tid,
@@ -2436,7 +2464,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
-        rejection = _goal_mode_handoff_rejection(
+        rejection, fail_open_note = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
         )
@@ -2447,6 +2475,17 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
+        if fail_open_note:
+            try:
+                kb.add_comment(conn, tid, author="goal-judge", body=fail_open_note)
+            except Exception:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "could not record goal-judge fail-open comment on %s",
+                    tid, exc_info=True,
+                )
+            print(f"kanban: {fail_open_note}", file=sys.stderr)
         ok, reason = kb.request_review(
             conn,
             tid,
