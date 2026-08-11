@@ -96,14 +96,19 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     return {"state_type": st, "state_name": sn}
 
 
-def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
+def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Parse ``--workspace`` into ``(kind, path|None)``.
 
-    Accepts: ``scratch``, ``worktree``, ``worktree:<path>``, ``dir:<path>``.
+    Accepts: omitted/``auto``, ``scratch``, ``worktree``, ``worktree:<path>``,
+    ``dir:<path>``. Omitted/``auto`` leaves kind as ``None`` so
+    ``create_task`` applies the board's default workspace policy
+    (MESH-INFRA-2).
     """
-    if not value:
-        return ("scratch", None)
+    if value is None:
+        return (None, None)
     v = value.strip()
+    if not v or v.lower() == "auto":
+        return (None, None)
     if v in {"scratch", "worktree"}:
         return (v, None)
     for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree")):
@@ -116,7 +121,7 @@ def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
             )
         return (kind, os.path.expanduser(path))
     raise argparse.ArgumentTypeError(
-        f"unknown --workspace value {value!r}: use scratch, worktree, "
+        f"unknown --workspace value {value!r}: use auto, scratch, worktree, "
         "worktree:<path>, or dir:<path>"
     )
 
@@ -335,9 +340,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
-                          help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
+    p_create.add_argument("--workspace", default=None,
+                          help="auto | scratch | worktree | worktree:<path> | dir:<path> "
+                               "(default: auto — board policy; git default_workdir / "
+                               "project_id → worktree, else scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
@@ -970,12 +976,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- gc ---
     p_gc = sub.add_parser(
-        "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
+        "gc", help="Garbage-collect archived-task workspaces, old events, old logs, and stale worktrees",
     )
     p_gc.add_argument("--event-retention-days", type=int, default=30,
                       help="Delete task_events older than N days for terminal tasks (default: 30)")
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
+    p_gc.add_argument(
+        "--worktree-retention-days", type=int, default=14,
+        help="Remove done/archived per-task git worktrees older than N days "
+             "(default: 14). Only <repo>/.worktrees/<task_id> paths are eligible.",
+    )
 
     # --- repair ---
     p_repair = sub.add_parser(
@@ -1523,13 +1534,13 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
-        ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+        ws_kind, ws_path = _parse_workspace_flag(getattr(args, "workspace", None))
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
-    if branch_name and ws_kind != "worktree":
-        print("kanban: --branch is only valid with --workspace worktree", file=sys.stderr)
+    if branch_name and ws_kind not in (None, "worktree"):
+        print("kanban: --branch is only valid with --workspace worktree (or auto when board policy is worktree)", file=sys.stderr)
         return 2
     try:
         max_runtime = _parse_duration(getattr(args, "max_runtime", None))
@@ -3292,8 +3303,8 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
+    """Remove scratch workspaces of archived tasks, prune old events,
+    delete old worker logs, and prune stale per-task git worktrees."""
     import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
@@ -3320,15 +3331,24 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
+    wt_days = getattr(args, "worktree_retention_days", 14)
     with kb.connect_closing() as conn:
         removed_events = kb.gc_events(
             conn, older_than_seconds=event_days * 24 * 3600,
         )
+        wt_stats = kb.gc_stale_worktrees(
+            conn,
+            older_than_seconds=max(0, int(wt_days)) * 24 * 3600,
+        )
     removed_logs = kb.gc_worker_logs(
         older_than_seconds=log_days * 24 * 3600,
     )
-    print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    print(
+        f"GC complete: {removed_ws} scratch workspace(s), "
+        f"{wt_stats.get('removed', 0)} stale worktree(s) "
+        f"(skipped={wt_stats.get('skipped', 0)}, errors={wt_stats.get('errors', 0)}), "
+        f"{removed_events} event row(s), {removed_logs} log file(s) removed"
+    )
     return 0
 
 
