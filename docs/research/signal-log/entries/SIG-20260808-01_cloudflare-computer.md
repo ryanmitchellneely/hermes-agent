@@ -4,6 +4,7 @@
 id: SIG-20260808-01
 date: 2026-08-08
 title: "Cloudflare Computer — give your agent a computer"
+index_title: "Cloudflare Computer — agent virtual filesystem"
 source_url: "https://x.com/trending_repos/status/2085699382096060827"
 canonical_repo: "https://github.com/cloudflare/computer"
 canonical_docs: "https://github.com/cloudflare/computer/tree/main/docs"

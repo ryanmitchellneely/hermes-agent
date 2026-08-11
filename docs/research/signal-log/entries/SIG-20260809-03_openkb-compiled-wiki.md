@@ -4,6 +4,8 @@
 id: SIG-20260809-03
 date: 2026-08-09
 title: "OpenKB (VectifyAI/PageIndex) — LLM compiles docs into an interlinked wiki; no vector DB"
+index_title: "OpenKB — compile docs into an interlinked wiki, no vector DB (we own this pattern twice, neither compiles)"
+index_links: [repo]
 source_url: "https://x.com/oliviscusai/status/2086318229685760115"
 posted_at: "2026-08-09T05:06:42Z"
 canonical_repo: "https://github.com/VectifyAI/OpenKB"
@@ -20,6 +22,7 @@ related_plans:
   - "t_043bcb33"              # REF: agent+model doc corpus index — the cold-start map this fixes
   - "B18"                     # DevBot knowledge plane Phase 1 called for an llm-wiki bootstrap
 status: open
+status_note: "spiked 08-09 — verdict holds (pattern-mine, no adopt); see entry §9"
 distill: none
 ```
 
@@ -144,3 +147,130 @@ this pattern twice already** (`llm-wiki` skill never run; KRT `.omc/wiki` live b
 files are session logs**) and neither one compiles. Primary steal **S1 — generate the index from
 `entries/` instead of hand-editing it**, which is exactly the drift that put 5 of 12 entries in the
 cold-start map this morning.
+
+---
+
+# 9. SPIKE RESULT — 2026-08-09 (bounded, throwaway, no keys)
+
+**Verdict: the compile layer works on local hardware; the query layer does not. Model choice is
+the whole ballgame, and it is not the obvious one.**
+
+Ran for real: `openkb 0.4.5` in a throwaway venv (`/tmp/openkb-spike-20260809`, 593 MB, disposable),
+3 signal-log entries as the corpus, Spark Ollama via the MBP tunnel `:11435`. **Zero API keys, no
+`.env` written, nothing installed into `~/.t1000` or the T1000 venv.**
+
+## 9.1 Config that works (verbatim)
+
+```yaml
+# .openkb/config.yaml
+language: en
+model: ollama/qwen3-coder:30b
+pageindex_threshold: 20
+concurrency: 2
+litellm:
+  drop_params: true    # Ollama rejects several OpenAI-only params
+  timeout: 3600        # default timeout aborts a local compile mid-call
+  num_retries: 2
+```
+Plus `export OLLAMA_API_BASE=http://127.0.0.1:11435`. `openkb init` **still prompts for an API key
+even with `--model`** — pipe stdin (`printf '\n\n\n' | openkb init --model ... --language en`) or it
+aborts. The `No LLM API key found` warning on every `add` is cosmetic for local models.
+
+## 9.2 The result that matters: gpt-oss:120b FAILED, qwen3-coder:30b PASSED
+
+| | `ollama/gpt-oss:120b` | `ollama/qwen3-coder:30b` |
+|---|---|---|
+| Wall time, 3 docs | 99 s | 171 s |
+| Summaries | **3 written, ALL EMPTY** (104–221 B, frontmatter only) | 3 populated (~2.5 KB each) |
+| Concept pages | **0** — `Failed to parse concepts plan` ×3 | **9** |
+| Entity pages | **0** | **9** |
+| Cross-doc synthesis | none | **yes** — `update: agent-width` (doc 2 updating doc 1's concept) |
+| CLI exit | `[OK] added to knowledge base` ×3 | `[OK]` ×3 |
+
+**gpt-oss:120b is a reasoning model and does not honor OpenKB's JSON output contract.** It burns the
+budget on reasoning and emits prose. The salvaged fragment written to disk proves it verbatim:
+
+```
+The user asks: Write a summary page for this document in Markdown. Return a JSON object with keys ": "description"
+   }
+```
+
+**This is the same failure class as DS4 Flash's empty `content` / full `reasoning_content`** that
+`reasoning_effort=none` fixed on the code lane — a third instance of the same trap.
+
+**Direct LiteLLM calls do NOT reproduce it** (all four combos below returned valid JSON), because an
+explicit *"Return ONLY valid JSON, no prose"* is enough to steer it. OpenKB's prompts are not.
+Do not "verify the plumbing" and conclude the model works — the plumbing was never the problem.
+
+| call | latency | content | reasoning |
+|---|---|---|---|
+| `ollama/` | 11.4 s | 1124 B ✅ | 0 |
+| `ollama/` + `reasoning_effort=low` | 7.3 s | 1048 B ✅ | 0 |
+| `ollama_chat/` | 17.6 s | 1215 B ✅ | 1817 |
+| `ollama_chat/` + `reasoning_effort=low` | 14.6 s | 2401 B ✅ | 142 |
+
+## 9.3 ⚠️ `openkb add` reports `[OK]` on a silently empty compile
+
+All three gpt-oss docs printed `[OK] ... added to knowledge base`, `index.md` listed all three, and
+**every page body was blank.** Only the `concepts-plan` step warned; the empty *summary* was silent.
+A scheduled compile on a reasoning model would produce a confident, growing, empty wiki.
+**Any adoption must assert non-empty page bodies, not exit code.**
+
+## 9.4 Accuracy — numbers held, relationships did not
+
+Checked generated claims against source entries. **Numbers were faithful**, including hedges:
+`+27%` ✅ (source line 1/28), `2.4–3.3× prefill` ✅ (line 39, and the page correctly said
+*"claimed by the fork"*), `62.5 agg tok/s` ✅, `2.9 tokens/step at 74% accept` ✅ (line 31),
+worktree isolation ✅ (lines 37/52). No invented figures found.
+
+**One clear factual error, and it is a linking error.** `entities/qwen3.md` contradicts its own
+frontmatter one line later:
+
+> frontmatter: *"developed by **Alibaba**"* → body: *"Qwen3 is a family of large language models
+> developed by **[[entities/nvidia]]**."*
+
+NVIDIA appears in the same source (they published the KV-transfer work), so cross-linking grabbed the
+nearest entity and manufactured a false relationship. **The compiled-wiki risk is fabricated edges,
+not fabricated numbers.**
+
+## 9.5 The staleness finding — sharper than the tool
+
+`concepts/agent-width.md` presents McNab's 62.5 agg tok/s as *"demonstrating that hardware can
+support high concurrency"* — with **no trace of our own N=1→4 ladder showing almost no aggregate
+gain.** That is not a hallucination: the disconfirming result **lives only on kanban `t_9c7208c2`
+and was never written back into `SIG-20260807-03`.**
+
+**A compiled wiki is exactly as current as the entries, and will propagate a claim we have already
+disproven, in confident prose, with citations.** Write results back to entries before compiling
+anything. This strengthens S1 and adds: **measurement results belong in the entry, not only the card.**
+
+## 9.6 Layer 2 (generators) fails on a local 30B
+
+```
+openkb query "..." → [ERROR] Query failed: Max turns (50) exceeded   (126 s)
+```
+The agentic tool loop did not converge in 50 turns. Clean split:
+**Layer 1 (compile) = local-viable. Layer 2 (query/chat/Skill Factory) = not, on a 30B coder.**
+This is the same eval-vs-worker split as Flash (9/9 vs 1/13): local models do single-shot structured
+generation well and multi-turn agentic loops badly.
+
+## 9.7 Ops notes
+
+- **Cold load of `gpt-oss:120b` = ~158 s** of a 159 s call (decode itself 37.2 tok/s). Budget cold
+  start separately from throughput; it dwarfs it.
+- `qwen3-coder:30b` sits at **48.0 GB resident** (not its 18.6 GB file) once ctx is allocated, and
+  **evicted `gpt-oss:120b`**. A compile job is not free on a box someone else is using.
+- Compile cost ≈ **57 s/doc** at concurrency 2 → ~13 min for the 14 signal entries, ~3 h for all
+  197 research files. Batch/overnight work, not interactive.
+
+## 9.8 Revised verdict
+
+**Unchanged: pattern-mine, do not adopt as a runtime.** The spike did not surface a reason to run
+OpenKB on the estate — it surfaced three things worth more than the tool:
+
+1. A **third instance** of the reasoning-model empty-output trap → belongs in the model desk doctrine.
+2. **Silent-empty-success** as a failure mode any compile job we build must assert against.
+3. **Fabricated edges** as the real cost of auto-cross-linking, and **entry staleness** as the thing
+   that makes a compiled wiki actively misleading rather than merely incomplete.
+
+S1 (generate `INDEX.md` from `entries/` frontmatter) is still the cheap win and needs none of this.

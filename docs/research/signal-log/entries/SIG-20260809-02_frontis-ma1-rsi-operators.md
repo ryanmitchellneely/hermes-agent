@@ -4,6 +4,8 @@
 id: SIG-20260809-02
 date: 2026-08-09
 title: "Frontis-MA1 (35B) + OpenMLE — RSI via four trained program-evolution operators; harness contributed more than the model"
+index_title: "Frontis-MA1 / OpenRSI — harness +30 vs model +20 in one factorial; 4 trained operators"
+index_links: [docs]
 source_url: "https://x.com/neural_avb/status/2086119647099985975"
 posted_at: "2026-08-08T15:57:36Z"
 quoted_post: "https://x.com/neural_avb/status/2086073348531110130"   # self-QRT; substance is the linked X article

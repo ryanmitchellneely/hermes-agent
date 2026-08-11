@@ -4,6 +4,7 @@
 id: SIG-20260808-06
 date: 2026-08-08
 title: "DeepSeek-V4-Flash 27% faster on one DGX Spark — DwarfStar/Entrpi fork v0.5.6"
+index_title: "DS4-Flash +27% on one Spark — Entrpi fork v0.5.6 (we measured 16 tok/s upstream)"
 source_url: "https://x.com/jmurillocode/status/2086139608442515884"
 canonical_repo: "https://github.com/Entrpi/ds4-on-spark"
 canonical_docs: "https://github.com/Entrpi/ds4/blob/v0.5.6/CHANGELOG.md"

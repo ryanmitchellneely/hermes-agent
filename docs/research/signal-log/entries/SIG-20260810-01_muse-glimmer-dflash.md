@@ -7,6 +7,7 @@ title: "Meta Muse Glimmer 30B (Unsloth) — dense multimodal open model with a s
 index_title: "Muse Glimmer 30B + DFlash — spec-dec as a one-command Ollama tag; first local vision candidate; NOT a coder replacement"
 index_links: [repo, docs]
 source_url: "https://x.com/unslothai/status/2086761998268928157"
+source_url_2: "https://x.com/analogalok/status/2086834522461806748"   # RTX 4090 llama.cpp bench — contradicts our result, see §9
 canonical_repo: "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF"
 canonical_docs: "https://unsloth.ai/docs/models/muse-glimmer"
 bucket: models
@@ -19,10 +20,11 @@ related_plans:
   - "t_716141c4"              # DSpark NEGATIVE-FINAL — this is a second, independent spec-dec route
   - "t_47f30baf"              # CadensPC role — this signal answers it NEGATIVE
   - "B17"                     # Spark inference experiments (Phase C spec-dec)
-status: done
+status: open
 distill: none
 updated: 2026-08-10
-status_note: "CLOSED 2026-08-10 — see §6/§7. ryan-spark (0.31.2): NEGATIVE-FINAL, HTTP 412 manifest-phase gate, whole-model-family, 'may be in pre-release,' zero bytes transferred, box/120b unaffected — revisit when Ollama lifts the gate. Ryan's MBP (upgraded 0.23.0→0.32.7): pulls/loads clean. First A/B pass had a real methodology bug (wall-clock timing + reasoning silently eating the token budget) that Ryan caught by cross-checking against published community numbers — CORRECTED via native eval_count/eval_duration + think:false: baseline 20.7 tok/s (not 15.0), dflash 14.0 tok/s post-warmup (not 10.8), still net negative but the drafter barely fires for code at all (near-zero draft attempts vs 60-74% acceptance in the reasoning-heavy run) — the slowdown is a structural dual-model tax, not overhead-vs-benefit. Vision smoke test PASSED. Plain nvfp4 tag kept on the MBP for vision only — Ryan's call if he wants it gone."
+reopened: 2026-08-10   # see §9 — an independent bench gets +50% decode from the SAME drafter on a config we can now run
+status_note: "REOPENED 2026-08-10 (§9): an independent RTX 4090 bench (analogalok) gets 50->75 tok/s decode (+50%) from the SAME DFlash drafter, via llama.cpp `--spec-type draft-dflash --spec-draft-n-max 3` — the opposite sign to our -32%. Our arm ran Ollama/Metal on the MBP with NO ability to set n_max (Ollama exposes no spec knobs); his ran CUDA llama.cpp with n_max=3. VERIFIED LIVE: ryan-spark already has ~/llama.cpp built with CUDA at commit 62bf73d = 'model: Muse Glimmer Support (#26841)', and its llama-server advertises draft-dflash + draft-dspark + 4 ngram-* types, n_max default 3. The experiment is reproducible on our own box, bypassing the HTTP 412 manifest gate entirely — needs only the GGUF download. Prior text preserved below and still true FOR ITS CONFIGURATION. // CLOSED 2026-08-10 — see §6/§7. ryan-spark (0.31.2): NEGATIVE-FINAL, HTTP 412 manifest-phase gate, whole-model-family, 'may be in pre-release,' zero bytes transferred, box/120b unaffected — revisit when Ollama lifts the gate. Ryan's MBP (upgraded 0.23.0→0.32.7): pulls/loads clean. First A/B pass had a real methodology bug (wall-clock timing + reasoning silently eating the token budget) that Ryan caught by cross-checking against published community numbers — CORRECTED via native eval_count/eval_duration + think:false: baseline 20.7 tok/s (not 15.0), dflash 14.0 tok/s post-warmup (not 10.8), still net negative but the drafter barely fires for code at all (near-zero draft attempts vs 60-74% acceptance in the reasoning-heavy run) — the slowdown is a structural dual-model tax, not overhead-vs-benefit. Vision smoke test PASSED. Plain nvfp4 tag kept on the MBP for vision only — Ryan's call if he wants it gone."
 ```
 
 ## 1. Claim
@@ -265,3 +267,135 @@ subject inferred from Unsloth's 08-10 changelog. Real find: **DFlash spec-dec sh
 GB10 at all", which DSpark's Metal-only dead end left open. Also the fleet's **first local vision
 candidate** (zero today). **Not** a `qwen3-coder:30b` replacement — dense ≈10× FLOPs/token vs A3B.
 **No** for Caden (10.7 GB min vs 8 GB VRAM).
+
+---
+
+## 9. Contradiction: an independent bench gets **+50%** from the same drafter (2026-08-10)
+
+[@analogalok](https://x.com/analogalok/status/2086834522461806748) (Alok, 2026-08-10 15:18Z,
+70♥ / 5RT / 8,140 views, video attached) benched Muse Glimmer on a **single RTX 4090** using
+**llama.cpp built from source (Ubuntu 22, CUDA 13)** — not Ollama. Verbatim commands and results:
+
+```bash
+# arm A — no speculation
+./build/bin/llama-server -m Muse-Glimmer-30B-UD-Q4_K_XL.gguf \
+  -c 130000 -b 4096 -ub 4096 -ngl 99 --port 8080
+#   prefill 3134.95 t/s · decode 50.00 t/s · VRAM 19.34 GB
+
+# arm B — DFlash drafter
+./build/bin/llama-server -m Muse-Glimmer-30B-UD-Q4_K_XL.gguf \
+  -md dflash-kquant.gguf --spec-type draft-dflash --spec-draft-n-max 3 \
+  -c 80000 -b 4096 -ub 4096 -ngl 99 --port 8080
+#   prefill 1293.69 t/s · decode 75.00 t/s · VRAM 23.93 GB  (dflash gguf +1.6 GB)
+```
+
+**Decode 50 → 75 tok/s = +50%.** Ours was **20.7 → 14.0 = −32%.** Same model, same drafter,
+opposite sign. One of the two is a configuration artifact, and the asymmetry says which is more
+likely:
+
+| | ours (§7) | his |
+|---|---|---|
+| Engine | **Ollama 0.32.7** (GGUF/Metal) | **llama.cpp from source**, CUDA 13 |
+| Silicon | M3 Max, unified memory | RTX 4090, 24 GB VRAM |
+| Quant | `nvfp4` (19 GB tag) | `UD-Q4_K_XL` |
+| Drafter wiring | opaque `-dflash` **tag** | explicit `-md dflash-kquant.gguf --spec-type draft-dflash` |
+| **`n_max`** | **not settable — Ollama exposes no spec knobs** | **3** |
+| Batch | engine default | `-b 4096 -ub 4096` |
+| Content | code (`think:false`) | unstated; his decode figure is whole-run |
+
+He also pays the expected spec-dec tax on the other axis — **prefill halves, 3135 → 1294 t/s** —
+which is a coherent, textbook tradeoff signature and mild evidence the drafter is genuinely
+engaging on his stack. Our run showed the drafter *opting out* (`drafted=1` of 255 iterations) yet
+still losing 32%, which we called a "structural dual-model tax."
+
+> ⚠️ **Do not over-read the engine as the cause.** The tempting conclusion — *"the tax is an
+> Ollama artifact; llama.cpp's explicit wiring fixes it"* — **is not supported**, because
+> **llama.cpp lost too.** `t_227d09b2` ran `--spec-type draft-eagle3` on **this exact build**
+> (`62bf73d`, CUDA, ryan-spark) and got **11.7–14.2% acceptance → 23.3 tok/s vs 49.8–50.3 plain =
+> 2× SLOWER**. Different model (gpt-oss-120b) and different drafter (EAGLE3), so it is not a
+> direct refutation — but it kills "the engine was the problem" as a clean story. **Six variables
+> differ between our arm and his; the engine is one candidate, not the identified cause.**
+>
+> The variable with the strongest prior is **`n_max`**, because it is the one we *know* we set
+> wrong: the EAGLE3 run used **16** against a measured mean accept length of **2.8–3.2**, and
+> `t_227d09b2`'s own parked-revisit note says so verbatim (*"mean accept ~3 says 16 wastes 13"*).
+> **llama.cpp's default is 3. analogalok used 3. We used 16.** That is the cheapest hypothesis on
+> the table and it is exactly what `t_99c6388b` was already created to test.
+
+### The part that makes this actionable — the rig is already on ryan-spark
+
+Verified live, read-only:
+
+```
+~/llama.cpp   62bf73d  2026-08-10  "model: Muse Glimmer Support (#26841)"
+              version 374, built with GNU 13.3.0 for Linux aarch64
+build/bin/llama-server   built 2026-08-10 06:13
+libggml-cuda.so.0.19.0   built 2026-08-10 06:13     <- CUDA backend compiled
+src/models/muse-glimmer.cpp                          <- model support in-tree
+```
+
+`llama-server --help` advertises, authoritatively:
+
+```
+--spec-type   none, draft-simple, draft-eagle3, draft-mtp, draft-dflash,
+              draft-dspark, ngram-simple, ngram-map-k, ngram-map-k4v,
+              ngram-mod, ngram-cache
+--spec-draft-n-max N     (default: 3)
+--spec-draft-n-min N     (default: 0)
+```
+
+Three consequences:
+
+1. **`draft-dflash` is directly runnable on GB10 today.** The `t_e28b2c0e` blocker was Ollama's
+   **HTTP 412 manifest gate** on ryan-spark — that gate is an *Ollama registry* problem and
+   llama.cpp does not touch it. Only the GGUF download stands between us and his exact arm B.
+   Box has **44 GB available, 3.3 TB free disk**; `UD-Q4_K_XL` ≈ 17 GB + dflash 1.6 GB.
+   **It also fits the already-ratified architecture** — Ryan confirmed **Option 1** on
+   `t_227d09b2` at 09:59: Ollama keeps `:11434` residency and the Juice/teacher contract, while
+   **llama.cpp+MXFP4 is the window/batch engine for `/v1` consumers**. A Muse Glimmer bench is
+   exactly that surface, so it needs no production-lane change and no re-litigation of the split.
+
+   **Any window inherits `t_227d09b2`'s hard rules, non-negotiable** — they were written after an
+   EAGLE3 bench *wedged ryan-spark badly enough that sshd died and Ryan had to power-cycle it*:
+   pause **consumers**, not just the model (stop the Ollama service or down the tunnel — parking
+   the model does not stop a VPS request re-triggering a 65 GB reload mid-load); memory admission
+   gate before serve; hard abort if `MemAvailable` dips below the serve requirement mid-load; and
+   **never `pkill -f llama-server`** — it matches Ollama's own bundled runner at
+   `/usr/local/lib/ollama/llama-server` and will kill the warm 120b.
+2. **`n_max` default is 3** — exactly his value, and 5× below the **16** we used for the EAGLE3
+   run. That is independent corroboration of `t_99c6388b`'s thesis that our EAGLE3 rejection was
+   a misconfiguration, from a completely unrelated source.
+3. **`draft-dspark` exists in a CUDA-built binary.** `t_716141c4` closed DSpark NEGATIVE-FINAL on
+   the evidence that it is Metal-only with 0 CUDA lines — that was measured in **antirez/ds4**,
+   a different codebase. Upstream llama.cpp ships a CUDA-capable `draft-dspark`. **Do not reopen
+   `t_716141c4`** (its finding about DS4 stands), but the general claim "dspark is Metal-only"
+   must not be carried over to llama.cpp.
+
+### Other claims from the post, unverified by us
+
+- **19.34 GB VRAM at 130k ctx with unquantized f16 KV**, attributed to **16:1 GQA**. He contrasts
+  Gemma 4 31B, which he says needs Q4 KV quant to reach 140k and only ~40k with f16 on 24 GB.
+  Plausible and consistent with the HF card's 131k claim, but a vendor-adjacent enthusiast number.
+- **76% SWE-Bench Verified.** Not in Unsloth's post; treat as unsourced until the model card or
+  Meta says it.
+- Quoted tweet frames it as *"distilled from Muse Spark"*, with Muse Spark 1.2 weights "gearing
+  up." Roadmap chatter, not a fact.
+
+**Caden verdict is unchanged and if anything firmer** — his whole framing is "dominate 24 GB
+consumer cards." Caden's RTX 4060 has **8 GB**. Still a clean NO.
+
+### Revised steal
+
+| # | Steal | Rank | State |
+|---|---|---|---|
+| **S1′** | **Re-run the DFlash A/B on ryan-spark under llama.cpp** (`--spec-type draft-dflash --spec-draft-n-max 3`), not Ollama. One variable vs his published pair. This converts our −32% from a verdict into a *configuration* datapoint. | **P0** | → folded into `t_99c6388b` |
+| **S2′** | **Never bench spec-dec through an engine that hides `n_max`.** Ollama's `-dflash` tag is a black box; the two published wins on this drafter both set `n_max` explicitly. Add to the bench contract. | **P1** | → `t_6e058ca2` |
+| ~~S3′~~ | ~~llama.cpp is a third engine path~~ — **already known, not my find.** `t_227d09b2` landed llama.cpp `62bf73d` on ryan-spark at **09:59**, and `SIG-20260810-02` was corrected at **11:30** by an earlier session, which marked its own vLLM-is-the-prerequisite claim superseded. Recorded here only so this entry does not re-assert the stale framing. | — | already corrected elsewhere |
+
+**Do not:** quote his 50/75 as a GB10 number (RTX 4090, different memory system) · pull
+muse-glimmer through Ollama on ryan-spark (still 412-gated; llama.cpp is the route) · load
+anything on ryan-spark without checking the 120b's residency first · treat +50% as replicated
+until we run it.
+
+*Filed 2026-08-10. Post fetched verbatim via `api.fxtwitter.com`. All llama.cpp facts read
+read-only off `spark`; nothing built, downloaded, or changed on that box.*

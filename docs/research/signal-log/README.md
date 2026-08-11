@@ -12,7 +12,7 @@ When Ryan drops a URL / “review this” / “any cool ideas”:
 1. FETCH   primary post + canonical repo/docs (if any)
 2. CLASS   bucket + confidence (see enums)
 3. WRITE   entries/YYYY-MM-DD_<slug>.md from TEMPLATE.md
-4. LEDGER  one new row at TOP of INDEX.md
+4. LEDGER  regenerate: python3 scripts/signal_log_index.py --write   (never hand-edit INDEX.md)
 5. STEALS  only rows with steal_rank ∈ {P0,P1} get “Next action”
 6. WIRE    if Next action is backlog → kanban comment or AUTOMATION-ROADMAP ID
 7. REPLY   short chat: ID + bucket + top 1–3 steals + path
@@ -57,11 +57,12 @@ When Ryan drops a URL / “review this” / “any cool ideas”:
 
 | Path | Role |
 |------|------|
-| `INDEX.md` | Newest-first ledger (one line per signal) |
-| `TEMPLATE.md` | Copy for every entry |
-| `entries/*.md` | Full writeups |
-| `STEALS.md` | Rollup of open P0/P1 steals only |
-| `../../scripts/signal_log_new.py` | Scaffold entry + INDEX row |
+| `INDEX.md` | **GENERATED** newest-first ledger — do not hand-edit; edit the entry, re-run the generator |
+| `TEMPLATE.md` | Copy for every entry (includes the optional `index_*` ledger fields) |
+| `entries/*.md` | Full writeups — **the SoT for everything in the ledger** |
+| `STEALS.md` | Rollup of open P0/P1 steals only (still hand-maintained) |
+| `../../scripts/signal_log_new.py` | Scaffold a new entry, then calls the generator |
+| `../../scripts/signal_log_index.py` | Build `INDEX.md` from frontmatter — `--check` (diff, exit 1 if stale) / `--write` |
 
 ## Chat triggers → this system
 
@@ -74,6 +75,9 @@ When Ryan drops a URL / “review this” / “any cool ideas”:
 
 ## Hard rules
 
+0. **`INDEX.md` is generated.** Status, title, links, dates live in the entry's frontmatter and
+   nowhere else. Hand-editing the ledger is what let it drift to **5 rows for 12 entries** (08-09),
+   and it silently held two statuses (`carded`, a spike verdict) that existed in no entry.
 1. **Reference required** — X status URL and/or repo; no orphan takes.  
 2. **Takeaway ≤ 5 bullets** in entry; steals are separate table.  
 3. **No curl\|sh** onto `~/.t1000` from a signal.  

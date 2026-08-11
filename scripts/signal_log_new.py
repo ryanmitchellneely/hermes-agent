@@ -16,14 +16,16 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
+import sys
 from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOG = ROOT / "docs" / "research" / "signal-log"
 ENTRIES = LOG / "entries"
-INDEX = LOG / "INDEX.md"
 TEMPLATE = LOG / "TEMPLATE.md"
+GENERATOR = Path(__file__).with_name("signal_log_index.py")
 
 
 def next_id(day: str) -> str:
@@ -96,45 +98,30 @@ def main() -> None:
         count=1,
         flags=re.M,
     )
+    # The template ships enum literals on these two lines; without substituting
+    # them every scaffolded entry landed with `status: open|wired|done|wont`
+    # (caught 2026-08-09 by signal_log_index.py's enum warning).
+    body = re.sub(r"^status:.*$", "status: open", body, count=1, flags=re.M)
+    body = re.sub(r"^distill:.*$", "distill: none", body, count=1, flags=re.M)
     body = body.replace("# SIG-YYYYMMDD-NN — <short title>", f"# {sig} — {args.title}")
-
-    rank = args.steal_rank
-    index_row = (
-        f"| {sig} | {day} | {args.title} | `{args.bucket}` | `{args.posture}` | "
-        f"`{rank}` | [entry](entries/{path.name}) | [src]({args.url}) | open |\n"
-    )
 
     if args.dry_run:
         print(path)
-        print(index_row)
         return
 
     ENTRIES.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise SystemExit(f"exists: {path}")
     path.write_text(body)
-
-    if not INDEX.exists():
-        INDEX.write_text(
-            "# Signal log index\n\n"
-            "| ID | Date | Title | Bucket | Posture | Rank | Entry | Source | Status |\n"
-            "|----|------|-------|--------|---------|------|-------|--------|--------|\n"
-        )
-    text = INDEX.read_text()
-    lines = text.splitlines(keepends=True)
-    # insert after header separator line
-    out: list[str] = []
-    inserted = False
-    for i, line in enumerate(lines):
-        out.append(line)
-        if not inserted and line.startswith("|----"):
-            out.append(index_row)
-            inserted = True
-    if not inserted:
-        out.append(index_row)
-    INDEX.write_text("".join(out))
     print(f"wrote {path}")
-    print(f"indexed {sig}")
+
+    # INDEX.md is GENERATED from entry frontmatter — never hand-insert a row here.
+    # This script used to write its own row, which made two writers for one file;
+    # that is how the ledger drifted (5 rows listed for 12 entries, 2026-08-09).
+    if subprocess.run([sys.executable, str(GENERATOR), "--write"]).returncode == 0:
+        print(f"indexed {sig}")
+    else:
+        print(f"NOTE: run `python3 {GENERATOR} --write` to refresh INDEX.md", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 id: SIG-20260809-01
 date: 2026-08-09
 title: "One retry closes a six-times memory gap — harness beats model size on a coding exam"
+index_title: "One repair pass closes a 6× memory gap — harness beats model size"
 source_url: "https://x.com/danpacary/status/2085794035197960418"
 posted_at: "2026-08-07T18:23:44Z"
 canonical_repo: ""            # none published — "evalx", gsha 1877a3f777b7, not public
@@ -20,7 +21,7 @@ related_plans:
   - "t_716141c4"              # upstream DSpark = 1.01x
   - "SIG-20260808-06"
   - "~/Documents/T1000/docs/inference/FLASH-G3-WORTH-IT-2026-08-08.md"
-status: open
+status: carded          # t_6506193d — was only ever recorded in INDEX.md until 2026-08-09
 distill: none
 ```
 

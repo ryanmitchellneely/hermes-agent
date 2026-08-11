@@ -4,6 +4,8 @@
 id: SIG-20260807-04
 date: 2026-08-07
 title: "Oh-My-Hermes multi-model orchestration layer"
+index_title: "Oh-My-Hermes multi-model orchestration layer — **v1.0.5 delta (§8)**"
+updated: 2026-08-09
 source_url: "https://x.com/rlaope/status/2085581549484073099"
 source_url_2: "https://x.com/rlaope/status/2086267378309234801"  # 2026-08-09 re-promo; triggered the v1.0.5 delta below
 canonical_repo: "https://github.com/rlaope/oh-my-hermes"

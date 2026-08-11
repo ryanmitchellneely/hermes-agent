@@ -3,7 +3,7 @@
 ```yaml
 id: SIG-YYYYMMDD-NN          # assign next NN that day
 date: YYYY-MM-DD
-title: ""
+title: ""                    # full descriptive title
 source_url: ""               # X status or primary URL
 canonical_repo: ""           # github or empty
 canonical_docs: ""           # blog/docs or empty
@@ -14,7 +14,15 @@ confidence: high|medium|low
 hardware_fit: [spark, mbp, caden, mini, vps, cloud, none]
 stacks_touched: [t1000, pulp, k2, sovereign, investing, none]
 related_plans: []            # paths or B17 / t_…
-status: open|wired|done|wont
+status: open|carded|wired|done|wont
+distill: none|ai_brief|mesh_doctrine|k2_handoff
+
+# --- optional: INDEX.md rendering (ledger is GENERATED from these) ---
+# index_title: ""            # short scannable ledger label + our verdict (default: title)
+# index_links: [repo]        # extra Source links: repo | docs (label auto by host)
+# updated: YYYY-MM-DD        # renders "date · **upd MM-DD**"
+# status_note: ""            # rich status text, bolded, replaces plain status
+# source_url_2: ""           # second post (re-promo / follow-up) -> [src2]
 ```
 
 ## 1. Claim (1–2 sentences)
