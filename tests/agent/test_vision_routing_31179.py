@@ -256,3 +256,53 @@ model:
         import tools.browser_tool
         with patch.object(tools.browser_tool, "check_browser_requirements", return_value=True):
             assert tools.browser_tool.check_browser_vision_requirements() is True
+
+
+# ---------------------------------------------------------------------------
+# mesh t_9dafa09a: unconfigured/auto vision must fail readably, not crash
+# ---------------------------------------------------------------------------
+#
+# Original report: gateway.error.log showed repeated
+# ``TypeError: object types.SimpleNamespace cannot be used in await
+# expression`` from vision_tools.py -> auxiliary_client.py's async
+# chat.completions.create() while auxiliary.vision was still
+# provider:auto/model:'' (unfilled). These tests pin the current, correct
+# behavior end to end: with nothing configured and no credentials, the
+# resolver returns a plain ``None`` client (never a stub object) and the
+# async vision call path raises a readable RuntimeError instead of an
+# unawaitable-object TypeError.
+
+
+class TestUnconfiguredVisionFailsReadably:
+    """Fully unconfigured vision must never reach an unawaitable stub."""
+
+    def test_auto_resolve_returns_none_client_when_nothing_configured(
+        self, isolated_home, monkeypatch
+    ):
+        _fresh_modules()
+
+        from agent.auxiliary_client import resolve_vision_provider_client
+        provider, client, model = resolve_vision_provider_client(provider="auto")
+        assert client is None
+        assert model is None
+        # Whatever object comes back for `client` on failure must be exactly
+        # None, never a placeholder/stub that looks truthy but isn't a real
+        # awaitable-producing client.
+        assert client is not False
+        assert not hasattr(client, "chat")
+
+    @pytest.mark.asyncio
+    async def test_async_vision_call_raises_clean_runtime_error(
+        self, isolated_home, monkeypatch
+    ):
+        _fresh_modules()
+
+        from agent.auxiliary_client import async_call_llm
+        with pytest.raises(RuntimeError) as excinfo:
+            await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe this"}],
+            )
+        # Must be the readable "no provider configured" message, not a
+        # TypeError about awaiting a non-awaitable SimpleNamespace/stub.
+        assert "No LLM provider configured" in str(excinfo.value)
