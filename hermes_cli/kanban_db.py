@@ -157,6 +157,53 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     )
 
 
+# Named local Ollama providers (Ryan desk + generic). NOT kevin-spark (DS4
+# OpenAI-compat — different effort contract; may accept xhigh).
+_LOCAL_OLLAMA_PROVIDER_NAMES = frozenset(
+    {
+        "spark",
+        "mbp-ollama",
+        "ollama",
+        "local",
+        "caden",
+        "cadenspc",
+        "ryan-spark",
+    }
+)
+
+
+def _default_local_ollama_reasoning(task: "Task") -> Optional[str]:
+    """Default ``none`` for local-Ollama kanban pins without explicit effort.
+
+    Desk global ``agent.reasoning_effort: xhigh`` is correct for Grok but
+    Ollama 400s on it. Returning ``\"none\"`` makes the dispatcher pass
+    ``--reasoning none`` so workers are cheap and never die pre-token.
+    Returns None when the task is not a local-Ollama pin (caller skips).
+    """
+    # Explicit pin already handled by caller; belt-and-suspenders.
+    if getattr(task, "reasoning_effort", None):
+        return None
+
+    prov = (getattr(task, "provider_override", None) or "").strip().lower()
+    model = (getattr(task, "model_override", None) or "").strip()
+
+    if prov in _LOCAL_OLLAMA_PROVIDER_NAMES or prov.endswith("-ollama"):
+        return "none"
+
+    # Provider left blank but model is an Ollama-style ``name:size`` tag —
+    # only auto-none when the model clearly looks local-Ollama (colon tag
+    # with a size hint). Avoids forcing none onto random OpenRouter slugs.
+    if not prov and model and ":" in model and "/" not in model.split(":", 1)[0]:
+        import re
+
+        if re.search(r"\d+b(?:-\d+k)?$", model, re.IGNORECASE) or model.lower().startswith(
+            "hf.co/"
+        ):
+            return "none"
+
+    return None
+
+
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -10168,8 +10215,15 @@ def _default_spawn(
     # Per-task thinking depth. Independent of the model override — a task can
     # run the profile's own model at a different depth — so this is its own
     # branch, not a nested one.
-    if task.reasoning_effort:
-        cmd.extend(["--reasoning", task.reasoning_effort])
+    #
+    # Local Ollama providers reject desk-global ``xhigh`` (Grok default).
+    # When the operator pins spark/mbp-ollama (etc.) without an explicit
+    # reasoning_effort, default ``none`` so the worker is cheap + never
+    # 400s. Explicit task.reasoning_effort always wins. Wire-level clamp
+    # in plugins/model-providers/custom is the backstop if this is skipped.
+    _reasoning = task.reasoning_effort or _default_local_ollama_reasoning(task)
+    if _reasoning:
+        cmd.extend(["--reasoning", _reasoning])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

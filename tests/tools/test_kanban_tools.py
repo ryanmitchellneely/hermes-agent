@@ -190,12 +190,17 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
+    # Patch judge_goal at its source so the shared gate helper
+    # (hermes_cli.goals.judge_kanban_completion, which both kanban gates now
+    # call) is exercised end-to-end rather than stubbed out. timeout defaults
+    # to None — it is resolved from auxiliary.goal_judge.timeout inside
+    # judge_goal, not hardcoded by the caller.
+    def mock_judge_goal(*, goal, last_response, timeout=None, **_kw):
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
         return "continue", "missing verification evidence", False, None, False
 
-    monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", mock_judge_goal)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
 
     # Attempt to complete should be rejected
@@ -211,6 +216,67 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         task = kb.get_task(conn2, goal_task_id)
         assert task.status == "running"  # Should still be running, not done
+    finally:
+        conn2.close()
+
+
+def test_complete_goal_mode_transport_failure_fails_open(monkeypatch, tmp_path):
+    """An UNREACHABLE judge must not reject a completion at the tool gate.
+
+    judge_goal reports transport errors as ("continue", ..., transport_failed=True).
+    The tool gate used to read only the "continue" and hard-reject, so a 30s
+    timeout rejected legitimately-finished work. The fail-open must also leave
+    an audit comment so it is visible on the board rather than silent.
+    """
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        goal_task_id = kb.create_task(
+            conn, title="goal-mode-test", assignee="test-worker",
+            body="Must achieve X with verified evidence.", goal_mode=True
+        )
+        kb.claim_task(conn, goal_task_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+
+    calls = []
+
+    def mock_judge_goal(*, goal, last_response, timeout=None, **_kw):
+        calls.append(timeout)
+        return "continue", "judge error: TimeoutError", False, None, True
+
+    monkeypatch.setattr("hermes_cli.goals.judge_goal", mock_judge_goal)
+    monkeypatch.setattr("hermes_cli.goals.KANBAN_GATE_RETRY_BACKOFF", 0)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    out = kt._handle_complete({"summary": "Shipped X; tests green (12 passed)."})
+    d = json.loads(out)
+    assert "error" not in d, f"transport failure must fail OPEN, got: {d}"
+
+    # Bounded retry happened before falling open.
+    assert len(calls) == 2, f"expected 1 retry before fail-open, got {len(calls)} attempt(s)"
+
+    conn2 = kb.connect()
+    try:
+        task = kb.get_task(conn2, goal_task_id)
+        assert task.status == "done"
+        bodies = [c.body for c in kb.list_comments(conn2, goal_task_id)]
+        assert any("unreachable" in b.lower() for b in bodies), (
+            f"fail-open must be auditable on the board; comments={bodies}"
+        )
     finally:
         conn2.close()
 

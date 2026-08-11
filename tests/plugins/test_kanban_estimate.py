@@ -58,7 +58,10 @@ def test_estimate_parses_model_json(client, monkeypatch):
 
     def fake_call_llm(**kwargs):
         assert kwargs.get("task") == "kanban_estimator"
-        return _fake_resp('{"est_tokens": 42000, "complexity": "M", "rationale": "multi-file edit"}')
+        return _fake_resp(
+            '{"est_tokens": 42000, "complexity": "M", "lane": "either", '
+            '"rationale": "multi-file edit"}'
+        )
 
     monkeypatch.setattr(aux, "call_llm", fake_call_llm)
 
@@ -66,8 +69,55 @@ def test_estimate_parses_model_json(client, monkeypatch):
     assert body["ok"] is True
     assert body["est_tokens"] == 42000
     assert body["complexity"] == "M"
+    # either + no risk → local-first
+    assert body["lane"] == "local"
     assert body["rationale"] == "multi-file edit"
     assert body["model"] == "aux-mini"
+    assert body.get("suggestion")
+    assert body["suggestion"]["model"]
+    assert body["suggestion"]["provider"]
+
+
+def test_estimate_lane_fallback_from_complexity(client, monkeypatch):
+    """When the model omits lane, derive it from complexity/tokens — local first."""
+    task_id = client.post("/api/plugins/kanban/tasks", json={"title": "tweak label"}).json()["task"]["id"]
+
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux,
+        "call_llm",
+        lambda **kw: _fake_resp(
+            '{"est_tokens": 8000, "complexity": "S", "rationale": "localized"}'
+        ),
+    )
+    body = client.post(f"/api/plugins/kanban/tasks/{task_id}/estimate").json()
+    assert body["ok"] is True
+    assert body["lane"] == "local"
+    assert body["suggestion"]["lane"] == "local"
+
+
+def test_estimate_security_task_goes_frontier(client, monkeypatch):
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "fix oauth permission bypass", "body": "security auth hole"},
+    ).json()["task"]["id"]
+
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux,
+        "call_llm",
+        lambda **kw: _fake_resp(
+            '{"est_tokens": 12000, "complexity": "S", "lane": "local", "rationale": "small"}'
+        ),
+    )
+    body = client.post(f"/api/plugins/kanban/tasks/{task_id}/estimate").json()
+    assert body["ok"] is True
+    assert body["risky"] is True
+    assert body["lane"] == "frontier"
+    assert body["suggestion"]["lane"] == "frontier"
+    assert body["suggestion"]["provider"] in {"xai-oauth", "claude-acp"}
 
 
 def test_estimate_tolerates_unparseable_reply(client, monkeypatch):

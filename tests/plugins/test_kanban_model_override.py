@@ -267,6 +267,79 @@ def test_spawn_omits_reasoning_when_unset(monkeypatch, tmp_path, conn):
     assert "--reasoning" not in cmd
 
 
+def test_spawn_auto_none_for_local_ollama_provider(monkeypatch, tmp_path, conn):
+    """spark/mbp-ollama pins without explicit effort get --reasoning none.
+
+    Desk global xhigh is Grok-correct; Ollama 400s on it. Auto-none is the
+    dispatcher-side guard (wire clamp in custom profile is the backstop).
+    """
+    tid = kb.create_task(
+        conn,
+        title="t",
+        assignee="elias",
+        model_override="qwen2.5-coder:32b-64k",
+        provider_override="spark",
+    )
+    task = kb.get_task(conn, tid)
+    assert task.reasoning_effort is None
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
+    i = cmd.index("--reasoning")
+    assert cmd[i + 1] == "none"
+    assert cmd[cmd.index("-m") + 1] == "qwen2.5-coder:32b-64k"
+    assert cmd[cmd.index("--provider") + 1] == "spark"
+
+
+def test_spawn_auto_none_for_mbp_ollama(monkeypatch, tmp_path, conn):
+    tid = kb.create_task(
+        conn,
+        title="t",
+        assignee="elias",
+        model_override="qwen3-coder:30b",
+        provider_override="mbp-ollama",
+    )
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, kb.get_task(conn, tid))
+    assert cmd[cmd.index("--reasoning") + 1] == "none"
+
+
+def test_spawn_explicit_reasoning_wins_over_ollama_auto(monkeypatch, tmp_path, conn):
+    tid = kb.create_task(
+        conn,
+        title="t",
+        assignee="elias",
+        model_override="gpt-oss:120b",
+        provider_override="spark",
+        reasoning_effort="high",
+    )
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, kb.get_task(conn, tid))
+    assert cmd[cmd.index("--reasoning") + 1] == "high"
+
+
+def test_spawn_no_auto_none_for_kevin_spark_ds4(monkeypatch, tmp_path, conn):
+    """kevin-spark is DS4 OpenAI-compat, not Ollama — do not force none."""
+    tid = kb.create_task(
+        conn,
+        title="t",
+        assignee="elias",
+        model_override="deepseek-v4-flash",
+        provider_override="kevin-spark",
+    )
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, kb.get_task(conn, tid))
+    assert "--reasoning" not in cmd
+
+
+def test_spawn_auto_none_for_ollama_model_tag_without_provider(
+    monkeypatch, tmp_path, conn
+):
+    tid = kb.create_task(
+        conn,
+        title="t",
+        assignee="elias",
+        model_override="hermes3:8b-16k",
+    )
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, kb.get_task(conn, tid))
+    assert cmd[cmd.index("--reasoning") + 1] == "none"
+
+
 def test_worker_cli_accepts_the_reasoning_flag():
     """The dispatcher's --reasoning must be a real flag on the worker's CLI —
     a spawn arg no parser accepts fails every dispatch."""

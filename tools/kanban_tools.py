@@ -34,7 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
-from hermes_cli.goals import judge_goal
+from hermes_cli.goals import judge_kanban_completion
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
