@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
@@ -1200,6 +1201,54 @@ def get_pricing_entry(
         if entry:
             return entry
     return _lookup_official_docs_pricing(route)
+
+
+def acp_usage_namespace(acp_usage: Any) -> SimpleNamespace:
+    """Project an ACP ``PromptResponse.usage`` object into the OpenAI usage shape.
+
+    ACP reports the four token buckets separately (``inputTokens`` EXCLUDES
+    cache), while the chat-completions shape this repo's ACP shims expose puts
+    the cache-inclusive total in ``prompt_tokens`` and the split under
+    ``prompt_tokens_details``. Reassembling here — rather than in each shim —
+    keeps the quirk in the same module as :func:`normalize_usage`, which is
+    what reads it back out.
+
+    Verified live against ``claude-agent-acp`` 0.62.0, which answers
+    ``session/prompt`` with::
+
+        {"stopReason": "end_turn",
+         "usage": {"inputTokens": 2, "outputTokens": 4,
+                   "cachedReadTokens": 19467, "cachedWriteTokens": 16113,
+                   "totalTokens": 35586}}
+
+    ``usage`` is optional in the ACP schema (still marked UNSTABLE) and absent
+    on some settle paths, so the returned object also carries
+    ``tokens_available``: ``True`` only when the transport actually reported
+    counts. ``agent/call_telemetry.py`` treats ``claude-acp``/``copilot-acp``
+    as tokenless by default, and that flag is how a recovered real count is
+    distinguished from the historical hardcoded zero.
+    """
+    data = acp_usage if isinstance(acp_usage, dict) else {}
+    input_tokens = _to_int(data.get("inputTokens"))
+    output_tokens = _to_int(data.get("outputTokens"))
+    cache_read = _to_int(data.get("cachedReadTokens"))
+    cache_write = _to_int(data.get("cachedWriteTokens"))
+    thought_tokens = _to_int(data.get("thoughtTokens"))
+    prompt_tokens = input_tokens + cache_read + cache_write
+    total_tokens = _to_int(data.get("totalTokens")) or (prompt_tokens + output_tokens)
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=output_tokens,
+        total_tokens=total_tokens,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=cache_read,
+            cache_write_tokens=cache_write,
+        ),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=thought_tokens),
+        tokens_available=bool(
+            prompt_tokens or output_tokens or thought_tokens or total_tokens
+        ),
+    )
 
 
 def normalize_usage(

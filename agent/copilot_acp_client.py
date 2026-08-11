@@ -28,6 +28,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
+from agent.usage_pricing import acp_usage_namespace
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -470,19 +471,14 @@ class CopilotACPClient:
             _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
             _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
 
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, acp_usage = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = acp_usage_namespace(acp_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -501,7 +497,9 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self, prompt_text: str, *, timeout_seconds: float
+    ) -> tuple[str, str, Any]:
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
@@ -648,7 +646,13 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            _request(
+            # ACP PromptResponse.usage is optional and still marked UNSTABLE in
+            # the schema. claude-agent-acp populates it (verified live); whether
+            # the Copilot CLI does has NOT been verified — no copilot binary was
+            # available to probe. Read it either way: when it is absent
+            # acp_usage_namespace() reports tokens_available=False, which is the
+            # honest answer for a tokenless lane (MESH-TEL-2c).
+            prompt_result = _request(
                 "session/prompt",
                 {
                     "sessionId": session_id,
@@ -662,7 +666,10 @@ class CopilotACPClient:
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
             )
-            return "".join(text_parts), "".join(reasoning_parts)
+            acp_usage = (
+                prompt_result.get("usage") if isinstance(prompt_result, dict) else None
+            )
+            return "".join(text_parts), "".join(reasoning_parts), acp_usage
         finally:
             self.close()
 

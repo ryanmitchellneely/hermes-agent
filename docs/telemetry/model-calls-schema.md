@@ -65,8 +65,8 @@ Not one run. A single kanban run makes many model calls; run counts are a floor.
 
 ## The `tokens_available` contract
 
-`agent/claude_acp_client.py:1103` (non-streaming) and `:1237` (streaming), and
-`agent/copilot_acp_client.py:481`, all build
+`agent/claude_acp_client.py` (non-streaming and streaming) and
+`agent/copilot_acp_client.py` used to build
 
 ```python
 usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0,
@@ -83,13 +83,48 @@ So:
 * `tokens_available` is required and never null.
 * It is auto-detected as `false` when there is no usage object, when the
   provider is in `TOKENLESS_PROVIDERS` (`claude-acp`, `copilot-acp`), or when a
-  normalized usage object is all zeros. A caller that knows better (2c, once it
-  recovers real ACP counts) can pass `tokens_available=True` explicitly.
+  normalized usage object is all zeros. A caller that knows better can pass
+  `tokens_available=True` explicitly — which is what MESH-TEL-2c now does.
 * When it is `false`, **every** token field is written as `null`, never `0`, so
   a naive `SUM` cannot silently undercount.
 * Consumers report those rows as their own count — "N calls with no token
   data" — rather than folding them into a total. `scripts/telemetry_query.py`
   does exactly this (`calls_with_tokens` / `calls_without_tokens`).
+
+### MESH-TEL-2c: claude-acp is no longer tokenless
+
+The counts were on the wire the whole time. ACP's `session/prompt` response
+carries `PromptResponse.usage` (optional, still marked **UNSTABLE** in the ACP
+schema) and both shims discarded the result. Probed live against
+`claude-agent-acp` 0.62.0, a one-word prompt answers:
+
+```json
+{"stopReason": "end_turn",
+ "usage": {"inputTokens": 2, "outputTokens": 4, "cachedReadTokens": 19467,
+           "cachedWriteTokens": 16113, "totalTokens": 35586}}
+```
+
+`agent/usage_pricing.py:acp_usage_namespace` projects that into the
+chat-completions shape the shims expose (ACP's `inputTokens` **excludes**
+cache; `prompt_tokens` includes it) and tags the result with a
+`tokens_available` attribute. The emit sites forward that attribute into
+`record_model_call(tokens_available=...)`, because auto-detection would
+otherwise apply the `TOKENLESS_PROVIDERS` default and null the very counts 2c
+recovered. Providers outside the ACP lanes never set the attribute, so they
+keep pure auto-detection.
+
+`usage` is absent on some settle paths (and the Copilot CLI's support is
+**unverified** — no `copilot` binary was available to probe). Absent usage
+still yields `tokens_available=false` with `null` tokens; the shims read the
+result either way, so a Copilot CLI that does report usage is picked up
+without a further change.
+
+Note the side effect this makes real: the ACP lanes now feed genuine prompt
+totals to session accounting and to `context_compressor.update_from_response`,
+which previously saw zeros. No dollar cost appears —
+`resolve_billing_route("claude-acp"/"copilot-acp")` returns `unknown`, so
+`estimate_usage_cost` yields `amount_usd=None` and nothing is added to session
+spend.
 
 Model attribution is still complete on those rows: provider, model, effort,
 outcome and wall time are all captured. The `>=95% attribution` bar is about

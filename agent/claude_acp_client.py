@@ -31,6 +31,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
+from agent.usage_pricing import acp_usage_namespace
 from tools.environments.local import hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -1087,7 +1088,7 @@ class ClaudeACPClient:
                 tool_choice=tool_choice,
             )
 
-        response_text, reasoning_text = self._run_prompt(
+        response_text, reasoning_text, acp_usage = self._run_prompt(
             messages_list,
             timeout_seconds=effective_timeout,
             acp_model=acp_model,
@@ -1099,12 +1100,7 @@ class ClaudeACPClient:
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
-        usage = SimpleNamespace(
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-        )
+        usage = acp_usage_namespace(acp_usage)
         assistant_message = SimpleNamespace(
             content=cleaned_text,
             tool_calls=tool_calls,
@@ -1148,7 +1144,7 @@ class ClaudeACPClient:
 
         def _worker() -> None:
             try:
-                text, reasoning = self._run_prompt(
+                text, reasoning, acp_usage = self._run_prompt(
                     messages,
                     timeout_seconds=timeout_seconds,
                     acp_model=acp_model,
@@ -1160,6 +1156,7 @@ class ClaudeACPClient:
                 )
                 result_box["text"] = text
                 result_box["reasoning"] = reasoning
+                result_box["usage"] = acp_usage
             except Exception as exc:
                 result_box["error"] = exc
             finally:
@@ -1233,12 +1230,7 @@ class ClaudeACPClient:
         yield SimpleNamespace(
             choices=[],
             model=model_name,
-            usage=SimpleNamespace(
-                prompt_tokens=0,
-                completion_tokens=0,
-                total_tokens=0,
-                prompt_tokens_details=SimpleNamespace(cached_tokens=0),
-            ),
+            usage=acp_usage_namespace(result_box.get("usage")),
         )
 
     def _run_prompt(
@@ -1252,7 +1244,7 @@ class ClaudeACPClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         on_live_delta: Any = None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, Any]:
         with self._lock:
             try:
                 return self._run_prompt_unlocked(
@@ -1292,7 +1284,7 @@ class ClaudeACPClient:
         tool_choice: Any = None,
         force_full: bool = False,
         on_live_delta: Any = None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, Any]:
         now = time.monotonic()
         if (
             self._active_process is not None
@@ -1362,7 +1354,11 @@ class ClaudeACPClient:
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
         assert self._session_id
-        self._request_unlocked(
+        # The session/prompt RESULT carries this turn's real token counts —
+        # ACP PromptResponse.usage, which claude-agent-acp resets per turn.
+        # It used to be discarded here, which is why the usage object below
+        # was a hardcoded zero (MESH-TEL-2c).
+        prompt_result = self._request_unlocked(
             "session/prompt",
             {
                 "sessionId": self._session_id,
@@ -1382,7 +1378,10 @@ class ClaudeACPClient:
         self._sent_message_count = len(messages)
         self._sent_messages_json = _messages_stable_json(messages)
         self._last_used_at = time.monotonic()
-        return "".join(text_parts), "".join(reasoning_parts)
+        acp_usage = (
+            prompt_result.get("usage") if isinstance(prompt_result, dict) else None
+        )
+        return "".join(text_parts), "".join(reasoning_parts), acp_usage
 
     def _ensure_process_unlocked(self, *, timeout_seconds: float) -> None:
         if self._active_process is not None and self._active_process.poll() is None:

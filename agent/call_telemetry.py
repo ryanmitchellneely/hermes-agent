@@ -19,18 +19,26 @@ is wrapped in ``try/except`` and swallows everything, exactly like
 model call.
 
 THE tokens_available CONTRACT (the reason this schema shipped ahead of its
-callers). ``agent/claude_acp_client.py`` (:1103 non-streaming, :1237 streaming)
-and ``agent/copilot_acp_client.py`` (:481) hardcode::
+callers). ``agent/claude_acp_client.py`` and ``agent/copilot_acp_client.py``
+used to hardcode::
 
     usage = SimpleNamespace(prompt_tokens=0, completion_tokens=0, total_tokens=0, ...)
 
-so those lanes emit a REAL ZERO, not a missing value. Stored naively as 0 the
-subscription lanes look free and any local-vs-subscription split comes out
+so those lanes emitted a REAL ZERO, not a missing value. Stored naively as 0
+the subscription lanes look free and any local-vs-subscription split comes out
 inverted. Every row therefore carries a required ``tokens_available`` boolean,
 and rows with ``tokens_available=false`` write ``null`` (not ``0``) into every
 token field so a naive ``SUM`` cannot silently undercount — it either skips
 them or raises. Consumers report those calls as their own count
 ("N calls with no token data") instead of folding them into a total.
+
+MESH-TEL-2c removed the hardcoded zeros: ACP's ``session/prompt`` response
+carries real per-turn counts in ``PromptResponse.usage``, which both shims were
+discarding (verified live against ``claude-agent-acp`` 0.62.0). Recovered usage
+arrives here tagged with a ``tokens_available`` attribute that the emit sites
+forward explicitly, because ``TOKENLESS_PROVIDERS`` below would otherwise null
+it. The auto-detected default for those lanes is unchanged — a caller that says
+nothing still gets ``tokens_available=false``.
 
 Token normalization is delegated to ``agent/usage_pricing.py:normalize_usage``
 so provider quirks (bedrock cache accounting, codex Responses shape, DeepSeek
