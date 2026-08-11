@@ -151,6 +151,68 @@ record_model_call(
 )
 ```
 
+### Where it is actually called from (MESH-TEL-2b)
+
+Two chokepoints, not one per provider adapter — a per-adapter wiring leaves a
+lane silently unattributed the moment a new adapter lands. Each has a success
+site and a failure site, because a lane that only records the calls that came
+back reports a 100% success rate by construction (t_4123e041).
+
+| site | covers | notes |
+|---|---|---|
+| `agent/auxiliary_client.py::_validate_llm_response` | every non-streaming aux call that returned (vision, compression, title, web_extract, judges, …) | the same chokepoint `record_aux_usage` uses |
+| `agent/auxiliary_client.py::_record_aux_call_failure` | the aux failure counterpart | fires from the `_relay_auxiliary_call` decorator, so it is once per LOGICAL call no matter how many attempts the fallback chain burned; `KeyboardInterrupt`/`CancelledError` are deliberately not recorded as model failures |
+| `agent/conversation_loop.py`, at the success `break` | every accepted main-loop response | reached exactly once per accepted call, after all retry/fallback branches have looped or bailed |
+| `run_agent.py::_invoke_api_request_error_hook` | the main-loop failure counterpart | the single funnel for all three main-loop failure surfaces (invalid response, `content_filter` refusal, raised exception); the emit sits **above** the `has_hook()` early-return so telemetry does not depend on a user having configured a lifecycle hook |
+
+`wall_ms` on an aux row spans the whole **logical** call, measured from
+`time.monotonic()` stamped by the relay decorator — so a route that only
+succeeded on its third fallback reads as the slow call it actually was, and an
+NTP step cannot produce a negative duration. Every emit site stamps `wall_ms`
+into a local **before** any other work in the emit runs, so the emit's own cost
+(notably the identity lookup's first-miss config read) never lands in the field
+whose job is timing.
+
+### `provider` records the lane, not the routing decision
+
+`provider` is passed through `call_telemetry.resolve_provider_identity` at all
+three sites. Two labels are routing decisions rather than identities and are
+upgraded to `custom:<name>` via `runtime_provider.canonical_custom_identity`
+(reverse-lookup by `base_url`, then by model):
+
+- **`auto`** — what every aux task carries on a stock desk
+  (`auxiliary.<task>.provider: auto`, 13 of 13 tasks here). Recorded raw, every
+  aux row in the fleet says `provider: "auto"`.
+- **bare `custom`** — the shared billing class of every named `providers:`
+  entry, so Flash-on-`:8889` and Ollama-on-`:11434` collapse into one bucket,
+  and a worker launched `--provider kevin-spark` records as `custom`.
+
+Real identities (`openrouter`, `claude-acp`, `nous`, …) pass through untouched,
+and a sentinel that cannot be recovered keeps its original label rather than
+having a lane invented for it. The lookup is memoized per `(base_url, model)`;
+the first miss costs ~85 ms of config parsing, every hit ~0.0002 ms.
+
+`reason`/`error_type` map onto the closed outcome set:
+`content_policy_blocked → refusal`, `timeout → timeout`, everything else
+`→ error`.
+
+Known gaps, all verified rather than assumed:
+
+- **`ttft_ms` is always `null` today.** Neither chokepoint sits on a streaming
+  first-token boundary, so nothing observes the timestamp. The field is in the
+  schema and the writer honours it; no caller populates it yet.
+- A main-loop call retried *inside* the provider SDK is one row, not N.
+- The streaming aux path returns a raw iterator instead of passing through
+  `_validate_llm_response`, so it is not counted.
+- On ACP lanes one "call" is a whole agent turn, so `wall_ms` and
+  `output_tokens` are turn-scoped and much larger than a single HTTP request.
+
+`tests/conftest.py` pins `T1000_TELEMETRY_DIR` to a per-test tempdir so the
+suite cannot append fake rows to the real store.
+
+`tests/conftest.py` pins `T1000_TELEMETRY_DIR` to a per-test tempdir so the
+suite cannot append fake rows to the real store.
+
 Keyword-only; everything except `provider` and `model` is optional.
 `board` / `task_id` / `run_id` / `session_id` / `lane` fall back to the
 dispatcher environment so call sites need not thread them through. The function

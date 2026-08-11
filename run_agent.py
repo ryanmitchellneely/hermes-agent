@@ -1721,6 +1721,26 @@ class AIAgent:
             return True
         return provider_lower == "ollama"
 
+    def _is_local_ollama_endpoint(self) -> bool:
+        """True for desk local Ollama URLs (MBP/Spark tunnel ports, ollama host).
+
+        Used to run the same /api/show thinking probe as Ollama Cloud so
+        non-thinking tags never receive reasoning_effort on the wire.
+        """
+        bu = self._base_url_lower or ""
+        if "ollama" in bu:
+            return True
+        # Common Ryan desk ports: MBP 11434, Spark tunnel 11435, lab 11436+.
+        for port in (":11434", ":11435", ":11436", ":11437"):
+            if port in bu:
+                return True
+        provider_lower = (self.provider or "").strip().lower()
+        if provider_lower in {"ollama", "custom"} and any(
+            p in bu for p in (":11434", ":11435", ":11436", ":11437")
+        ):
+            return True
+        return False
+
     def _should_treat_stop_as_truncated(
         self,
         finish_reason: str,
@@ -2905,6 +2925,66 @@ class AIAgent:
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
     ) -> None:
+        # Cross-board model-call telemetry (MESH-TEL-2b). All three main-loop
+        # failure surfaces — invalid response, content_filter refusal, and the
+        # raised-exception handler — funnel through this method, so it is the
+        # failure counterpart to conversation_loop's success emit. It sits
+        # ABOVE the has_hook() early-return below deliberately: telemetry must
+        # not depend on the user having configured an api_request_error hook.
+        try:
+            from agent.call_telemetry import (
+                record_model_call,
+                resolve_provider_identity,
+            )
+
+            # Stamp the duration first: the identity lookup below reads config
+            # on its first miss, and that must not land in the call's wall time.
+            _tel_wall_ms = int((time.time() - api_start_time) * 1000)
+            _tel_error = str(error_type or "")
+            _tel_reason = str(reason or "")
+            if _tel_reason == "content_policy_blocked":
+                _tel_outcome = "refusal"
+            elif _tel_reason == "timeout" or "timeout" in _tel_error.lower():
+                _tel_outcome = "timeout"
+            else:
+                _tel_outcome = "error"
+            # error_class carries the error_classifier taxonomy (FailoverReason)
+            # rather than a second hand-rolled one — conversation_loop already
+            # classifies and passes the reason in. The exception's own type only
+            # fills in where the classifier had nothing better than "unknown",
+            # so "RuntimeError" beats a row that just says "unknown".
+            _tel_error_class = (
+                _tel_reason
+                if _tel_reason and _tel_reason != "unknown"
+                else (_tel_error or _tel_reason or None)
+            )
+            _tel_reasoning = getattr(self, "reasoning_config", None)
+            record_model_call(
+                # Same sentinel upgrade as the success emit, so a lane's error
+                # rows group with its ok rows instead of landing in "custom".
+                provider=resolve_provider_identity(
+                    self.provider, getattr(self, "base_url", None), self.model
+                ),
+                model=self.model,
+                effort=(
+                    _tel_reasoning.get("effort")
+                    if isinstance(_tel_reasoning, dict)
+                    and _tel_reasoning.get("enabled") is not False
+                    else None
+                ),
+                # A failed call returned no usage — the record carries null
+                # tokens, never 0, so a rollup cannot read it as free.
+                usage=None,
+                wall_ms=_tel_wall_ms,
+                outcome=_tel_outcome,
+                error_class=_tel_error_class,
+                api_mode=self.api_mode,
+                session_id=self.session_id or None,
+                task="main_loop",
+            )
+        except Exception:
+            pass
+
         # Lazy module import (not from-import) so tests can replace lifecycle
         # dispatch at this call site. After first call the import is a
         # ``sys.modules`` dict lookup, so retries don't repay any real cost.
@@ -7159,7 +7239,10 @@ class AIAgent:
         # /api/show capabilities list is authoritative — emit reasoning_effort
         # only for models that declare the "thinking" capability. deepseek-v4
         # has it; gemma3 / qwen3-coder don't. Cached per (model, base_url).
-        if base_url_host_matches(self._base_url_lower, "ollama.com"):
+        # Local desk tunnels (:11434 MBP, :11435 Spark, …) must probe too —
+        # previously only ollama.com was gated, so local custom pins still
+        # inherited desk global xhigh and 400'd (t_3a7f19db / t_0be4092d).
+        if base_url_host_matches(self._base_url_lower, "ollama.com") or self._is_local_ollama_endpoint():
             return self._ollama_supports_thinking_cached()
         if "openrouter" not in self._base_url_lower:
             return False

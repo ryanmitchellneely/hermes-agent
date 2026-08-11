@@ -161,6 +161,62 @@ def _canonical_usage(usage: Any, provider: Optional[str], api_mode: Optional[str
     return normalize_usage(_as_namespace(usage), provider=provider, api_mode=api_mode)
 
 
+#: Provider labels that are a ROUTING DECISION, not an identity. ``auto`` is
+#: what every auxiliary task carries on a stock desk
+#: (``auxiliary.<task>.provider: auto``); bare ``custom`` is the shared billing
+#: class of every named ``providers:`` entry, so a desk running Flash on :8889
+#: and Ollama on :11434 collapses both into one bucket. Neither names the lane
+#: that actually served the call, which is the only thing this store exists for.
+PROVIDER_SENTINELS = frozenset({"", "auto", "auxiliary", "custom", "unknown"})
+
+#: (base_url, model) -> identity. ``canonical_custom_identity`` reads config
+#: from disk and this runs on every model call, so the lookup is memoized.
+#: Bounded because a long-lived gateway can see many ad-hoc endpoints.
+_IDENTITY_CACHE: dict[tuple, Optional[str]] = {}
+_IDENTITY_CACHE_MAX = 256
+
+
+def resolve_provider_identity(provider: Any, base_url: Any = None, model: Any = None) -> Optional[str]:
+    """Upgrade a routing sentinel to the provider identity that actually RAN.
+
+    Without this, aux rows on a stock desk all read ``provider: "auto"`` (13 of
+    13 aux tasks are configured that way and the resolver passes the label
+    through), and a worker launched ``--provider kevin-spark`` records
+    ``provider: "custom"`` — so "how much deepseek vs 120b, by lane" has
+    nothing to group by. That is the same class of defect as reading the model
+    from config: the row names the routing decision instead of the route.
+
+    ``hermes_cli.runtime_provider.canonical_custom_identity`` is the repo's
+    existing reverse-lookup for exactly this (base_url -> ``custom:<name>``,
+    then model), and its docstring already says any path persisting a resolved
+    provider must go through it. Real identities (``openrouter``,
+    ``claude-acp``, ``nous``, …) pass through untouched.
+
+    Falls back to the original label. Never raises.
+    """
+    label = str(provider or "").strip()
+    if label.lower() not in PROVIDER_SENTINELS:
+        return label or None
+    url = str(base_url or "").strip()
+    slug = str(model or "").strip()
+    if not url and not slug:
+        return label or None
+    key = (url, slug)
+    if key in _IDENTITY_CACHE:
+        return _IDENTITY_CACHE[key] or (label or None)
+    identity: Optional[str] = None
+    try:
+        from hermes_cli.runtime_provider import canonical_custom_identity
+
+        identity = canonical_custom_identity(base_url=url or None, model=slug or None)
+    except Exception:  # pragma: no cover - defensive
+        identity = None
+    if len(_IDENTITY_CACHE) >= _IDENTITY_CACHE_MAX:
+        _IDENTITY_CACHE.clear()
+    _IDENTITY_CACHE[key] = identity
+    return identity or (label or None)
+
+
 def build_record(
     *,
     provider: Any,

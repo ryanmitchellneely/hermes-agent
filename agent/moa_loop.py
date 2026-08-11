@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait
 from types import SimpleNamespace
 from typing import Any
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, caller_records_telemetry
 from agent.message_content import flatten_message_text
 from agent.transports import get_transport
 
@@ -1810,19 +1810,25 @@ class MoAChatCompletions:
             agg_runtime.pop("extra_body", None),
             extra_body,
         )
-        _agg_response = call_llm(
-            task="moa_aggregator",
-            messages=agg_messages,
-            temperature=aggregator_temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            extra_body=agg_extra_body,
-            # Prepared requests must retain the acting aggregator's reasoning
-            # policy exactly as the direct create() path does (#64187).
-            reasoning_config=_aggregator_reasoning_config(aggregator),
-            **stream_kwargs,
-            **agg_runtime,
-        )
+        # This response is handed straight back to conversation_loop, which
+        # emits its own telemetry row for it. Suppress the aux chokepoint's row
+        # so the acting aggregator is counted once, not twice (MESH-TEL-2b).
+        # The one-shot /moa synthesis path above is NOT wrapped: nothing
+        # downstream ever sees that response, so its aux row is the only one.
+        with caller_records_telemetry():
+            _agg_response = call_llm(
+                task="moa_aggregator",
+                messages=agg_messages,
+                temperature=aggregator_temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                extra_body=agg_extra_body,
+                # Prepared requests must retain the acting aggregator's reasoning
+                # policy exactly as the direct create() path does (#64187).
+                reasoning_config=_aggregator_reasoning_config(aggregator),
+                **stream_kwargs,
+                **agg_runtime,
+            )
         # Non-streaming path (quiet mode / eval / subagents): the aggregator
         # output is available inline, so capture it into the pending trace now.
         # Streaming path: the aggregator's raw token stream is returned to the

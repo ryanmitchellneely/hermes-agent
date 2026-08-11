@@ -3075,6 +3075,146 @@ _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_relay_call", default=None)
 )
 
+#: Set while an aux call's telemetry row is the CALLER's responsibility.
+#: Only MoA's acting aggregator uses it — see :func:`caller_records_telemetry`.
+_TELEMETRY_OWNED_BY_CALLER: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "auxiliary_telemetry_owned_by_caller", default=False
+)
+
+
+@contextlib.contextmanager
+def caller_records_telemetry():
+    """Suppress this aux call's telemetry row because the caller emits it.
+
+    MESH-TEL-2b, the double-counting guard. MoA's ACTING aggregator
+    (``agent/moa_loop.py``) is one physical provider call that crosses BOTH
+    chokepoints: it goes out through ``call_llm(task="moa_aggregator")`` — so
+    it lands in ``_validate_llm_response`` — and its response is then returned
+    to ``conversation_loop`` as the turn's response, which emits again. Two
+    rows, one call, tokens doubled on every non-streaming MoA turn.
+
+    This mirrors the reasoning behind ``aux_accounting._EXCLUDED_TASKS`` (which
+    drops ``moa_reference``/``moa_aggregator`` from session accounting because
+    the main loop already folds them in), but resolves it in the opposite
+    direction for telemetry: the aux row is dropped and the MAIN-LOOP row is
+    kept, because the aggregator's response is what the loop actually acted on.
+    Advisor (``moa_reference``) calls are NOT suppressed — the main loop's emit
+    reads the raw ``response.usage``, which is aggregator-only, so advisor
+    usage appears exactly once, here.
+
+    Scoped to a ContextVar rather than a parameter so it cannot leak across the
+    MoA advisor fan-out's worker threads.
+    """
+    token = _TELEMETRY_OWNED_BY_CALLER.set(True)
+    try:
+        yield
+    finally:
+        _TELEMETRY_OWNED_BY_CALLER.reset(token)
+
+
+def _telemetry_provider_identity(provider: Any, base_url: Any, model: Any) -> Optional[str]:
+    """Thin wrapper over the shared resolver so both aux emit sites agree.
+
+    Lives in agent/call_telemetry.py because the main loop's emit needs the
+    identical upgrade — see resolve_provider_identity's docstring.
+    """
+    try:
+        from agent.call_telemetry import resolve_provider_identity
+
+        return resolve_provider_identity(provider, base_url, model)
+    except Exception:  # pragma: no cover - defensive
+        return str(provider or "").strip() or None
+
+
+def _new_relay_auxiliary_context(task: Any) -> Dict[str, Any]:
+    """Fresh per-logical-aux-call state. ``started_at`` powers telemetry wall_ms."""
+    return {
+        "task": str(task or "unknown"),
+        "request_id": f"aux-{uuid.uuid4().hex}",
+        "attempt_count": 0,
+        "provider": "",
+        "model": "",
+        # Upstream initializes this in the inline context dict this helper
+        # replaced. Readers use context.get("response_model"), so omitting it
+        # happens to work today — but a later switch to [] subscripting would
+        # KeyError, so keep the key rather than rely on that.
+        "response_model": None,
+        "api_mode": "chat_completions",
+        # The endpoint the route settled on. Telemetry uses it to recover a real
+        # provider identity when the label is the "auto" sentinel.
+        "base_url": "",
+        # Monotonic so a wall-clock/NTP step cannot produce a negative duration.
+        "started_at": time.monotonic(),
+        # Resolved reasoning effort, published by _build_call_kwargs once the
+        # fallback chain has settled on the request that actually goes out.
+        "effort": None,
+    }
+
+
+def _record_aux_call_failure(exc: BaseException) -> None:
+    """Emit the telemetry row for an auxiliary call that never returned.
+
+    MESH-TEL-2b: ``_validate_llm_response`` only sees calls that CAME BACK, so
+    on its own it reports a 100% success rate — the exact blind spot that let a
+    judge silently fall back and time out (t_4123e041) look like a healthy lane.
+    This is the failure counterpart, and it sits on the one wrapper every
+    logical aux call passes through, so it fires exactly once per call no
+    matter how many attempts the fallback chain burned.
+
+    The taxonomy comes from ``agent/error_classifier.py`` rather than a
+    hand-rolled one; the exception's own type is kept only when the classifier
+    has nothing better than ``unknown``.
+    """
+    try:
+        # A cancelled or Ctrl-C'd call is the operator stopping work, not a
+        # model failure — recording it as one would corrupt the success rate.
+        if not isinstance(exc, Exception):
+            return
+        context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+        # Stamp the duration first — classification and the identity lookup
+        # below both do real work, and neither belongs in the call's wall time.
+        started_at = context.get("started_at")
+        wall_ms = (
+            (time.monotonic() - started_at) * 1000
+            if isinstance(started_at, (int, float))
+            else None
+        )
+        provider = str(context.get("provider") or "") or None
+        model = str(context.get("model") or "") or None
+        try:
+            from agent.error_classifier import classify_api_error
+
+            reason = classify_api_error(
+                exc, provider=provider or "", model=model or ""
+            ).reason.value
+        except Exception:  # pragma: no cover - defensive
+            reason = "unknown"
+        exc_name = type(exc).__name__
+        outcome = {
+            "timeout": "timeout",
+            "content_policy_blocked": "refusal",
+        }.get(reason, "error")
+
+        from agent.call_telemetry import record_model_call
+
+        record_model_call(
+            provider=_telemetry_provider_identity(
+                provider, context.get("base_url"), model
+            ),
+            # No response to read the model off, so this is the route the
+            # fallback chain last resolved — null when it failed before routing.
+            model=model,
+            effort=context.get("effort"),
+            usage=None,
+            wall_ms=wall_ms,
+            outcome=outcome,
+            error_class=reason if reason != "unknown" else exc_name,
+            task=str(context.get("task") or "auxiliary"),
+            api_mode=context.get("api_mode"),
+        )
+    except Exception:
+        logger.debug("Aux failure telemetry failed (non-fatal)", exc_info=True)
+
 
 def _relay_auxiliary_call(callback):
     """Give every physical retry in one auxiliary call a shared Relay identity."""
@@ -3082,18 +3222,11 @@ def _relay_auxiliary_call(callback):
     @functools.wraps(callback)
     def wrapped(*args, **kwargs):
         task = args[0] if args else kwargs.get("task")
-        token = _RELAY_AUX_CALL_CONTEXT.set({
-            "task": str(task or "unknown"),
-            "request_id": f"aux-{uuid.uuid4().hex}",
-            "attempt_count": 0,
-            "provider": "",
-            "model": "",
-            "response_model": None,
-            "api_mode": "chat_completions",
-        })
+        token = _RELAY_AUX_CALL_CONTEXT.set(_new_relay_auxiliary_context(task))
         try:
             return callback(*args, **kwargs)
-        except BaseException:
+        except BaseException as exc:
+            _record_aux_call_failure(exc)
             _fail_relay_auxiliary_call()
             raise
         finally:
@@ -3108,18 +3241,11 @@ def _relay_auxiliary_call_async(callback):
     @functools.wraps(callback)
     async def wrapped(*args, **kwargs):
         task = args[0] if args else kwargs.get("task")
-        token = _RELAY_AUX_CALL_CONTEXT.set({
-            "task": str(task or "unknown"),
-            "request_id": f"aux-{uuid.uuid4().hex}",
-            "attempt_count": 0,
-            "provider": "",
-            "model": "",
-            "response_model": None,
-            "api_mode": "chat_completions",
-        })
+        token = _RELAY_AUX_CALL_CONTEXT.set(_new_relay_auxiliary_context(task))
         try:
             return await callback(*args, **kwargs)
-        except BaseException:
+        except BaseException as exc:
+            _record_aux_call_failure(exc)
             _fail_relay_auxiliary_call()
             raise
         finally:
@@ -3132,6 +3258,7 @@ def _set_relay_auxiliary_route(
     provider: str | None,
     model: str | None,
     api_mode: str | None,
+    base_url: str | None = None,
 ) -> None:
     context = _RELAY_AUX_CALL_CONTEXT.get()
     if context is None:
@@ -3140,6 +3267,9 @@ def _set_relay_auxiliary_route(
     context["model"] = str(model or "unknown")
     context["response_model"] = None
     context["api_mode"] = str(api_mode or "chat_completions")
+    # Optional so existing callers/tests that pass three positionals still work.
+    if base_url:
+        context["base_url"] = str(base_url)
 
 
 def _relay_auxiliary_metadata(
@@ -8324,6 +8454,19 @@ def _build_call_kwargs(
         else:
             effort = reasoning_config.get("effort") or "medium"
             merged_extra["reasoning"] = {"enabled": True, "effort": effort}
+    # Publish the effort that is actually going on the wire for telemetry
+    # (MESH-TEL-2b). Deliberately OUTSIDE the branch above: a provider whose
+    # profile encodes reasoning itself still ran at this effort, and reading it
+    # here — rather than from config — means the aux fallback chain's last
+    # attempt before the response is what the row reports.
+    if reasoning_config and isinstance(reasoning_config, dict):
+        _relay_aux_ctx = _RELAY_AUX_CALL_CONTEXT.get()
+        if _relay_aux_ctx is not None:
+            _relay_aux_ctx["effort"] = (
+                None
+                if reasoning_config.get("enabled") is False
+                else (reasoning_config.get("effort") or "medium")
+            )
     # Portal product tags + sticky session_id. The provider profile usually
     # supplies both; this fallback covers profile-load failures and alias
     # spellings the profile lookup might miss. session_id keeps aux
@@ -8397,6 +8540,50 @@ def _validate_llm_response(
         )
     from agent.aux_accounting import record_aux_usage
     record_aux_usage(response, task, provider=provider, base_url=base_url)
+    # Cross-board model-call telemetry (MESH-TEL-2b) — same chokepoint, same
+    # best-effort contract as record_aux_usage above. Reaching here means the
+    # provider returned; downstream shape validation is a separate concern, so
+    # this row is the CALL's outcome, not the payload's. Failures never reach
+    # this line and are emitted by _record_aux_call_failure instead.
+    try:
+        if not _TELEMETRY_OWNED_BY_CALLER.get():
+            from agent.call_telemetry import record_model_call
+
+            _tel_usage = getattr(response, "usage", None)
+            _tel_ctx = _RELAY_AUX_CALL_CONTEXT.get() or {}
+            _tel_started = _tel_ctx.get("started_at")
+            _tel_model = getattr(response, "model", None) or _tel_ctx.get("model")
+            # Stamp the duration BEFORE anything else in the emit runs. The
+            # identity lookup below reads config on its first miss (~85ms once
+            # per route per process); folded into wall_ms it would inflate
+            # exactly one row per lane, in the field whose whole job is timing.
+            # Spans the whole logical aux call, so a route that only succeeded
+            # on its third fallback reads as the slow call it was. Null when
+            # validation is reached outside the wrapper.
+            _tel_wall_ms = (
+                (time.monotonic() - _tel_started) * 1000
+                if isinstance(_tel_started, (int, float))
+                else None
+            )
+            record_model_call(
+                # "auto"/bare-"custom" is a routing decision, not a lane —
+                # upgrade it to the entry that actually served this call.
+                provider=_telemetry_provider_identity(
+                    provider or _tel_ctx.get("provider"),
+                    base_url or _tel_ctx.get("base_url"),
+                    _tel_model,
+                ),
+                model=getattr(response, "model", None),
+                effort=_tel_ctx.get("effort"),
+                usage=_tel_usage,
+                tokens_available=getattr(_tel_usage, "tokens_available", None),
+                wall_ms=_tel_wall_ms,
+                outcome="ok",
+                task=task or "auxiliary",
+                api_mode=_tel_ctx.get("api_mode"),
+            )
+    except Exception:
+        logger.debug("Aux call telemetry failed (non-fatal)", exc_info=True)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
@@ -9086,6 +9273,7 @@ def _call_llm_impl(
         request_provider,
         final_model,
         resolved_api_mode,
+        resolved_base_url,
     )
 
     # Log what we're about to do — makes auxiliary operations visible
@@ -9860,6 +10048,7 @@ async def _async_call_llm_impl(
         request_provider,
         final_model,
         resolved_api_mode,
+        resolved_base_url,
     )
 
     # Pass the client's actual base_url (not just resolved_base_url) so

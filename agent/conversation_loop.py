@@ -3807,6 +3807,53 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
+                # Cross-board model-call telemetry (MESH-TEL-2b). This is the
+                # main loop's single "one provider call completed" point — it
+                # is reached exactly once per accepted response, after every
+                # retry/fallback branch has either looped or bailed out.
+                # Failures are emitted from the other chokepoint,
+                # run_agent.py::_invoke_api_request_error_hook.
+                try:
+                    from agent.call_telemetry import (
+                        record_model_call,
+                        resolve_provider_identity,
+                    )
+
+                    _tel_usage = getattr(response, "usage", None)
+                    _tel_reasoning = getattr(agent, "reasoning_config", None)
+                    _tel_model = getattr(response, "model", None) or agent.model
+                    record_model_call(
+                        # A worker launched --provider kevin-spark still carries
+                        # the bare billing class "custom" here; upgrade it to the
+                        # entry that owns the endpoint so lanes stay separable.
+                        provider=resolve_provider_identity(
+                            agent.provider,
+                            getattr(agent, "base_url", None),
+                            _tel_model,
+                        ),
+                        # The slug that actually ran: the provider's own report
+                        # wins over agent.model, which a fallback may have moved.
+                        model=getattr(response, "model", None) or agent.model,
+                        effort=(
+                            _tel_reasoning.get("effort")
+                            if isinstance(_tel_reasoning, dict)
+                            and _tel_reasoning.get("enabled") is not False
+                            else None
+                        ),
+                        usage=_tel_usage,
+                        # ACP lanes flag recovered-vs-hardcoded-zero counts on
+                        # the usage object itself (MESH-TEL-2c); everyone else
+                        # leaves this None and gets auto-detection.
+                        tokens_available=getattr(_tel_usage, "tokens_available", None),
+                        wall_ms=int(api_duration * 1000),
+                        outcome="ok",
+                        api_mode=agent.api_mode,
+                        session_id=agent.session_id or None,
+                        task="main_loop",
+                    )
+                except Exception as _tel_exc:  # pragma: no cover - defensive
+                    logger.debug("Call telemetry emit failed: %s", _tel_exc)
+
                 from agent import relay_llm
 
                 relay_llm.complete_logical_call(
