@@ -1,11 +1,16 @@
 """Tests for the Distillery review agent (scripts/distillery_review_agent.py).
 
-Card C2 scope only: cluster + judge pass (load index.json, select a
-prioritized batch, judge, render reviews/<date>.md). --apply is a separate
-follow-on card (C3) and is not implemented or tested here.
+Covers both card C2 (cluster + judge pass: load index.json, select a
+prioritized batch, judge, render reviews/<date>.md) and card C3 (--apply:
+read decision: approve rows back, flip status via the sweep's own --mark,
+append FILED-LOG.md, clear the batch from the pending cache).
 
 All fixtures are synthetic and local — no live network call to the judge;
-`call_judge` is monkeypatched everywhere it would otherwise fire.
+`call_judge` is monkeypatched everywhere it would otherwise fire. The C3
+--apply tests below DO shell out to the real sibling
+distillery_intake_sweep.py --mark (that subprocess call is the actual
+contract under test — index.json must only ever move through it, never
+be written directly by this script).
 """
 
 import json
@@ -330,3 +335,209 @@ def test_judge_never_invoked_when_all_rows_already_pending(tmp_path, monkeypatch
         ["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--date", "2026-08-10"]
     )
     assert rc == 0
+
+
+# ── --apply (card C3): parsing ──────────────────────────────────────────
+
+
+def test_parse_review_rows_round_trips_the_real_renderer(tmp_path):
+    rows = [_row("a", title="Row A"), _row("b", title="Row B")]
+    clusters = [{"label": "C", "row_ids": ["a", "b"]}]
+    verdicts = {
+        "a": {"cluster": "C", "verdict": "file", "rationale": "keep it", "supersede_of": None},
+        "b": {
+            "cluster": "C",
+            "verdict": "supersede",
+            "rationale": "dup of a",
+            "supersede_of": "a",
+        },
+    }
+    md = dra.render_review_markdown("2026-08-10", rows, clusters, verdicts)
+    # decision: is always rendered blank; approve exactly one row by editing
+    # the substring in place, the way a human would in an editor.
+    md = md.replace("id: a\ncluster: C\nverdict: file\nrationale: keep it\ndecision:",
+                     "id: a\ncluster: C\nverdict: file\nrationale: keep it\ndecision: approve")
+
+    parsed = dra.parse_review_rows(md)
+    assert len(parsed) == 2
+    by_id = {r["id"]: r for r in parsed}
+    assert by_id["a"]["title"] == "Row A"
+    assert by_id["a"]["verdict"] == "file"
+    assert by_id["a"]["rationale"] == "keep it"
+    assert by_id["a"]["decision"] == "approve"
+    assert by_id["b"]["verdict"] == "supersede"
+    assert by_id["b"]["supersede_of"] == "a"
+    assert by_id["b"]["decision"] == ""
+
+
+def test_parse_review_rows_empty_text_yields_no_rows():
+    assert dra.parse_review_rows("no yaml blocks here") == []
+
+
+# ── --apply (card C3): applying a batch ─────────────────────────────────
+
+
+def _write_config(intake_dir: Path) -> None:
+    intake_dir.mkdir(parents=True, exist_ok=True)
+    (intake_dir / "config.yaml").write_text("boards: []\n", encoding="utf-8")
+
+
+def _review_block(row_id, title, verdict, rationale, decision, supersede_of=None):
+    lines = [f"### {title}", "", "```yaml", f"id: {row_id}", "cluster: C", f"verdict: {verdict}",
+              f"rationale: {rationale}"]
+    if supersede_of:
+        lines.append(f"supersede_of: {supersede_of}")
+    lines.append(f"decision: {decision}".rstrip())
+    lines.append("```")
+    lines += ["", "a summary", "", f"source: [plan] ~/.hermes/plans/{row_id}.md"]
+    return "\n".join(lines)
+
+
+def _write_review_file(intake_dir: Path, date_str: str, blocks: list[str]) -> Path:
+    path = intake_dir / "reviews" / f"{date_str}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = f"# Distillery review batch — {date_str}\n\n## C\n\n"
+    path.write_text(header + "\n\n".join(blocks) + "\n", encoding="utf-8")
+    return path
+
+
+def _apply_fixture(tmp_path, blocks, pending_ids=()):
+    intake = tmp_path / "intake"
+    _write_config(intake)
+    date_str = "2026-08-10"
+    row_ids = [b.split("id: ", 1)[1].splitlines()[0] for b in blocks]
+    _write_index(intake, [_row(rid) for rid in row_ids])
+    _write_review_file(intake, date_str, blocks)
+    pending_cache = tmp_path / "pending.json"
+    dra.save_pending(
+        pending_cache,
+        {rid: {"review_date": date_str, "review_file": f"reviews/{date_str}.md"} for rid in pending_ids},
+    )
+    return intake, date_str, pending_cache
+
+
+def test_apply_file_verdict_flips_status_via_sweep_mark_and_writes_filed_log(tmp_path):
+    blocks = [_review_block("a", "Row A", "file", "worth filing -> KB page", "approve")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a"])
+
+    rc = dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+    assert rc == 0
+
+    rows = dra.load_index(intake)
+    assert rows[0]["status"] == "filed"
+
+    filed_log = (intake / "FILED-LOG.md").read_text()
+    assert "a | Row A" in filed_log
+    assert "worth filing -> KB page" in filed_log
+
+
+def test_apply_skip_verdict_flips_status_and_writes_no_filed_log(tmp_path):
+    blocks = [_review_block("a", "Row A", "skip", "too narrow", "approve")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a"])
+
+    rc = dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+    assert rc == 0
+
+    rows = dra.load_index(intake)
+    assert rows[0]["status"] == "skipped"
+    assert not (intake / "FILED-LOG.md").is_file()
+
+
+def test_apply_supersede_maps_to_skipped_plus_dup_note_on_draft_file(tmp_path):
+    blocks = [_review_block("a", "Row A", "file", "keep", "approve"),
+              _review_block("b", "Row B", "supersede", "dup of a", "approve", supersede_of="a")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a", "b"])
+
+    rc = dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+    assert rc == 0
+
+    rows = {r["id"]: r for r in dra.load_index(intake)}
+    assert rows["b"]["status"] == "skipped"
+
+    draft_text = (intake / "drafts" / "b.md").read_text()
+    assert "dup of a" in draft_text.split("## notes")[-1]
+    # FILED-LOG.md only gets a line for the file verdict, never supersede/skip
+    filed_log = (intake / "FILED-LOG.md").read_text()
+    assert "b | Row B" not in filed_log
+
+
+def test_apply_never_flips_status_for_a_blank_decision_row(tmp_path):
+    blocks = [_review_block("a", "Row A", "file", "keep", "approve"),
+              _review_block("b", "Row B", "skip", "undecided", "")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a", "b"])
+
+    rc = dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+    assert rc == 0
+
+    rows = {r["id"]: r for r in dra.load_index(intake)}
+    assert rows["a"]["status"] == "filed"
+    assert rows["b"]["status"] == "draft"  # untouched
+
+
+def test_apply_clears_every_batch_row_from_pending_regardless_of_decision(tmp_path):
+    blocks = [_review_block("a", "Row A", "file", "keep", "approve"),
+              _review_block("b", "Row B", "skip", "undecided", "")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a", "b"])
+
+    dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+
+    assert dra.load_pending(pending_cache) == {}
+
+
+def test_apply_blank_decision_row_reappears_as_a_candidate_next_batch(tmp_path):
+    blocks = [_review_block("a", "Row A", "skip", "undecided", "")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a"])
+
+    dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+
+    rows = dra.load_index(intake)
+    pending = dra.load_pending(pending_cache)
+    candidates = dra.select_candidates(rows, set(pending.keys()), batch_size=8)
+    assert [r["id"] for r in candidates] == ["a"]
+
+
+def test_apply_missing_review_file_raises(tmp_path):
+    intake = tmp_path / "intake"
+    _write_config(intake)
+    _write_index(intake, [_row("a")])
+    pending_cache = tmp_path / "pending.json"
+
+    try:
+        dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", "2026-08-10"])
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert "no review file" in str(e)
+
+
+def test_apply_unrecognized_verdict_refuses_to_guess(tmp_path):
+    blocks = [_review_block("a", "Row A", "delete", "hand-edited nonsense", "approve")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a"])
+
+    try:
+        dra.main(["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str])
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert "unrecognized verdict" in str(e)
+
+    # refusal must be atomic — no partial mark applied before the error
+    assert dra.load_index(intake)[0]["status"] == "draft"
+
+
+def test_apply_json_output_reports_counts(tmp_path, capsys):
+    blocks = [_review_block("a", "Row A", "file", "keep", "approve"),
+              _review_block("b", "Row B", "skip", "undecided", "")]
+    intake, date_str, pending_cache = _apply_fixture(tmp_path, blocks, pending_ids=["a", "b"])
+
+    rc = dra.main(
+        ["--intake-dir", str(intake), "--pending-cache", str(pending_cache), "--apply", date_str, "--json"]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "date": date_str,
+        "review_file": str(intake / "reviews" / f"{date_str}.md"),
+        "applied": 1,
+        "filed": 1,
+        "skipped": 0,
+        "deferred": 1,
+    }
