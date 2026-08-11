@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Distillery review agent — cluster + judge pass (v1, card C2 scope).
+"""Distillery review agent — cluster+judge pass (C2) + apply path (C3).
 
 Design: docs/research/fleet-roadmap-2026-08-09/spec-distillery-review.md
-(spec parent t_216ac84b; this script implements mesh card t_0d8b422e, "C2").
+(spec parent t_216ac84b; this script implements mesh cards t_0d8b422e "C2"
+and t_9a5a4a93 "C3").
 
 Reads docs/research/distillery-intake/index.json, selects up to
 --batch-size candidate rows (status draft/stale, stale-oldest-first then
@@ -24,25 +25,40 @@ safety-critical half of the requirement (never leave an un-TTL'd load
 pinned on Ryan Spark — the exact landmine already hit once on this box).
 Flagged for the C5 arm-gate reviewer; not a silent deviation.
 
-This script NEVER writes index.json — only the sweep's own --mark path
-does that (see C3, --apply, not implemented here). --dry-run still makes a
-real judge call (the acceptance proof needs real output) but writes no
-files and touches no pending-cache state.
+This script NEVER writes index.json directly — only the sweep's own
+--mark path does that. --dry-run still makes a real judge call (the
+acceptance proof needs real output) but writes no files and touches no
+pending-cache state.
 
 Pending-cache contract (~/.t1000/cache/distillery-review-pending.json):
-this script only ever ADDS row ids to it (on a real, non-dry-run write).
-C3's --apply is the only thing that should ever remove entries — for every
-row in the batch file it applies, regardless of that row's individual
-decision, so a `decision:` left blank still reappears as a candidate in
-the next day's batch (spec Design sketch step 2 + Acceptance criteria).
+the cluster+judge pass only ever ADDS row ids to it (on a real,
+non-dry-run write). `--apply` is the only thing that ever removes
+entries — for every row in the batch file it applies, regardless of that
+row's individual decision, so a `decision:` left blank still reappears as
+a candidate in the next day's batch (spec Design sketch step 2 +
+Acceptance criteria).
 
 Empty stdout on a real (non-dry-run) run with zero candidates = silent,
 matching the sweep's own no_agent cron contract.
+
+`--apply <date>` (card C3): reads back `decision: approve` rows from
+reviews/<date>.md, flips their status via `distillery_intake_sweep.py
+--mark id=filed|skipped` (never touches index.json itself), and appends
+one pointer line to FILED-LOG.md per `file` verdict applied. `supersede`
+maps to `--mark id=skipped` (STATUS_TERMINAL has no third state) plus a
+"dup of <id>" note. There is no `--mark`-level way to set notes, so the
+note is written to the row's own drafts/<id>.md `## notes` section — the
+same human-edit-round-trip surface the sweep already reads back into
+index.json on its next regular (non-mark) run via fold_human_edits(). This
+is a real, spec-flagged compromise (see spec Gates & risks on `supersede`),
+not a silent deviation, and it adds no new code to the sweep script itself.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -64,6 +80,26 @@ CANDIDATE_STATUSES = ("stale", "draft")  # sort priority order, not a filter set
 DEFAULT_BATCH_SIZE = 8
 VERDICTS = ("file", "skip", "supersede")
 DEFAULT_PENDING_CACHE = "~/.t1000/cache/distillery-review-pending.json"
+
+# Must match distillery_intake_sweep.py's NOTES_HEADING exactly — that's the
+# human-edit-round-trip contract read_human_edits()/fold_human_edits() parse
+# drafts/*.md against. Not imported (the two scripts talk over the CLI/FS,
+# never Python imports — same dual-write-copy independence the sweep's own
+# --mark subprocess call already relies on).
+NOTES_HEADING = "## notes"
+
+# render_review_markdown()'s exact output shape, one block per row:
+#   ### <title>
+#
+#   ```yaml
+#   id: <id>
+#   ...
+#   decision:
+#   ```
+REVIEW_ROW_RE = re.compile(
+    r"^### (?P<title>.+?)\s*\n\n```yaml\n(?P<yaml>.*?)\n```",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def fmt_ts(value: datetime) -> str:
@@ -318,6 +354,168 @@ def render_cron_summary(date_str: str, rows: list[dict], clusters: list[dict], r
     )
 
 
+def parse_review_rows(text: str) -> list[dict]:
+    """Parse the yaml-fenced row blocks render_review_markdown() wrote back
+    out of a (possibly human-edited) reviews/<date>.md file."""
+    rows = []
+    for m in REVIEW_ROW_RE.finditer(text):
+        fields: dict[str, str] = {}
+        for line in m.group("yaml").splitlines():
+            key, sep, value = line.partition(":")
+            if not sep:
+                continue
+            fields[key.strip()] = value.strip()
+        row_id = fields.get("id")
+        if not row_id:
+            continue
+        rows.append(
+            {
+                "id": row_id,
+                "title": m.group("title").strip(),
+                "verdict": fields.get("verdict", ""),
+                "rationale": fields.get("rationale", ""),
+                "supersede_of": fields.get("supersede_of") or None,
+                "decision": fields.get("decision", ""),
+            }
+        )
+    return rows
+
+
+def run_sweep_mark(sweep_script: Path, intake_dir: Path, marks: list[str]) -> None:
+    """The only write path for status: shells out to the sweep's own
+    --mark, exactly as a human would from the CLI. Never touches
+    index.json itself."""
+    if not marks:
+        return
+    cmd = [sys.executable, str(sweep_script), "--intake-dir", str(intake_dir)]
+    for mark in marks:
+        cmd += ["--mark", mark]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"distillery-review --apply: sweep --mark failed (exit "
+            f"{result.returncode}):\n{result.stderr.strip()}"
+        )
+
+
+def set_draft_notes(drafts_dir: Path, row_id: str, notes: str) -> None:
+    """Write `notes` into drafts/<row_id>.md's `## notes` section — the
+    same human-edit surface the sweep reads back on its next regular run.
+    A no-op if the draft file doesn't exist (--mark always regenerates it
+    first via write_drafts, so this should never fire in practice)."""
+    path = Path(drafts_dir).expanduser() / f"{row_id}.md"
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    head, sep, _tail = text.partition(NOTES_HEADING)
+    if not sep:
+        return
+    path.write_text(head + NOTES_HEADING + "\n\n" + notes + "\n", encoding="utf-8")
+
+
+def append_filed_log(filed_log_path: Path, date_str: str, entries: list[dict]) -> None:
+    """One append-only pointer line per `file` verdict applied. rationale
+    doubles as the "where this should land" pointer per spec — the judge
+    is asked for exactly that in build_judge_messages()."""
+    if not entries:
+        return
+    filed_log_path = Path(filed_log_path)
+    filed_log_path.parent.mkdir(parents=True, exist_ok=True)
+    if not filed_log_path.is_file():
+        filed_log_path.write_text(
+            "# Filed distillery rows\n\n"
+            "Append-only pointer log — one line per `file` verdict applied "
+            "by `distillery_review_agent.py --apply`. This is a pointer, "
+            "not the artifact: writing the actual KB page / skill update "
+            "is a human or future-agent follow-through, starting here.\n",
+            encoding="utf-8",
+        )
+    lines = [
+        f"- {date_str} | {row['id']} | {row['title']} — {row['rationale']}"
+        for row in entries
+    ]
+    with filed_log_path.open("a", encoding="utf-8") as f:
+        f.write("\n" + "\n".join(lines) + "\n")
+
+
+def apply_review_batch(
+    intake_dir: Path, date_str: str, pending_cache: Path, as_json: bool = False
+) -> int:
+    review_path = intake_dir / "reviews" / f"{date_str}.md"
+    if not review_path.is_file():
+        raise SystemExit(f"distillery-review --apply: no review file at {review_path}")
+
+    rows = parse_review_rows(review_path.read_text(encoding="utf-8"))
+    if not rows:
+        raise SystemExit(
+            f"distillery-review --apply: {review_path} has no recognizable "
+            "row blocks — was it hand-edited past the yaml-fence format?"
+        )
+
+    approved = [r for r in rows if r["decision"].strip() == "approve"]
+    marks: list[str] = []
+    filed_entries: list[dict] = []
+    supersede_notes: list[tuple[str, str]] = []
+
+    for row in approved:
+        verdict = row["verdict"]
+        if verdict == "file":
+            marks.append(f"{row['id']}=filed")
+            filed_entries.append(row)
+        elif verdict == "skip":
+            marks.append(f"{row['id']}=skipped")
+        elif verdict == "supersede":
+            marks.append(f"{row['id']}=skipped")
+            supersede_notes.append((row["id"], f"dup of {row['supersede_of'] or 'unknown'}"))
+        else:
+            raise SystemExit(
+                f"distillery-review --apply: row {row['id']} has an "
+                f"unrecognized verdict {verdict!r} — refusing to guess a "
+                "--mark status"
+            )
+
+    sweep_script = Path(__file__).resolve().parent / "distillery_intake_sweep.py"
+    run_sweep_mark(sweep_script, intake_dir, marks)
+
+    drafts_dir = intake_dir / "drafts"
+    for row_id, notes in supersede_notes:
+        set_draft_notes(drafts_dir, row_id, notes)
+
+    append_filed_log(intake_dir / "FILED-LOG.md", date_str, filed_entries)
+
+    # Every row in this batch clears from pending — approved or deferred —
+    # so a blank `decision:` reappears as a candidate in a later batch
+    # instead of being stuck "pending" against a batch that already closed.
+    pending = load_pending(pending_cache)
+    for row in rows:
+        pending.pop(row["id"], None)
+    save_pending(pending_cache, pending)
+
+    skipped_count = len(approved) - len(filed_entries)
+    deferred = len(rows) - len(approved)
+    if as_json:
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "date": date_str,
+                    "review_file": str(review_path),
+                    "applied": len(approved),
+                    "filed": len(filed_entries),
+                    "skipped": skipped_count,
+                    "deferred": deferred,
+                }
+            )
+            + "\n"
+        )
+    else:
+        sys.stdout.write(
+            f"distillery-review --apply {date_str}: {len(approved)} applied "
+            f"({len(filed_entries)} filed, {skipped_count} skipped/superseded), "
+            f"{deferred} deferred (decision left blank).\n"
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     repo_root_default = Path(__file__).resolve().parents[1]
     intake_default = repo_root_default / "docs" / "research" / "distillery-intake"
@@ -350,6 +548,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--date", default=None, help="override batch date (testing only; default today UTC)"
     )
+    ap.add_argument(
+        "--apply",
+        metavar="DATE",
+        default=None,
+        help=(
+            "Apply decision: approve rows from reviews/DATE.md: flips "
+            "status via the sweep's own --mark (never touches index.json "
+            "directly), appends one FILED-LOG.md line per file verdict, "
+            "and clears every row in that batch from the pending cache "
+            "(approved or not) so a deferred row reappears in a later batch."
+        ),
+    )
     args = ap.parse_args(argv)
 
     if args.intake_dir is None:
@@ -364,6 +574,10 @@ def main(argv: list[str] | None = None) -> int:
 
     intake_dir = Path(args.intake_dir).expanduser()
     pending_cache = Path(args.pending_cache).expanduser()
+
+    if args.apply:
+        return apply_review_batch(intake_dir, args.apply, pending_cache, as_json=args.json)
+
     date_str = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     rows = load_index(intake_dir)
