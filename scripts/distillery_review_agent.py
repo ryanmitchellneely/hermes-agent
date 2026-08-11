@@ -390,7 +390,9 @@ def run_sweep_mark(sweep_script: Path, intake_dir: Path, marks: list[str]) -> No
     cmd = [sys.executable, str(sweep_script), "--intake-dir", str(intake_dir)]
     for mark in marks:
         cmd += ["--mark", mark]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
     if result.returncode != 0:
         raise SystemExit(
             f"distillery-review --apply: sweep --mark failed (exit "
