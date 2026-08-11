@@ -111,6 +111,66 @@ def _patch_judge(monkeypatch, verdicts):
     monkeypatch.setattr(goals, "judge_goal", _fake_judge)
 
 
+def test_loop_blocks_when_judge_permanently_unreachable(monkeypatch):
+    """A permanently broken judge must not burn the whole turn budget.
+
+    A transport failure surfaces as "continue", so the loop would re-poke a
+    worker that has nothing left to do for every remaining turn. After N
+    consecutive transport failures, block for human review instead — the same
+    posture GoalManager.evaluate_after_turn takes.
+    """
+    def _always_transport_fail(goal, response, subgoals=None,
+                               background_processes=None, **_kw):
+        return "continue", "judge error: TimeoutError", False, None, True
+
+    monkeypatch.setattr(goals, "judge_goal", _always_transport_fail)
+
+    turns = []
+    blocked = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.append(r),
+        first_response="started",
+        max_turns=20,
+    )
+
+    assert res["outcome"] == "blocked_judge_unreachable"
+    assert blocked and "unreachable" in blocked[0].lower()
+    # Bailed out well before exhausting the 20-turn budget.
+    assert len(turns) < 20
+
+
+def test_loop_transport_failure_streak_resets_on_success(monkeypatch):
+    """Intermittent blips must not accumulate into a spurious block."""
+    seq = [True, True, False, True, True, False]
+
+    def _flaky(goal, response, subgoals=None, background_processes=None, **_kw):
+        tf = seq.pop(0) if seq else False
+        if tf:
+            return "continue", "judge error: TimeoutError", False, None, True
+        return "continue", "keep going", False, None, False
+
+    monkeypatch.setattr(goals, "judge_goal", _flaky)
+
+    blocked = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.append(r),
+        first_response="started",
+        max_turns=7,
+    )
+
+    assert res["outcome"] != "blocked_judge_unreachable", (
+        "a reachable judge in between must reset the streak"
+    )
+
+
 def test_loop_stops_when_worker_already_completed(monkeypatch):
     # Worker called kanban_complete on its first turn — no judging needed.
     _patch_judge(monkeypatch, ["continue"])  # should never be consulted
@@ -145,7 +205,8 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
+             verdict="done", reason="", complete_ok=True, summary="done",
+             transport_failed=False, comments=None):
         import argparse
         import types
         from unittest.mock import MagicMock
@@ -182,9 +243,19 @@ class TestCLIJudgeGate:
         )
         # Match the real judge_goal contract:
         # (verdict, reason, parse_failed, wait_directive, transport_failed)
+        # Patched at the source so the shared gate helper
+        # (goals.judge_kanban_completion) is exercised for real.
         monkeypatch.setattr(
             "hermes_cli.goals.judge_goal",
-            lambda **kw: (verdict, reason, False, None, False),
+            lambda **kw: (verdict, reason, False, None, transport_failed),
+        )
+        # No real backoff sleep in tests.
+        monkeypatch.setattr("hermes_cli.goals.KANBAN_GATE_RETRY_BACKOFF", 0)
+        monkeypatch.setattr(
+            "hermes_cli.kanban.kb.add_comment",
+            lambda conn, tid, *, author, body: (
+                comments.append((author, body)) if comments is not None else None
+            ),
         )
 
         args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=None)
@@ -205,3 +276,40 @@ class TestCLIJudgeGate:
         rc, complete_calls = self._run(monkeypatch, goal_mode=False)
         assert rc == 0
         assert complete_calls == ["t1"]
+
+    def test_transport_failure_does_not_reject_completion(self, monkeypatch):
+        """A judge that can't be REACHED must not reject a completion.
+
+        judge_goal reports transport errors as ("continue", ..., True). The
+        gate used to read only the "continue" and hard-reject, turning a
+        network blip into "your finished work is rejected".
+        """
+        comments: list = []
+        rc, complete_calls = self._run(
+            monkeypatch,
+            verdict="continue",
+            reason="judge error: TimeoutError",
+            transport_failed=True,
+            comments=comments,
+        )
+        assert rc == 0, "transport failure must fail OPEN, not reject"
+        assert complete_calls == ["t1"]
+        # ...and the fail-open must be auditable on the board, not silent.
+        assert len(comments) == 1
+        author, body = comments[0]
+        assert author == "goal-judge"
+        assert "unreachable" in body.lower()
+
+    def test_real_continue_verdict_still_rejects(self, monkeypatch):
+        """The evidence gate is NOT weakened: a genuine verdict still rejects."""
+        comments: list = []
+        rc, complete_calls = self._run(
+            monkeypatch,
+            verdict="continue",
+            reason="no evidence provided",
+            transport_failed=False,
+            comments=comments,
+        )
+        assert rc != 0
+        assert complete_calls == []
+        assert comments == [], "a real rejection is not a fail-open"

@@ -97,6 +97,140 @@ class TestJudgeGoal:
         assert reason == "achieved"
 
 
+class TestJudgeTimeoutIsConfigDriven:
+    """auxiliary.goal_judge.timeout must actually reach call_llm.
+
+    judge_goal used to declare ``timeout: float = DEFAULT_JUDGE_TIMEOUT``,
+    which shadowed the config knob on every caller that didn't pass one
+    (i.e. all kanban paths) — hard-capping the judge at 30s no matter what
+    config.yaml said.
+    """
+
+    def _capture_timeout(self, monkeypatch, **judge_kwargs):
+        from hermes_cli import goals
+
+        seen = {}
+
+        def fake_call_llm(**kw):
+            seen["timeout"] = kw.get("timeout")
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(content='{"done": true, "reason": "ok"}'))]
+            )
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+        goals.judge_goal("goal", "response", **judge_kwargs)
+        return seen["timeout"]
+
+    def test_config_timeout_reaches_call_llm(self, monkeypatch):
+        from hermes_cli import goals
+
+        monkeypatch.setattr(goals, "_goal_judge_timeout", lambda: 123.0)
+        assert self._capture_timeout(monkeypatch) == 123.0
+
+    def test_explicit_caller_timeout_wins_over_config(self, monkeypatch):
+        from hermes_cli import goals
+
+        monkeypatch.setattr(goals, "_goal_judge_timeout", lambda: 123.0)
+        assert self._capture_timeout(monkeypatch, timeout=7.5) == 7.5
+
+    def test_resolver_reads_config_value(self, monkeypatch):
+        from hermes_cli import goals
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"auxiliary": {"goal_judge": {"timeout": 90}}},
+        )
+        assert goals._goal_judge_timeout() == 90.0
+
+    @pytest.mark.parametrize("bad", [0, -5, "abc", None, {}])
+    def test_resolver_falls_back_on_bad_value(self, monkeypatch, bad):
+        from hermes_cli import goals
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"auxiliary": {"goal_judge": {"timeout": bad}}},
+        )
+        assert goals._goal_judge_timeout() == goals.DEFAULT_JUDGE_TIMEOUT
+
+
+class TestJudgeKanbanCompletionGate:
+    """Shared gate used by BOTH kanban completion paths.
+
+    Contract: transport failure fails OPEN (with an audit note); a real
+    non-done verdict still rejects.
+    """
+
+    def _patch_judge(self, monkeypatch, results):
+        from hermes_cli import goals
+
+        seq = list(results)
+        calls = []
+
+        def _fake(**kw):
+            calls.append(kw)
+            return seq.pop(0) if seq else seq_last
+
+        seq_last = results[-1]
+        monkeypatch.setattr(goals, "judge_goal", _fake)
+        monkeypatch.setattr(goals, "KANBAN_GATE_RETRY_BACKOFF", 0)
+        return calls
+
+    def test_done_verdict_allows(self, monkeypatch):
+        from hermes_cli import goals
+
+        self._patch_judge(monkeypatch, [("done", "looks good", False, None, False)])
+        allowed, reason, note = goals.judge_kanban_completion("t", "b", "evidence")
+        assert allowed is True
+        assert note is None
+        assert reason == "looks good"
+
+    def test_real_continue_verdict_rejects(self, monkeypatch):
+        from hermes_cli import goals
+
+        self._patch_judge(monkeypatch, [("continue", "no evidence", False, None, False)])
+        allowed, reason, note = goals.judge_kanban_completion("t", "b", "")
+        assert allowed is False, "the evidence gate must NOT be weakened"
+        assert note is None
+        assert reason == "no evidence"
+
+    def test_skipped_verdict_rejects(self, monkeypatch):
+        from hermes_cli import goals
+
+        self._patch_judge(monkeypatch, [("skipped", "empty goal", False, None, False)])
+        allowed, _reason, note = goals.judge_kanban_completion("t", "b", "e")
+        assert allowed is False
+        assert note is None
+
+    def test_transport_failure_fails_open_with_audit_note(self, monkeypatch):
+        from hermes_cli import goals
+
+        calls = self._patch_judge(
+            monkeypatch,
+            [("continue", "judge error: TimeoutError", False, None, True)] * 2,
+        )
+        allowed, _reason, note = goals.judge_kanban_completion("t", "b", "evidence")
+        assert allowed is True, "an unreachable judge is not a rejection"
+        assert note and "unreachable" in note.lower()
+        assert len(calls) == 2, "bounded retry before falling open"
+
+    def test_transport_failure_then_success_uses_real_verdict(self, monkeypatch):
+        """The retry is real: if attempt 2 reaches the judge, its verdict wins."""
+        from hermes_cli import goals
+
+        calls = self._patch_judge(
+            monkeypatch,
+            [
+                ("continue", "judge error: TimeoutError", False, None, True),
+                ("continue", "no evidence provided", False, None, False),
+            ],
+        )
+        allowed, reason, note = goals.judge_kanban_completion("t", "b", "")
+        assert allowed is False
+        assert note is None, "recovered judge is not a fail-open"
+        assert reason == "no evidence provided"
+        assert len(calls) == 2
+
+
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
 # ──────────────────────────────────────────────────────────────────────

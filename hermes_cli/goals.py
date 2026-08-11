@@ -860,6 +860,36 @@ def _goal_judge_max_tokens() -> int:
     return DEFAULT_JUDGE_MAX_TOKENS
 
 
+def _goal_judge_timeout() -> float:
+    """Resolve ``auxiliary.goal_judge.timeout``, falling back to the default.
+
+    Mirrors :func:`_goal_judge_max_tokens`. ``judge_goal`` used to declare
+    ``timeout: float = DEFAULT_JUDGE_TIMEOUT``, which shadowed this config knob
+    on every call site that didn't pass a timeout explicitly (i.e. all of the
+    kanban paths) — the judge was hard-capped at 30s no matter what
+    ``config.yaml`` said. Resolving here keeps the knob live while letting an
+    explicit caller-passed timeout win.
+
+    A non-positive or non-numeric value falls back to the default rather than
+    crashing the goal loop.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            (cfg.get("auxiliary") or {})
+            .get("goal_judge", {})
+            .get("timeout", DEFAULT_JUDGE_TIMEOUT)
+        )
+        value = float(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_JUDGE_TIMEOUT
+
+
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Parse the judge's reply. Fail-open on unusable output.
 
@@ -1007,7 +1037,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
-    timeout: float = DEFAULT_JUDGE_TIMEOUT,
+    timeout: Optional[float] = None,
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
@@ -1115,7 +1145,7 @@ def judge_goal(
             ],
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
+            timeout=_goal_judge_timeout() if timeout is None else timeout,
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
@@ -1133,6 +1163,87 @@ def judge_goal(
         f" wait={wait_directive}" if wait_directive else "",
     )
     return verdict, reason, parse_failed, wait_directive, False
+
+
+# Bounded retry budget for the kanban completion gate. One retry keeps the
+# worst case at roughly 2 * auxiliary.goal_judge.timeout + backoff (≈2min at
+# the 60s default), which is far inside the dispatcher's stale-claim patience
+# (kanban.dispatch_stale_timeout_seconds, default 4h).
+KANBAN_GATE_TRANSPORT_RETRIES = 1
+KANBAN_GATE_RETRY_BACKOFF = 2.0
+
+
+def judge_kanban_completion(
+    title: str,
+    body: str,
+    evidence: str,
+    *,
+    timeout: Optional[float] = None,
+    transport_retries: Optional[int] = None,
+    retry_backoff: Optional[float] = None,
+) -> Tuple[bool, str, Optional[str]]:
+    """Shared goal-judge gate for kanban completion. Fails OPEN on transport.
+
+    Both kanban completion gates — ``hermes kanban complete`` (CLI) and the
+    ``kanban_complete`` tool — call this so they cannot drift apart again.
+    They were hand-copied duplicates, and that duplication is exactly how the
+    ``transport_failed`` defect survived in one copy after being described in
+    the other.
+
+    Returns ``(allowed, reason, fail_open_note)``:
+
+      - ``allowed`` — True when the completion may proceed.
+      - ``reason`` — the judge's reason, for the rejection message.
+      - ``fail_open_note`` — non-None only when the completion was allowed
+        *without* a judge verdict because the judge was unreachable. Callers
+        MUST record it on the board (comment/event) so the fail-open is
+        auditable rather than silent.
+
+    Why fail open on transport failure: a timeout / auth error / DNS failure
+    is not a judgment about the work. ``judge_goal`` deliberately reports
+    those as ``("continue", ..., transport_failed=True)`` and documents that
+    callers fail open; both kanban gates instead read the ``"continue"`` and
+    hard-rejected, turning a 30s network blip into "your completed work is
+    rejected." A real ``continue``/``skipped``/``wait`` verdict still rejects
+    exactly as before — the evidence gate is not weakened, only the
+    can't-reach-the-judge path changes.
+    """
+    goal = f"{title}\n\n{body or ''}".strip()
+    evidence = (evidence or "").strip()
+
+    # Resolved at call time (not as default args) so the retry budget stays
+    # patchable from tests and tunable in one place.
+    if transport_retries is None:
+        transport_retries = KANBAN_GATE_TRANSPORT_RETRIES
+    if retry_backoff is None:
+        retry_backoff = KANBAN_GATE_RETRY_BACKOFF
+
+    attempts = max(1, 1 + max(0, transport_retries))
+    reason = ""
+    for attempt in range(attempts):
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(
+            goal=goal,
+            last_response=evidence,
+            timeout=timeout,
+        )
+        if not transport_failed:
+            return verdict == "done", reason, None
+        if attempt + 1 < attempts:
+            logger.info(
+                "kanban goal gate: judge transport failure (%s); retrying in %.1fs",
+                _truncate(reason, 120), retry_backoff,
+            )
+            if retry_backoff > 0:
+                time.sleep(retry_backoff)
+
+    note = (
+        f"goal judge unreachable after {attempts} attempt(s) ({_truncate(reason, 200)}) "
+        f"— completion allowed WITHOUT a judge verdict (fail-open). "
+        f"The evidence in this handoff was not machine-verified; re-check it by hand "
+        f"if the judge stays down."
+    )
+    logger.warning("kanban goal gate: %s", note)
+    return True, reason, note
 
 
 def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1155,7 +1266,7 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
-def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
+def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
     Uses the ``goal_judge`` auxiliary task (main-model-first, cache-safe — it
@@ -1185,7 +1296,7 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
             ],
             temperature=0,
             max_tokens=_goal_judge_max_tokens(),
-            timeout=timeout,
+            timeout=_goal_judge_timeout() if timeout is None else timeout,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)
@@ -2050,6 +2161,13 @@ def run_kanban_goal_loop(
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # Consecutive judge transport failures. A transport failure is not a
+    # verdict — judge_goal reports it as "continue" so the loop keeps the
+    # worker alive through a blip. But a permanently broken judge (bad key,
+    # dead endpoint) would otherwise burn the entire turn budget re-poking a
+    # worker that has nothing left to do, so bail out the way
+    # GoalManager.evaluate_after_turn does.
+    consecutive_transport_failures = 0
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2083,7 +2201,30 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
+        if transport_failed:
+            consecutive_transport_failures += 1
+            if consecutive_transport_failures >= DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+                _log(
+                    f"kanban goal loop: judge unreachable "
+                    f"{consecutive_transport_failures}x in a row ({_truncate(reason, 120)}); "
+                    f"blocking instead of burning the turn budget"
+                )
+                try:
+                    block_fn(
+                        f"Goal-mode loop stopped: the auxiliary goal judge was unreachable "
+                        f"{consecutive_transport_failures} times in a row ({_truncate(reason, 200)}). "
+                        f"Check auxiliary.goal_judge config/credentials, then unblock."
+                    )
+                except Exception as exc:
+                    _log(f"kanban goal loop: block_fn failed ({exc})")
+                return {
+                    "outcome": "blocked_judge_unreachable",
+                    "turns_used": turns_used,
+                    "reason": f"judge unreachable {consecutive_transport_failures}x",
+                }
+        else:
+            consecutive_transport_failures = 0
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -2152,5 +2293,6 @@ __all__ = [
     "clear_goal",
     "migrate_goal_to_session",
     "judge_goal",
+    "judge_kanban_completion",
     "run_kanban_goal_loop",
 ]
