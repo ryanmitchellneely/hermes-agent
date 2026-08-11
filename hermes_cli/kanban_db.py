@@ -1040,6 +1040,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Auto-estimate-on-create lifecycle: 'pending'|'done'|'failed'|'skipped'|
+    # None. See the column comment in SCHEMA_SQL. Drives the "estimating…"
+    # UI state (kanban-estimate-local-readiness.md / t_5716d9c5).
+    estimate_status: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1133,6 +1137,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            estimate_status=(
+                row["estimate_status"] if "estimate_status" in keys else None
             ),
         )
 
@@ -1321,7 +1328,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Auto-estimate-on-create lifecycle (t_5716d9c5): 'pending' = queued for
+    -- the dispatcher's auto-estimate tick (UI should render "estimating…"),
+    -- 'done' = stamped (see the ``estimated`` event for the full readout),
+    -- 'failed' = one attempt failed, won't retry (see ``estimate_failed``),
+    -- 'skipped' = never eligible (triage, caller pinned a model explicitly,
+    -- auto-estimate disabled, or a pre-migration legacy row). NULL only on
+    -- rows written by code that predates this column.
+    estimate_status       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2521,6 +2536,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "estimate_status" not in cols:
+        added = _add_column_if_missing(
+            conn, "tasks", "estimate_status", "estimate_status TEXT"
+        )
+        if added:
+            # Existing rows predate auto-estimate-on-create. Backfill them as
+            # 'skipped' so the dispatcher's pending-estimate scan doesn't
+            # burst-spend the aux LLM across every historical task on the
+            # next tick — only tasks created from here on are eligible.
+            conn.execute(
+                "UPDATE tasks SET estimate_status = 'skipped' "
+                "WHERE estimate_status IS NULL"
+            )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2534,6 +2563,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_estimate_status "
+        "ON tasks(estimate_status)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2987,6 +3020,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    auto_estimate: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3292,6 +3326,16 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Auto-estimate-on-create (t_5716d9c5): queue the task for the
+                # dispatcher's estimate tick unless there's nothing for it to
+                # do — triage cards aren't fleshed out yet, and a caller that
+                # already pinned a model explicitly gets that choice
+                # respected rather than silently overwritten.
+                if triage or model_override or not auto_estimate:
+                    estimate_status = "skipped"
+                else:
+                    estimate_status = "pending"
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3301,8 +3345,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, estimate_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3328,6 +3372,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        estimate_status,
                     ),
                 )
                 for pid in parents:
@@ -3352,6 +3397,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "estimate_status": estimate_status,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3603,6 +3649,61 @@ def set_reasoning_effort(
             conn, task_id, "reasoning_effort_set", {"reasoning_effort": effort}
         )
         return True
+
+
+# ---------------------------------------------------------------------------
+# Auto-estimate-on-create (t_5716d9c5)
+#
+# ``create_task`` stamps every eligible new row ``estimate_status='pending'``.
+# The gateway dispatcher's auto-estimate tick (``gateway/kanban_watchers.py``,
+# mirroring the existing ``auto_decompose`` tick) drains that queue: it asks
+# the auxiliary model for a rough token/complexity/lane read
+# (``hermes_cli.kanban_estimate.run_estimate``), then stamps the concrete
+# model/provider/effort pick onto the SAME ``model_override`` /
+# ``provider_override`` / ``reasoning_effort`` columns the manual board picker
+# already writes — so the picker is a pure override on top of this, never a
+# required step. Running it from the dispatcher (not a thread spawned inline
+# in ``create_task``) means it works identically no matter which surface
+# created the task (CLI, dashboard, or the ``kanban_create`` tool used by
+# orchestrators) and survives a short-lived CLI process exiting right after
+# create.
+# ---------------------------------------------------------------------------
+
+def list_tasks_needing_estimate(
+    conn: sqlite3.Connection, limit: int = 5,
+) -> list[Task]:
+    """Return up to ``limit`` tasks still queued for auto-estimate.
+
+    Oldest first, so a burst of creations drains in order. Used by the
+    dispatcher's auto-estimate tick; ``estimate_status='pending'`` is the
+    only queue state (see the column comment in SCHEMA_SQL for the full
+    state machine).
+    """
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE estimate_status = 'pending' "
+        "ORDER BY created_at ASC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [Task.from_row(r) for r in rows]
+
+
+def set_estimate_status(
+    conn: sqlite3.Connection, task_id: str, status: str,
+) -> bool:
+    """Transition a task's ``estimate_status`` (pending -> done|failed).
+
+    Unconditional on the task's board ``status`` (including ``archived`` —
+    a task archived mid-estimate should still stop showing as "pending"
+    forever). Returns False only if the task no longer exists.
+    """
+    if status not in {"pending", "done", "failed", "skipped"}:
+        raise ValueError(f"invalid estimate_status: {status!r}")
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET estimate_status = ? WHERE id = ?",
+            (status, task_id),
+        )
+        return cur.rowcount == 1
 
 
 # ---------------------------------------------------------------------------

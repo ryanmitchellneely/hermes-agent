@@ -2381,6 +2381,21 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # When true, the kanban dispatcher stamps effort/model onto every
+        # newly created task automatically (CLI create, dashboard create, and
+        # the kanban_create tool used by orchestrators all flow through the
+        # same estimate_status='pending' queue) — the board's model/effort
+        # picker becomes an override on top of this instead of a required
+        # step. Never blocks task creation: the stamp lands on the task's
+        # next dispatcher tick, not synchronously. Disable to go back to
+        # picker-only (on-click) estimates via the dashboard's Estimate
+        # button. See hermes_cli.kanban_estimate / t_5716d9c5.
+        "auto_estimate_on_create": True,
+        # Max newly-created tasks to auto-estimate per dispatcher tick.
+        # Mirrors auto_decompose_per_tick's burst protection — a bulk-load of
+        # new cards defers the remainder to subsequent ticks instead of
+        # spending a burst of aux LLM calls in one tick.
+        "auto_estimate_per_tick": 5,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

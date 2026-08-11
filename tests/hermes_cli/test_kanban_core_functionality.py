@@ -1111,8 +1111,13 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     # skips the dispatch connect because the corrupt board fingerprint is
     # disabled, but the ready/review probes still each connect. PR f55d94a1e
     # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # probe, bumping this from 3 → 5. t_5716d9c5's auto-estimate tick
+    # (mirrors auto-decompose: `kanban.auto_estimate_on_create` defaults
+    # True) adds one more `_kb.connect(board=slug)` per tick to scan for
+    # pending estimates — tolerates the corrupt board the same way
+    # auto-decompose does (catches, logs at debug, continues), bumping
+    # this from 5 → 7 (2 ticks × 1 extra connect each).
+    assert calls["connect"] == 7
 
 
 # ---------------------------------------------------------------------------

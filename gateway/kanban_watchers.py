@@ -86,6 +86,147 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _resolve_auto_estimate_settings(
+    load_config: Callable[[], Any],
+) -> "tuple[bool, int]":
+    """Resolve the live (enabled, per_tick) auto-estimate-on-create settings.
+
+    Mirrors :func:`_resolve_auto_decompose_settings` exactly (t_5716d9c5):
+    read fresh every tick so ``kanban.auto_estimate_on_create: false`` takes
+    effect on the next tick, not on gateway restart, and fail **safe** (off)
+    on a config-read error rather than risk a burst of aux-LLM calls across
+    every board on a transient read failure.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return False, 5
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    enabled = bool(kcfg.get("auto_estimate_on_create", True))
+    try:
+        per_tick = int(kcfg.get("auto_estimate_per_tick", 5) or 5)
+    except (TypeError, ValueError):
+        per_tick = 5
+    if per_tick < 1:
+        per_tick = 1
+    return enabled, per_tick
+
+
+def _auto_estimate_tick(per_tick: int) -> int:
+    """Stamp effort/model onto up to ``per_tick`` newly-created tasks across
+    all boards (t_5716d9c5). Mirrors ``_auto_decompose_tick``'s shape: drains
+    ``kanban_db.list_tasks_needing_estimate`` (``estimate_status='pending'``),
+    asks the auxiliary model via ``hermes_cli.kanban_estimate.run_estimate``,
+    and stamps the concrete pick onto ``model_override``/``provider_override``/
+    ``reasoning_effort`` — the SAME columns the manual board picker writes, so
+    the picker is a pure override on top of this, never a required step.
+
+    Never blocks task creation: this runs on the dispatcher's own schedule,
+    well after the task is already ``ready``/usable. One failed attempt marks
+    ``estimate_status='failed'`` (with the reason on an ``estimate_failed``
+    event) and is never retried, so a broken aux config can't turn into a
+    per-tick retry storm. A manual override that races in ahead of this tick
+    is respected — never overwritten. Returns the number of tasks processed
+    (stamped or failed) this call.
+    """
+    try:
+        from hermes_cli import kanban_db as _kb
+        from hermes_cli import kanban_estimate as _est
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "kanban auto-estimate: import failed (%s); skipping", exc,
+        )
+        return 0
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+    processed = 0
+    for b in boards:
+        if processed >= per_tick:
+            break
+        slug = b.get("slug") or _kb.DEFAULT_BOARD
+        conn = None
+        try:
+            conn = _kb.connect(board=slug)
+            pending = _kb.list_tasks_needing_estimate(
+                conn, limit=(per_tick - processed)
+            )
+            for task in pending:
+                if processed >= per_tick:
+                    break
+                processed += 1
+                try:
+                    result = _est.run_estimate(task.title, task.body)
+                    if not result.get("ok"):
+                        _kb.set_estimate_status(conn, task.id, "failed")
+                        _kb._append_event(
+                            conn, task.id, "estimate_failed",
+                            {"reason": result.get("reason")},
+                        )
+                        logger.debug(
+                            "kanban auto-estimate [%s]: %s failed: %s",
+                            slug, task.id, result.get("reason"),
+                        )
+                        continue
+                    suggestion = result.get("suggestion") or {}
+                    model = suggestion.get("model")
+                    provider = suggestion.get("provider")
+                    effort = suggestion.get("effort")
+                    # Re-fetch: a human (or another surface) may have set an
+                    # explicit override while this tick's LLM call was
+                    # in-flight. Never clobber it — auto-estimate only fills
+                    # in what's still unset.
+                    fresh = _kb.get_task(conn, task.id)
+                    if fresh is not None:
+                        if not fresh.model_override and model:
+                            _kb.set_model_override(
+                                conn, task.id, model, provider=provider,
+                            )
+                        if not fresh.reasoning_effort and effort:
+                            _kb.set_reasoning_effort(conn, task.id, effort)
+                    _kb._append_event(
+                        conn, task.id, "estimated",
+                        {
+                            "est_tokens": result.get("est_tokens"),
+                            "complexity": result.get("complexity"),
+                            "lane": result.get("lane"),
+                            "rationale": result.get("rationale"),
+                            "suggestion": suggestion,
+                        },
+                    )
+                    _kb.set_estimate_status(conn, task.id, "done")
+                    logger.info(
+                        "kanban auto-estimate [%s]: %s -> %s (%s)",
+                        slug, task.id, suggestion.get("label") or model,
+                        result.get("complexity"),
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban auto-estimate: crashed on %s", task.id,
+                    )
+                    try:
+                        _kb.set_estimate_status(conn, task.id, "failed")
+                        _kb._append_event(
+                            conn, task.id, "estimate_failed",
+                            {"reason": "internal error"},
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            logger.debug(
+                "kanban auto-estimate: board %s scan failed", slug, exc_info=True,
+            )
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return processed
+
+
 def _kanban_dispatch_allowed() -> bool:
     """Return False while the global emergency stop (`hermes pause`) is engaged.
 
@@ -1524,6 +1665,14 @@ class GatewayKanbanWatchersMixin:
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
                         await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                    # Same live-re-read discipline as auto-decompose above, for
+                    # the same reason: `kanban.auto_estimate_on_create: false`
+                    # must stop the next tick, not require a restart (t_5716d9c5).
+                    _ae_enabled, _ae_per_tick = _resolve_auto_estimate_settings(
+                        _load_config
+                    )
+                    if _ae_enabled:
+                        await asyncio.to_thread(_auto_estimate_tick, _ae_per_tick)
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):

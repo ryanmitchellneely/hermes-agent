@@ -78,6 +78,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "reasoning_effort": t.reasoning_effort,
+        "estimate_status": t.estimate_status,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -1739,6 +1741,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
+    elif task.estimate_status == "pending":
+        # Auto-estimate-on-create (t_5716d9c5) hasn't landed yet — surface
+        # that explicitly instead of looking like an unset/silent default.
+        print("  model:     estimating…")
+    elif task.estimate_status == "failed":
+        print("  model:     (auto-estimate failed — using profile default)")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
