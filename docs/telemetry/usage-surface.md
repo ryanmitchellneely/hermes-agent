@@ -85,21 +85,42 @@ Four classes, and the fourth is load-bearing:
 | `metered` | pay-per-token API; real dollars leave the account |
 | `unknown` | the provider slug does not identify the hosting |
 
-**`custom` is deliberately `unknown`.** It covers both local Ollama and hosted
-OpenAI-compatible endpoints (GLM on Volcengine ARK), and schema v1 carries no
-`base_url` to tell them apart. Guessing would reproduce the LAB-SCOREBOARD bug
-with better intentions. Instead the digest raises a warn flag naming the
-provider and its call count.
+**Bare `custom` is deliberately `unknown`.** It covers both local Ollama and
+hosted OpenAI-compatible endpoints (GLM on Volcengine ARK), and schema v1
+carries no `base_url` to tell them apart. Guessing would reproduce the
+LAB-SCOREBOARD bug with better intentions. Instead the digest raises a warn
+flag naming the provider and its call count.
 
-Resolve it with operator configuration, which is a statement of fact rather
-than an inference — `~/.t1000/telemetry/provider_classes.json`:
+**Qualified `custom:<name>` resolves to `<name>`.** This is not the guess above.
+`custom:<name>` is the codebase's canonical qualified provider form — config
+keys an endpoint by bare name while the runtime reports the qualified slug (see
+`agent/image_routing.py`, `agent/credential_pool.py`) — and the store holds the
+same endpoint recorded both ways: `mbp-ollama` (44 calls) and
+`custom:mbp-ollama` (120 calls) are one host. Reading the name back out is
+parsing a slug the transport wrote, not inferring where inference ran. Names the
+tables don't recognise still fall through to `unknown`, so `custom:glm` stays
+unattributed.
+
+Without this, the qualified slugs — which became the dominant form on
+2026-08-10 — left **84% of calls (3,306 of 3,934) unattributable**, and the
+local-vs-subscription split is the whole cost lever. With it, `unknown` is 1.3%.
+
+Resolve what's left with operator configuration, which is a statement of fact
+rather than an inference — `~/.t1000/telemetry/provider_classes.json`:
 
 ```json
-{ "custom": "local" }
+{ "custom": "local", "auto": "local", "mbp-mlx": "local" }
 ```
 
-Override the path with `--provider-class-map`. Unknown class names in the file
-are dropped rather than trusted.
+A full slug (`"custom:glm"`) outranks a bare name (`"glm"`), so you can pin one
+endpoint without reclassifying every sibling. Override the path with
+`--provider-class-map`. Unknown class names in the file are dropped rather than
+trusted.
+
+`mbp-mlx` is listed here rather than added to `LOCAL_PROVIDERS` on purpose: the
+naming convention and MLX being an on-device framework both point local, but
+that is an inference about an endpoint, and this file is where inferences get
+turned into stated facts by someone who knows.
 
 The durable fix is upstream: emit enough on the row to decide it. See
 "Follow-ups" below.

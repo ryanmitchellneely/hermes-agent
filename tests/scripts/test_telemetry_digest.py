@@ -286,6 +286,51 @@ class TestCostClassification:
         assert summary["by_cost_class"]["local"]["calls"] == 1
         assert not [f for f in summary["flags"] if f["kind"] == "cost_class_unknown"]
 
+    @pytest.mark.parametrize(
+        "provider,expected",
+        [
+            ("custom:spark", "local"),
+            ("custom:kevin-spark", "local"),
+            ("custom:mbp-ollama", "local"),
+            ("custom:openai", "metered"),
+            ("custom:claude-acp", "subscription"),
+        ],
+    )
+    def test_qualified_custom_slug_resolves_to_its_named_endpoint(
+        self, provider, expected
+    ):
+        """``custom:<name>`` is the repo's canonical qualified provider form.
+
+        The store records the SAME endpoint both ways -- ``mbp-ollama`` and
+        ``custom:mbp-ollama`` are one host. Reading the name out of the
+        qualifier is parsing a slug the transport wrote, not inferring hosting.
+        """
+        assert digest.classify_provider(provider) == expected
+
+    @pytest.mark.parametrize("provider", ["custom", "custom:", "auto", "custom:glm"])
+    def test_qualifier_stripping_does_not_manufacture_an_answer(self, provider):
+        """Bare ``custom`` and unrecognised names stay unknown.
+
+        ``custom:glm`` is the hosted-GLM case the whole never-guess rule exists
+        for: a qualifier alone is not evidence of locality.
+        """
+        assert digest.classify_provider(provider) == "unknown"
+
+    def test_class_map_full_slug_beats_the_bare_name(self):
+        """An operator pinning the exact slug must outrank the name table."""
+        assert (
+            digest.classify_provider(
+                "custom:spark", class_map={"custom:spark": "metered"}
+            )
+            == "metered"
+        )
+
+    def test_class_map_bare_name_still_reaches_a_qualified_slug(self):
+        assert (
+            digest.classify_provider("custom:glm", class_map={"glm": "metered"})
+            == "metered"
+        )
+
     def test_class_map_rejects_bogus_class_names(self, tmp_path):
         path = tmp_path / "map.json"
         path.write_text(json.dumps({"custom": "free-lunch", "spark": "local"}))

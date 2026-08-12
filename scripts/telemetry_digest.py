@@ -184,17 +184,12 @@ def load_provider_class_map(path: Optional[Path]) -> dict[str, str]:
     }
 
 
-def classify_provider(provider: Any, class_map: Optional[dict[str, str]] = None) -> str:
-    """Map a provider slug onto a cost class. Never guesses.
-
-    Resolution order: operator override map, then the three known-provider
-    tables, then ``unknown``. There is no fallback that infers "probably
-    local" from a model name — that inference is exactly what mislabels 22
-    LAB-SCOREBOARD rows.
-    """
-    name = str(provider or "").strip().lower()
+def _lookup_provider_class(
+    name: str, class_map: Optional[dict[str, str]] = None
+) -> Optional[str]:
+    """Resolve one exact slug against the map then the tables. No inference."""
     if not name:
-        return "unknown"
+        return None
     if class_map and name in class_map:
         return class_map[name]
     if name in LOCAL_PROVIDERS:
@@ -203,6 +198,38 @@ def classify_provider(provider: Any, class_map: Optional[dict[str, str]] = None)
         return "subscription"
     if name in METERED_PROVIDERS:
         return "metered"
+    return None
+
+
+def classify_provider(provider: Any, class_map: Optional[dict[str, str]] = None) -> str:
+    """Map a provider slug onto a cost class. Never guesses.
+
+    Resolution order: the full slug (operator map, then the known-provider
+    tables); then, for a qualified ``custom:<name>`` slug, the same lookup on
+    ``<name>``; then ``unknown``. There is no fallback that infers "probably
+    local" from a model name — that inference is exactly what mislabels 22
+    LAB-SCOREBOARD rows.
+
+    Reading ``<name>`` out of ``custom:<name>`` is not that inference. It is
+    the codebase's own canonical qualified form (see ``agent/image_routing.py``
+    and ``agent/credential_pool.py``: config keys the endpoint by bare name
+    while the runtime reports ``custom:<name>``), and the store holds the same
+    endpoint recorded both ways -- ``mbp-ollama`` and ``custom:mbp-ollama`` are
+    one host. Unrecognised names still fall through to ``unknown``: bare
+    ``custom`` and ``custom:glm`` stay unattributed, because a qualifier alone
+    is not evidence of where inference ran.
+    """
+    name = str(provider or "").strip().lower()
+    if not name:
+        return "unknown"
+    resolved = _lookup_provider_class(name, class_map)
+    if resolved is not None:
+        return resolved
+    prefix, sep, suffix = name.partition(":")
+    if sep and prefix == "custom":
+        resolved = _lookup_provider_class(suffix.strip(), class_map)
+        if resolved is not None:
+            return resolved
     return "unknown"
 
 
