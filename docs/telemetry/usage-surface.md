@@ -12,14 +12,17 @@ Answers the questions the store was opened for:
 
 ## What runs
 
-| piece | path |
-|---|---|
-| digest generator | `scripts/telemetry_digest.py` |
-| launcher (writes surface + heartbeat) | `deploy/telemetry-digest/telemetry-digest.sh` |
-| schedule (**not installed**) | `deploy/telemetry-digest/com.ryan.t1000-telemetry-digest.plist` |
-| markdown surface | `~/.t1000/telemetry/USAGE-DIGEST-latest.md` |
-| heartbeat status file | `~/.t1000/telemetry/telemetry-digest-heartbeat.json` |
-| tests | `tests/scripts/test_telemetry_digest.py` |
+| piece | path | tracked in git? |
+|---|---|---|
+| digest generator | `scripts/telemetry_digest.py` | yes (T1000) |
+| launcher (writes surface + heartbeat) | `deploy/telemetry-digest/telemetry-digest.sh` | yes (T1000) |
+| **delivery** schedule (**not armed**) | `deploy/telemetry-digest/arm-hermes-cron.sh` | yes (T1000) |
+| pull-only schedule (**not armed**) | `deploy/telemetry-digest/com.ryan.t1000-telemetry-digest.plist` | yes (T1000) |
+| markdown rollup | `~/.t1000/telemetry/USAGE-DIGEST-latest.md` | **yes (home repo)** |
+| dated rollup snapshots | `~/.t1000/telemetry/digests/USAGE-DIGEST-<date>.md` | **yes (home repo)** |
+| heartbeat status file | `~/.t1000/telemetry/telemetry-digest-heartbeat.json` | no — regenerated every run |
+| raw call store | `~/.t1000/telemetry/model_calls-*.jsonl` | no — rotates; never committed |
+| tests | `tests/scripts/test_telemetry_digest.py` | yes (T1000) |
 
 Ad-hoc use needs no schedule:
 
@@ -238,10 +241,39 @@ every heartbeat in the fleet:
 
 `status` is `ok`, `degraded` (warn flags raised), `empty`, or `error`.
 
-## Arming it — human gate, not yet done
+## Delivery — how the digest reaches a human
 
-Nothing is scheduled. Installing a schedule is a human decision in this repo.
-To arm the daily 08:30 run:
+The card asks for "one Telegram/digest message". **launchd does not deliver.**
+Its `StandardOutPath` is a log file, so a launchd-only install refreshes the
+surface on disk and nobody ever sees the decision flags — which is the failure
+mode this whole surface exists to prevent. The two schedules are therefore not
+interchangeable:
+
+| schedule | what it does | delivers to a human? |
+|---|---|---|
+| `arm-hermes-cron.sh` → Hermes no-agent cron | runs the launcher, sends its **stdout verbatim** to the configured target | **yes** |
+| `com.ryan.t1000-telemetry-digest.plist` → launchd | runs the launcher, stdout to a log file | no — pull-only refresh |
+
+`no_agent=True` means the script *is* the job: no LLM, no tokens, no agent
+loop. The launcher's "stdout is the delivery body" contract was written for
+exactly this and needs no change.
+
+### Arm the delivering schedule — human gate, not yet done
+
+Dry run by default, because arming starts a recurring outbound message:
+
+```bash
+deploy/telemetry-digest/arm-hermes-cron.sh          # prints what it would create
+deploy/telemetry-digest/arm-hermes-cron.sh --yes    # actually creates it
+```
+
+Defaults: `30 8 * * *`, `--deliver telegram`, `--no-agent`. Override with
+`TELEMETRY_DIGEST_SCHEDULE`, `TELEMETRY_DIGEST_DELIVER` (use `local` to save
+runs without sending anything).
+
+Verify: `hermes cron list` · Disarm: `hermes cron remove <job_id>`
+
+### Arm the pull-only schedule (optional, independent)
 
 ```bash
 cp /Users/ryan/Documents/T1000/deploy/telemetry-digest/com.ryan.t1000-telemetry-digest.plist \
@@ -253,6 +285,47 @@ launchctl kickstart -k gui/$(id -u)/com.ryan.t1000-telemetry-digest   # run once
 Verify: `cat ~/.t1000/telemetry/telemetry-digest-heartbeat.json`
 
 Disarm: `launchctl bootout gui/$(id -u)/com.ryan.t1000-telemetry-digest`
+
+Running both is fine and mildly useful (a midday surface refresh plus one
+morning message); the surface write is idempotent.
+
+## The committed rollup
+
+The rendered markdown is committed, and the raw store is not. That split is
+deliberate: **the trend cannot survive on the store alone.** Week-over-week
+deltas are recomputed from `model_calls-*.jsonl` on every run, so the moment
+those rows rotate or get pruned, every past window is unrecoverable. Keeping
+the *rendered* digest in git is what gives the surface a memory.
+
+- `USAGE-DIGEST-latest.md` — always the newest render.
+- `digests/USAGE-DIGEST-<YYYY-MM-DD>.md` — dated copy, written by
+  `--snapshot-dir` (the launcher passes it; ad-hoc runs do not archive). Local
+  date, matching the morning run a human actually saw.
+
+Both live under the home repo's curated `.t1000` allowlist
+(`~/.gitignore`), added the same way commit `3f5a4e3` added
+`kanban/bench-snapshots/`. **Markdown only** — the `.jsonl` call rows, the
+heartbeat, and `provider_classes.json` stay ignored.
+
+Committing is opt-in, since a scheduled job that commits unasked is a surprise:
+
+```bash
+TELEMETRY_DIGEST_COMMIT=1 deploy/telemetry-digest/telemetry-digest.sh
+```
+
+It stages only those two paths and commits with a pathspec, so nothing else
+dirty in the home repo can ride along. If a path is still git-ignored it says
+so on stderr and skips, rather than reporting a commit that did not happen.
+The paths it commits are read back out of the heartbeat the run just wrote, so
+a caller that redirected `--dir` / `--out` is followed rather than guessed at.
+
+> **Footgun, pinned by a test.** The store root is `$T1000_TELEMETRY_DIR`, else
+> `$HERMES_REAL_HOME/.t1000/telemetry`, else `~/.t1000/telemetry` — the rule in
+> `telemetry_dir()`. It is **not** under `$HERMES_HOME`: inside a Hermes worker
+> session `HERMES_HOME` is the *profile* dir (`~/.t1000/profiles/<name>`), so
+> deriving paths from it archives history where the digest never reads and the
+> commit step then correctly refuses to commit it — the rollup quietly stops
+> accumulating while every run still reports success.
 
 ## Why two scoreboards still exist (MESH-TEL-3 ↔ t_d0277c0b)
 

@@ -1326,6 +1326,24 @@ def default_heartbeat_path(root: Path) -> Path:
     return root / "telemetry-digest-heartbeat.json"
 
 
+def default_snapshot_dir(root: Path) -> Path:
+    return root / "digests"
+
+
+def snapshot_path(directory: Path, *, when: Optional[datetime] = None) -> Path:
+    """Dated copy of the rendered surface.
+
+    The trend section is recomputed from ``model_calls-*.jsonl`` on every run,
+    so the digest's own history lives only as long as the raw store does. Once
+    those rows rotate or are pruned, every past window is unrecoverable unless
+    the *rendered* markdown was kept. Local date, not UTC: the schedule fires
+    on local time, so "the 2026-08-12 digest" should mean the run a human saw
+    that morning.
+    """
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d")
+    return directory / f"USAGE-DIGEST-{stamp}.md"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="telemetry-digest",
@@ -1338,6 +1356,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lane", help="filter to one profile/lane")
     parser.add_argument("--out", help="markdown surface path (default <store>/USAGE-DIGEST-latest.md)")
     parser.add_argument("--heartbeat", help="status file path (default <store>/telemetry-digest-heartbeat.json)")
+    parser.add_argument(
+        "--snapshot-dir",
+        nargs="?",
+        const="",
+        help="also write a dated copy (USAGE-DIGEST-<YYYY-MM-DD>.md) so the "
+        "trend survives store rotation; bare flag uses <store>/digests. "
+        "Off by default — ad-hoc runs should not archive.",
+    )
     parser.add_argument("--no-heartbeat", action="store_true", help="skip the status file (tests / ad-hoc runs)")
     parser.add_argument(
         "--interval-seconds",
@@ -1437,6 +1463,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         # Surface is written BEFORE anything can fail downstream, so the last
         # good digest stays readable even when delivery breaks (kevin_digest.py
         # establishes this ordering).
+        snapshot_written: Optional[Path] = None
+        snapshot_error: Optional[str] = None
         if not args.json:
             try:
                 surface_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1444,23 +1472,52 @@ def main(argv: Optional[list[str]] = None) -> int:
             except OSError:
                 pass
 
+            if args.snapshot_dir is not None:
+                directory = (
+                    Path(args.snapshot_dir).expanduser()
+                    if args.snapshot_dir
+                    else default_snapshot_dir(root)
+                )
+                target = snapshot_path(directory)
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    target.write_text(body, encoding="utf-8")
+                    snapshot_written = target
+                except OSError as exc:
+                    # Not fatal — a dead archive must not take the surface down.
+                    # But it is never silent: an unwritten snapshot means the
+                    # trend is losing its own past, which is exactly the kind
+                    # of quiet degradation this surface exists to refuse.
+                    snapshot_error = f"{type(exc).__name__}: {exc}"[:200]
+                    print(
+                        f"telemetry-digest: snapshot NOT written to {target}: "
+                        f"{snapshot_error}",
+                        file=sys.stderr,
+                    )
+
         empty = summary["calls"] == 0
         warn_flags = [flag for flag in summary["flags"] if flag["severity"] == "warn"]
         status = "empty" if empty else ("degraded" if warn_flags else "ok")
+        if snapshot_error and not empty:
+            status = "degraded"
         if not args.no_heartbeat:
+            detail = (
+                f"{summary['calls']} calls in window {args.since}; "
+                f"{len(warn_flags)} warn flag(s)"
+            )
+            if snapshot_error:
+                detail += f"; snapshot failed: {snapshot_error}"
             write_heartbeat(
                 heartbeat_path,
                 heartbeat_payload(
                     status,
                     interval_seconds=args.interval_seconds,
-                    detail=(
-                        f"{summary['calls']} calls in window {args.since}; "
-                        f"{len(warn_flags)} warn flag(s)"
-                    ),
+                    detail=detail,
                     calls_in_window=summary["calls"],
                     failures=summary["overall"]["failures"],
                     warn_flags=len(warn_flags),
                     surface=str(surface_path),
+                    snapshot=str(snapshot_written) if snapshot_written else None,
                     window=args.since,
                 ),
             )

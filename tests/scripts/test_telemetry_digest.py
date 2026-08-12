@@ -20,6 +20,7 @@ to (or read) the real store.
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -849,3 +850,136 @@ class TestCaveats:
         summary = digest.summarize([_row()], pricing=None)
         assert summary["pricing_available"] is False
         assert any("usage_pricing" in caveat for caveat in summary["caveats"])
+
+
+class TestSnapshotHistory:
+    """The rollup must outlive the raw store it was computed from.
+
+    Trend deltas are recomputed from ``model_calls-*.jsonl`` every run, so
+    without a dated copy of the RENDERED markdown, rotating or pruning the
+    store destroys every past window irrecoverably.
+    """
+
+    def _run(self, tmp_path, extra, rows=None):
+        # Inside the 24h window on purpose: the fixture default ts is fixed and
+        # would fall out of it, turning every case into the empty-window path.
+        now_ms = int(__import__("time").time() * 1000)
+        default = [_row(ts_epoch_ms=now_ms - 3600 * 1000)]
+        root = _store(tmp_path, rows if rows is not None else default)
+        surface = tmp_path / "OUT.md"
+        heartbeat = tmp_path / "hb.json"
+        code = digest.main(
+            ["--dir", str(root), "--since", "24h", "--out", str(surface),
+             "--heartbeat", str(heartbeat), "--quiet"] + extra
+        )
+        return root, surface, heartbeat, code
+
+    def test_no_snapshot_without_the_flag(self, tmp_path):
+        """Ad-hoc runs must not silently accumulate an archive."""
+        root, _, _, code = self._run(tmp_path, [])
+        assert code == 0
+        assert not (root / "digests").exists()
+
+    def test_snapshot_is_dated_and_byte_identical_to_the_surface(self, tmp_path):
+        snapdir = tmp_path / "archive"
+        _, surface, _, code = self._run(tmp_path, ["--snapshot-dir", str(snapdir)])
+        assert code == 0
+
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        written = snapdir / f"USAGE-DIGEST-{stamp}.md"
+        assert written.exists()
+        assert written.read_text() == surface.read_text()
+
+    def test_bare_flag_archives_under_the_store(self, tmp_path):
+        root, _, _, code = self._run(tmp_path, ["--snapshot-dir"])
+        assert code == 0
+        assert list((root / "digests").glob("USAGE-DIGEST-*.md"))
+
+    def test_heartbeat_carries_the_snapshot_path(self, tmp_path):
+        snapdir = tmp_path / "archive"
+        _, _, heartbeat, _ = self._run(tmp_path, ["--snapshot-dir", str(snapdir)])
+        payload = json.loads(heartbeat.read_text())
+        assert payload["snapshot"].startswith(str(snapdir))
+
+    def test_heartbeat_snapshot_is_null_when_not_archiving(self, tmp_path):
+        """Absent, not fabricated — a consumer can tell archiving is off."""
+        _, _, heartbeat, _ = self._run(tmp_path, [])
+        assert json.loads(heartbeat.read_text())["snapshot"] is None
+
+    def test_snapshot_failure_degrades_loudly_but_does_not_kill_the_run(
+        self, tmp_path, capsys
+    ):
+        """A dead archive must not take the surface down — and must not be
+        silent either, since losing history is exactly the quiet degradation
+        this surface exists to refuse."""
+        blocked = tmp_path / "blocked"
+        blocked.write_text("i am a file, not a directory", encoding="utf-8")
+
+        _, surface, heartbeat, code = self._run(
+            tmp_path, ["--snapshot-dir", str(blocked)]
+        )
+
+        assert code == 0                       # surface still rendered
+        assert surface.read_text()             # ...and still written
+        assert "snapshot NOT written" in capsys.readouterr().err
+
+        payload = json.loads(heartbeat.read_text())
+        assert payload["status"] == "degraded"
+        assert "snapshot failed" in payload["detail"]
+        assert payload["snapshot"] is None
+
+    def test_json_mode_does_not_archive(self, tmp_path):
+        """--json is a machine query, not the scheduled surface render."""
+        root, _, _, _ = self._run(tmp_path, ["--snapshot-dir", "--json"])
+        assert not (root / "digests").exists()
+
+    def test_launcher_archives_into_the_store_not_hermes_home(self, tmp_path):
+        """HERMES_HOME is the PROFILE dir under a Hermes worker session
+        (~/.t1000/profiles/<name>), and the store is not under it. Deriving the
+        archive path from HERMES_HOME writes history somewhere the digest never
+        reads — and the commit step then correctly refuses to commit it, so the
+        rollup silently stops accumulating. Pin the resolution rule instead.
+        """
+        import os
+        import subprocess
+
+        store = _store(tmp_path, [_row(ts_epoch_ms=int(__import__("time").time() * 1000))])
+        profile_home = tmp_path / "profiles" / "worker"
+        profile_home.mkdir(parents=True)
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "T1000_TELEMETRY_DIR": str(store),
+                "HERMES_HOME": str(profile_home),   # the trap
+                "HOME": str(tmp_path / "fakehome"),
+                "T1000_REPO": str(REPO_ROOT),
+            }
+        )
+        env.pop("TELEMETRY_DIGEST_COMMIT", None)
+        env.pop("TELEMETRY_DIGEST_SNAPSHOT_DIR", None)
+
+        proc = subprocess.run(
+            [str(REPO_ROOT / "deploy" / "telemetry-digest" / "telemetry-digest.sh")],
+            capture_output=True, text=True, env=env,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert list((store / "digests").glob("USAGE-DIGEST-*.md"))
+        assert not (profile_home / "telemetry").exists()
+
+        # Delivery contract: stdout IS the message body under a no-agent cron,
+        # so operational chatter must never land there.
+        assert "# Model-call usage + success surface" in proc.stdout
+        assert "# Model-call usage + success surface" not in proc.stderr
+
+    def test_empty_window_still_archives_what_it_rendered(self, tmp_path):
+        """An empty digest is itself a finding worth keeping dated."""
+        snapdir = tmp_path / "archive"
+        root = _store(tmp_path, [_row(ts_epoch_ms=1)])   # far outside 24h
+        code = digest.main(
+            ["--dir", str(root), "--since", "24h", "--out", str(tmp_path / "O.md"),
+             "--no-heartbeat", "--quiet", "--snapshot-dir", str(snapdir)]
+        )
+        assert code == 1                                  # the empty-window alert
+        assert list(snapdir.glob("USAGE-DIGEST-*.md"))
