@@ -390,7 +390,15 @@ def record_model_call(
     ``"main_loop"``. *ttft_ms* is ``null`` where the transport cannot measure it.
 
     Never raises. Never blocks on a lock.
+
+    Set ``T1000_TELEMETRY_OFF`` to any non-empty value to disable recording
+    process-wide. This is the rollback lever: every LLM call in the fleet flows
+    through this function, and without a gate the only way to stop it is to
+    revert the commit and cycle every worker. Unset (the default) is a no-op,
+    so the gate costs one dict lookup and changes nothing.
     """
+    if os.environ.get("T1000_TELEMETRY_OFF"):
+        return
     try:
         record = build_record(
             provider=provider,
