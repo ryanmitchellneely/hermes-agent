@@ -236,3 +236,96 @@ def test_reviewer_is_recorded_on_the_claim_event(conn):
     payload = json.loads(claimed_events[0]["payload"])
     assert payload.get("reviewer") == "grok"
     assert payload.get("source_status") == "review"
+
+
+# --------------------------------------------------------------------------
+# dispatch level -- the actual t_eaeae889 governance guarantee
+# --------------------------------------------------------------------------
+
+
+def test_dispatcher_never_spawns_the_implementer_onto_its_own_review(
+    kanban_home, monkeypatch
+):
+    """Reproduces t_eaeae889 at the level the incident actually happened.
+
+    The real event trail: run 423 (profile ``grok``, the implementer) finished
+    with review_requested and an explicit "Needs Ryan green before
+    implementation children." Ninety seconds later run 425 -- the SAME grok
+    profile -- claimed the card with source_status:'review' and completed it,
+    summary "Reviewed and approved." The human gate the worker asked for was
+    closed by the worker itself.
+
+    The picker tests above prove pick_reviewer_profile() refuses. This proves
+    the DISPATCHER refuses, which is the guarantee that actually matters.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="grok's own work", assignee="grok")
+        kb.claim_task(conn, tid)
+        kb.request_review(
+            conn, tid, summary="Needs Ryan green before implementation children.",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+
+        # Every profile is spawnable, so nothing but the reviewer-must-differ
+        # rule can prevent grok from being handed its own review.
+        monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+        monkeypatch.setattr(
+            cfgmod, "load_config",
+            lambda *a, **k: {
+                "kanban": {
+                    "review_dispatch": True,
+                    # grok is listed FIRST and is still refused.
+                    "review_profiles": ["grok", "sonnet"],
+                }
+            },
+        )
+
+        res = kb.dispatch_once(conn, dry_run=True)
+        spawned = {t[0]: t[1] for t in res.spawned}
+
+        assert tid in spawned, "the card should still be reviewed, just not by grok"
+        assert spawned[tid] != "grok", (
+            "t_eaeae889: the implementer must never be dispatched onto its own "
+            "review -- that is how a worker closed its own human gate"
+        )
+        assert spawned[tid] == "sonnet"
+
+
+def test_dispatcher_holds_rather_than_self_approving_when_only_implementer_configured(
+    kanban_home, monkeypatch
+):
+    """If the ONLY configured reviewer is the implementer, hold — never fall back.
+
+    This is the case that makes the guarantee real rather than cosmetic: with
+    no one else eligible, the tempting behaviour is to let the implementer
+    through 'so the card can move'. That is precisely the bug.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="solo", assignee="grok")
+        kb.claim_task(conn, tid)
+        kb.request_review(
+            conn, tid, summary="done",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+
+        monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+        monkeypatch.setattr(
+            cfgmod, "load_config",
+            lambda *a, **k: {
+                "kanban": {"review_dispatch": True, "review_profiles": ["grok"]}
+            },
+        )
+
+        res = kb.dispatch_once(conn, dry_run=True)
+        assert tid not in [t[0] for t in res.spawned], "must not self-approve"
+        assert kb.get_task(conn, tid).status == "review", "must stay parked for a human"
+        assert tid in [t[0] for t in res.skipped_no_reviewer], (
+            "the hold must be VISIBLE in the dispatch result, not silent"
+        )
