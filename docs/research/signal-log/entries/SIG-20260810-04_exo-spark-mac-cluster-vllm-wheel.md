@@ -4,7 +4,7 @@
 id: SIG-20260810-04
 date: 2026-08-10
 title: "ExoLabs DGX Spark + Mac Studio M3 Ultra cluster (u1tra_instinct) — and the prebuilt vLLM sm121/cp312/aarch64 wheel sitting in exo-spark-assets"
-index_title: "Prebuilt vLLM wheel for GB10 EXISTS and matches our Spark triple exactly (sm121/cp312/aarch64) — B17's engine phase may be a download, not a build. Cluster itself needs hardware we don't have"
+index_title: "Prebuilt vLLM wheel for GB10 EXISTS and matches our Spark triple exactly (sm121/cp312/aarch64) — but this wheel was VETOED by Ryan on supply-chain grounds (10 downloads, third party) and the 'download, not a build' headline is SUPERSEDED by SIG-20260812-03: the OFFICIAL vLLM aarch64 wheel is compiled 12.0-without-PTX, and the SM121 fix (#49904) applies to the SOURCE BUILD. Engine phase is a build. Cluster itself needs hardware we don't have"
 index_links: [repo, docs]
 source_url: "https://x.com/u1tra_instinct/status/2086773844547711012"
 canonical_repo: "https://github.com/exo-explore/exo-spark-assets"
@@ -24,7 +24,7 @@ related_plans:
   - "SIG-20260810-02"     # OoO-Spec — where I wrongly narrowed the engine phase to "width only"
   - "SIG-20260807-03"     # McNab Spark width
 status: carded
-status_note: "Primary steal CARDED t_08e96127 (blocked on Ryan). See card body for the full spec + guardrails."
+status_note: "**Primary steal CARDED `t_08e96127` — now in `triage` with Ryan's supply-chain STOP on THIS wheel (10 downloads, third party); the veto held, nothing was fetched.** ⚠️ **Corrected 2026-08-12 by `SIG-20260812-03`:** the official vLLM PyPI aarch64 wheel is built `TORCH_CUDA_ARCH_LIST='…12.0'` with PTX explicitly excluded, and PR #49904's SM121 fix is a *source-build* fix — so the engine phase is a **build**, not a download. Card retargeted; gate is now vLLM issue #51920 (engine crash at startup on sm_121 for MLA models = DS4 Flash)."
 distill: none
 ```
 
