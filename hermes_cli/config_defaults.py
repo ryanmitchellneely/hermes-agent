@@ -2347,9 +2347,18 @@ DEFAULT_CONFIG = {
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
         # Automatically claim tasks in the first-class review column and spawn
-        # the assigned profile with the bundled sdlc-review skill. Disable for
+        # a reviewer profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Profiles allowed to REVIEW another profile's work, most-preferred
+        # first. The dispatcher takes the first entry that is not the task's
+        # implementer, exists, and is under its concurrency cap; if none
+        # qualify it DEFERS (leaves the task in review, unclaimed) rather than
+        # spawning the implementer onto its own review. That self-spawn was
+        # the reclaim loop -- one card burned 11 runs re-reviewing itself --
+        # and the self-approval hole. Empty (the default) therefore means
+        # automatic review is OFF: safe, but set this to turn it on.
+        "review_profiles": [],
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

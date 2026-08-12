@@ -408,7 +408,7 @@ def test_review_dispatch_gate_prevents_phantom_reviewer(
         # picked up by the dispatcher.
         monkeypatch.setattr(
             cfgmod, "load_config",
-            lambda *a, **k: {"kanban": {"review_dispatch": True}},
+            lambda *a, **k: {"kanban": {"review_dispatch": True, "review_profiles": ["reviewer-bot"]}},
         )
         res_on = kb.dispatch_once(conn, dry_run=True)
         assert tid in [s[0] for s in res_on.spawned]
@@ -431,7 +431,7 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
     monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
     monkeypatch.setattr(
         cfgmod, "load_config",
-        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+        lambda *a, **k: {"kanban": {"review_dispatch": True, "review_profiles": ["reviewer-bot"]}},
     )
     pr_comment = "Opened https://github.com/example/repo/pull/123 for review."
 
@@ -485,7 +485,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     monkeypatch.setattr(
         cfgmod,
         "load_config",
-        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True, "review_profiles": ["reviewer-bot"]}},
     )
     captured: list[list[str]] = []
 
@@ -538,7 +538,7 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
     monkeypatch.setattr(
         cfgmod,
         "load_config",
-        lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
+        lambda *args, **kwargs: {"kanban": {"review_dispatch": True, "review_profiles": ["reviewer-bot"]}},
     )
 
     with kb.connect() as conn:

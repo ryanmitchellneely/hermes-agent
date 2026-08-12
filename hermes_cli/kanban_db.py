@@ -4733,11 +4733,20 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    reviewer: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
+
+    ``reviewer`` names the profile that will actually RUN this review, which
+    is deliberately not the task's assignee (see
+    :func:`pick_reviewer_profile`). When given it becomes ``task_runs.profile``
+    — so the run history records who reviewed — and is set on the returned
+    Task's in-memory ``assignee`` so the caller spawns and cap-counts the
+    reviewer. ``tasks.assignee`` in the DB is left alone: the implementer
+    keeps ownership of the card.
 
     Parent dependencies are re-checked because a previously completed parent
     may have been reopened while this task waited in review.
@@ -4796,7 +4805,7 @@ def claim_review_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                reviewer or (trow["assignee"] if trow else None),
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -4812,10 +4821,17 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review",
+             **({"reviewer": reviewer} if reviewer else {})},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        if claimed is not None and reviewer:
+            # In-memory only. The caller spawns and cap-counts this field, so
+            # it must name the reviewer; tasks.assignee in the DB deliberately
+            # still names the implementer, who keeps ownership of the card.
+            claimed.assignee = reviewer
+        return claimed
 
 
 def _retry_status_for_run(
@@ -7937,6 +7953,15 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_no_reviewer: list[tuple[str, str]] = field(default_factory=list)
+    """Review tasks deferred because no eligible reviewer exists that is not
+    the implementer. Each entry is ``(task_id, implementer)``. The dispatcher
+    REFUSES to fall back to the assignee: that self-spawn is the reclaim loop
+    (t_6f7689e4) and the self-approval hole (t_eaeae889). Configure
+    ``kanban.review_profiles`` with at least one profile other than the
+    implementer to clear this. An empty list here with review tasks waiting
+    means auto-review is effectively off — which is the safe state, not a
+    silent one."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9463,6 +9488,82 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def review_profile_candidates() -> list[str]:
+    """Return the ordered reviewer-profile preference list from config.
+
+    ``kanban.review_profiles`` (a list, most-preferred first) names the
+    profiles allowed to REVIEW someone else's work. Empty/absent means no
+    reviewer is configured, which makes review dispatch defer rather than
+    fall back to the implementer — see :func:`pick_reviewer_profile`.
+    """
+    try:
+        from hermes_cli.config import load_config
+        raw = (load_config() or {}).get("kanban", {}).get("review_profiles", [])
+    except Exception:
+        return []
+    if isinstance(raw, str):  # tolerate a single name written unquoted
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in raw:
+        name = str(item).strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def pick_reviewer_profile(
+    implementer: Optional[str],
+    *,
+    candidates: Optional[list[str]] = None,
+    profile_exists=None,
+    per_profile_cap: Optional[int] = None,
+    per_profile_running: Optional[dict] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Choose who reviews work produced by *implementer*. None = do not spawn.
+
+    THE BUG THIS EXISTS FOR (t_6f7689e4): review dispatch used to spawn the
+    task's own assignee, so implementer and reviewer were the same profile by
+    construction. That profile re-verified its own already-committed work and
+    called request-review again, re-arming the exact claimable state the
+    dispatcher had just consumed. Observed on t_d107022a: 11 runs, all
+    profile ``sonnet``, ten consecutive ``review_requested`` outcomes,
+    ~32 minutes of worker time for no progress. The same self-spawn is also
+    how a profile could approve its own work (t_eaeae889), which fleet
+    doctrine forbids ("agents must not self-GREEN").
+
+    Returns ``(reviewer, defer_reason)``. On success ``reviewer`` is the first
+    candidate that is (1) not the implementer, (2) a real profile, and (3)
+    under its concurrency cap, with ``defer_reason`` None.
+
+    When no reviewer is returned the caller must DEFER — leave the task in
+    review, unclaimed. It must never fall back to the implementer; that is the
+    bug. ``defer_reason`` distinguishes the two very different causes, because
+    the codebase deliberately separates "this profile is busy" from "this task
+    is stuck" (see ``DispatchResult.skipped_per_profile_capped``):
+
+      ``"capped"``       eligible reviewers exist but are all at their cap.
+                         Transient — a later tick will pick it up.
+      ``"unavailable"``  no candidate is configured / exists / differs from
+                         the implementer. Operator-actionable: set
+                         ``kanban.review_profiles``.
+    """
+    saw_eligible_but_capped = False
+    for name in (candidates if candidates is not None else review_profile_candidates()):
+        if implementer and name == implementer:
+            continue
+        if profile_exists is not None and not profile_exists(name):
+            continue
+        if per_profile_cap is not None:
+            running = (per_profile_running or {}).get(name, 0)
+            if running >= per_profile_cap:
+                saw_eligible_but_capped = True
+                continue
+        return name, None
+    return None, ("capped" if saw_eligible_but_capped else "unavailable")
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -9889,13 +9990,29 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+        # Pick who REVIEWS. Never the implementer: spawning the assignee onto
+        # its own review is the reclaim loop (t_6f7689e4 — 11 runs, ten
+        # consecutive review_requested, ~32 min of worker time) and the
+        # self-approval hole (t_eaeae889). The cap is checked against the
+        # REVIEWER, since that is the profile whose slot this spawn consumes.
+        reviewer, defer_reason = pick_reviewer_profile(
+            row["assignee"],
+            profile_exists=profile_exists,
+            per_profile_cap=_per_profile_cap,
+            per_profile_running=_per_profile_running,
+        )
+        if reviewer is None:
+            # DEFER. The task stays in review, unclaimed, for a later tick or a
+            # human. Falling back to the implementer is exactly the bug.
+            # Keep "busy" and "stuck" in different buckets -- an all-capped
+            # reviewer pool is transient, an unconfigured one needs an operator.
+            if defer_reason == "capped":
                 result.skipped_per_profile_capped.append(
-                    (row["id"], row["assignee"], current)
+                    (row["id"], row["assignee"], _per_profile_cap or 0)
                 )
-                continue
+            else:
+                result.skipped_no_reviewer.append((row["id"], row["assignee"]))
+            continue
         guard_reason = check_respawn_guard(conn, row["id"], lane="review")
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
@@ -9907,14 +10024,16 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], reviewer, ""))
             spawned += 1
             if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
+                _per_profile_running[reviewer] = (
+                    _per_profile_running.get(reviewer, 0) + 1
                 )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn, row["id"], ttl_seconds=ttl_seconds, reviewer=reviewer
+        )
         if claimed is None:
             continue
         try:
