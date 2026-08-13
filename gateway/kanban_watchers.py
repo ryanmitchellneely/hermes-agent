@@ -1325,7 +1325,12 @@ class GatewayKanbanWatchersMixin:
         # / browser pool from being overwhelmed by a fan-out.
         raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
         max_in_progress_per_profile = None
-        if raw_per_profile is not None:
+        if isinstance(raw_per_profile, dict):
+            # Per-profile mapping (e.g. {sonnet: 6, default: 2}) — normalized
+            # and enforced in kanban_db; passed through as-is so the
+            # dispatcher core owns the semantics.
+            max_in_progress_per_profile = raw_per_profile
+        elif raw_per_profile is not None:
             try:
                 max_in_progress_per_profile = int(raw_per_profile)
             except (TypeError, ValueError):
@@ -1343,7 +1348,7 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile = None
                 else:
                     logger.info(
-                        "kanban dispatcher: max_in_progress_per_profile=%d",
+                        "kanban dispatcher: max_in_progress_per_profile=%s",
                         max_in_progress_per_profile,
                     )
 

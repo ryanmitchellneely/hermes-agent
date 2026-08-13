@@ -9577,13 +9577,51 @@ def pick_reviewer_profile(
             continue
         if profile_exists is not None and not profile_exists(name):
             continue
-        if per_profile_cap is not None:
+        _rev_cap = _resolve_profile_cap(_normalize_per_profile_cap(per_profile_cap), name)
+        if _rev_cap is not None:
             running = (per_profile_running or {}).get(name, 0)
-            if running >= per_profile_cap:
+            if running >= _rev_cap:
                 saw_eligible_but_capped = True
                 continue
         return name, None
     return None, ("capped" if saw_eligible_but_capped else "unavailable")
+
+
+def _normalize_per_profile_cap(raw):
+    """Accept kanban.max_in_progress_per_profile as an int or a mapping.
+
+    Int (legacy): one uniform cap for every profile. Mapping (2026-08-13,
+    Ryan's ruling — sonnet widened to 6 while local models keep the DS4
+    throttle): per-profile caps with an optional "default" key, e.g.
+    {"sonnet": 6, "default": 2}. A profile absent from the map falls back to
+    "default"; no "default" means that profile is UNCAPPED. Invalid entries
+    are dropped rather than poisoning the whole cap. Returns int, dict, or
+    None (no cap at all).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if isinstance(raw, dict):
+        clean = {}
+        for k, v in raw.items():
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                continue
+            if iv > 0:
+                clean[str(k)] = iv
+        return clean or None
+    return None
+
+
+def _resolve_profile_cap(cap, profile):
+    """Effective cap for one profile under int-or-mapping semantics."""
+    if cap is None:
+        return None
+    if isinstance(cap, dict):
+        return cap.get(profile, cap.get("default"))
+    return cap
 
 
 def dispatch_once(
@@ -9773,10 +9811,7 @@ def _dispatch_once_locked(
     # Tasks blocked this way go to skipped_per_profile_capped (not
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
-    _per_profile_cap = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
+    _per_profile_cap = _normalize_per_profile_cap(max_in_progress_per_profile)
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
         for prow in conn.execute(
@@ -9877,9 +9912,10 @@ def _dispatch_once_locked(
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
         # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        _eff_cap = _resolve_profile_cap(_per_profile_cap, row_assignee)
+        if _eff_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= _eff_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
