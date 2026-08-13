@@ -142,6 +142,51 @@ _LOCAL_MODEL_PREFERENCE = {
     "mbp-ollama": ("qwen3-coder:30b", "hf.co/NousResearch/Hermes-4.3-36B-GGUF:Q4_K_M", "hermes3:8b"),
 }
 
+# Models that must not take the FIRST attempt on M/L cards. Measured
+# 2026-08-13: the estimator sent 50+ M-tier cards here with rubber-stamp
+# rationales while the model completed 2 of 36 runs (55.6% crashed, protocol
+# non-compliance — clean exit, no terminal verb). Flash keeps S-tier and its
+# proven DevBot/eval-apply lane; this only changes who goes first on M/L.
+_FLASH_CLASS_MODELS = frozenset({"deepseek-v4-flash"})
+
+
+def _demote_flash_for_m_plus(suggestion: dict, alternatives: list, complexity: str):
+    """Never suggest a flash-class model as the first attempt on an M/L card.
+
+    Promotes the first capable LOCAL alternative if one is ready (stays on the
+    boxes), else sonnet from the frontier fallbacks. The flash pick is kept as
+    the first alternative so a human override stays one click. S cards are
+    untouched — flash earns its keep there.
+    """
+    if complexity not in ("M", "L") or suggestion.get("model") not in _FLASH_CLASS_MODELS:
+        return suggestion, alternatives
+    promoted = None
+    for i, alt in enumerate(alternatives):
+        if alt.get("lane") == "local" and alt.get("model") not in _FLASH_CLASS_MODELS:
+            promoted = dict(alternatives.pop(i))
+            break
+    if promoted is None:
+        for prov, mid, lab in _FRONTIER_FALLBACKS:
+            if mid == "sonnet":
+                promoted = {"lane": "frontier", "provider": prov, "model": mid, "label": lab}
+                alternatives = [
+                    a for a in alternatives
+                    if not (a.get("model") == mid and a.get("provider") == prov)
+                ]
+                break
+    if promoted is None:
+        return suggestion, alternatives
+    demoted = {k: suggestion.get(k) for k in ("lane", "provider", "model", "label")}
+    promoted["effort"] = suggestion.get("effort") or ("high" if complexity == "L" else "medium")
+    promoted["local_ok"] = suggestion.get("local_ok")
+    promoted["why"] = (
+        f"{complexity}-tier: flash-class first attempts measured at 55.6% crash "
+        "(protocol non-compliance, 2026-08-13) — routing to a capable model; "
+        "flash stays available as the first alternative"
+    )
+    return promoted, [demoted] + list(alternatives)
+
+
 # Frontier fallbacks when local is unsafe or offline (desk catalog order).
 _FRONTIER_FALLBACKS = (
     ("xai-oauth", "grok-4.5", "Grok 4.5"),
@@ -292,6 +337,9 @@ def _build_estimate_suggestion(
                 "model": mid,
                 "label": lab,
             })
+        suggestion, alternatives = _demote_flash_for_m_plus(
+            suggestion, alternatives, complexity
+        )
     else:
         # Frontier primary
         prov, mid, lab = _FRONTIER_FALLBACKS[0]

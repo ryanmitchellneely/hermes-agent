@@ -8698,6 +8698,21 @@ def _error_fingerprint(error_text: str) -> str:
 # precedence ``_record_task_failure`` documents for every other failure kind.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
+# Models that get NO protocol-violation retries: one clean-exit-without-verb
+# and the task blocks so the escalate ladder can move it within a cron tick.
+#
+# This deliberately narrows the "~96% complete on a later run" measurement
+# behind the bounded retry above — that number is dominated by capable models
+# where a finalize nudge lands next attempt. deepseek-v4-flash is the
+# counterexample, measured 2026-08-13 across all boards: 36 flash-profile runs,
+# 2 completed, 20 crashed (55.6%), and the two live burn cases each spent 3-4
+# consecutive violations (63 min on t_25a59802, ~32 min on t_d107022a's C4 run)
+# before gave_up finally parked them where the escalate sidecar could act. The
+# dispatcher's 90s respawn beats the 3m escalate cron on ready cards, so every
+# retry granted here is wall-clock the ladder cannot claw back. Small sample
+# (n=36, 3 cards) — if flash starts finishing M cards, shrink or empty this set.
+_PROTOCOL_VIOLATION_FIRST_STRIKE_MODELS = frozenset({"deepseek-v4-flash"})
+
 # How far back to walk a task's closed runs when counting the violation
 # streak. The streak trips at a handful of violations, so anything beyond a
 # few dozen rows (violations interleaved with neutral rate-limited requeues)
@@ -8960,18 +8975,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
-                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
+                    "SELECT max_retries, model_override FROM tasks WHERE id = ?",
+                    (tid,),
                 ).fetchone()
                 if trow is None:
                     continue  # task deleted mid-loop
                 task_override = (
                     trow["max_retries"] if "max_retries" in trow.keys() else None
                 )
-                violation_limit = (
-                    int(task_override)
-                    if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                _model = (
+                    trow["model_override"] if "model_override" in trow.keys() else None
                 )
+                if task_override is not None:
+                    # Explicit per-task budget keeps top precedence, as for
+                    # every other failure kind.
+                    violation_limit = int(task_override)
+                elif _model in _PROTOCOL_VIOLATION_FIRST_STRIKE_MODELS:
+                    violation_limit = 1
+                else:
+                    violation_limit = _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 if streak < violation_limit:
                     # Below budget: the task is already back at ``ready``
                     # (respawn allowed) with ``last_failure_error`` stamped.

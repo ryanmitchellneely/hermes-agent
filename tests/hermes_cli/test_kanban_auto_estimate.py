@@ -156,3 +156,50 @@ def test_legacy_rows_backfilled_as_skipped_on_migration(kanban_home):
         assert tid not in [t.id for t in kb.list_tasks_needing_estimate(conn, limit=10)]
     finally:
         conn.close()
+
+
+# ── M/L flash demotion (pure helper, no LLM) ─────────────────────────────────
+
+def _flash_suggestion():
+    return {
+        "lane": "local", "provider": "kevin-spark", "model": "deepseek-v4-flash",
+        "label": "DS4 · deepseek-v4-flash", "effort": "medium",
+        "why": "medium but no high-risk signals — prefer local", "local_ok": True,
+    }
+
+
+def test_m_card_never_starts_on_flash_prefers_capable_local():
+    from hermes_cli.kanban_estimate import _demote_flash_for_m_plus
+    alts = [
+        {"lane": "local", "provider": "spark", "model": "gpt-oss:120b", "label": "Spark · gpt-oss:120b"},
+        {"lane": "frontier", "provider": "xai-oauth", "model": "grok-4.5", "label": "Grok 4.5"},
+    ]
+    sug, alts = _demote_flash_for_m_plus(_flash_suggestion(), alts, "M")
+    assert sug["model"] == "gpt-oss:120b" and sug["lane"] == "local"
+    # the flash pick survives as the FIRST alternative — human override stays one click
+    assert alts[0]["model"] == "deepseek-v4-flash"
+
+
+def test_m_card_with_no_capable_local_goes_to_sonnet():
+    from hermes_cli.kanban_estimate import _demote_flash_for_m_plus
+    alts = [{"lane": "frontier", "provider": "xai-oauth", "model": "grok-4.5", "label": "Grok 4.5"}]
+    sug, alts = _demote_flash_for_m_plus(_flash_suggestion(), alts, "M")
+    assert sug["model"] == "sonnet" and sug["lane"] == "frontier"
+    assert alts[0]["model"] == "deepseek-v4-flash"
+
+
+def test_s_card_keeps_flash():
+    """The half of the ruling that protects flash: S-tier is its lane."""
+    from hermes_cli.kanban_estimate import _demote_flash_for_m_plus
+    sug, alts = _demote_flash_for_m_plus(_flash_suggestion(), [], "S")
+    assert sug["model"] == "deepseek-v4-flash"
+    assert alts == []
+
+
+def test_non_flash_m_suggestion_untouched():
+    from hermes_cli.kanban_estimate import _demote_flash_for_m_plus
+    sug_in = {"lane": "local", "provider": "spark", "model": "gpt-oss:120b",
+              "label": "Spark · gpt-oss:120b", "effort": "medium", "why": "x", "local_ok": True}
+    sug, alts = _demote_flash_for_m_plus(dict(sug_in), [], "M")
+    assert sug["model"] == "gpt-oss:120b"
+    assert alts == []

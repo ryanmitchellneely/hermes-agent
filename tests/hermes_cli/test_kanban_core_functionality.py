@@ -1413,3 +1413,74 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+
+
+def test_flash_protocol_violation_blocks_on_first_strike(kanban_home):
+    """A flash-class model gets NO protocol-violation retries.
+
+    THE MEASUREMENT THIS PINS (2026-08-13): deepseek-v4-flash completed 2 of 36
+    runs; its clean-exit-no-verb crashes do not heal on retry with the same
+    model (3-4 consecutive violations per burn case), and the dispatcher's 90s
+    respawn beats the 3m escalate cron on ready cards — so each granted retry
+    is wall-clock the ladder cannot claw back. One violation must park the card
+    where the sidecar can escalate it.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="flash first strike", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET model_override='deepseek-v4-flash' WHERE id=?", (tid,),
+        )
+        conn.commit()
+        _drive_protocol_violation(conn, tid, 992001)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"first violation on a first-strike model must block, got {task.status}"
+        )
+    finally:
+        conn.close()
+
+
+def test_capable_model_keeps_bounded_violation_retries(kanban_home):
+    """The negative control: the 96%-heal measurement stays honored elsewhere.
+
+    Without this, a change that set the limit to 1 GLOBALLY would pass the
+    first-strike test above while silently reverting the bounded-retry design
+    for capable models.
+    """
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="sonnet keeps budget", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET model_override='sonnet' WHERE id=?", (tid,),
+        )
+        conn.commit()
+        _drive_protocol_violation(conn, tid, 992002)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            "one violation on a capable model must still retry "
+            f"(bounded budget), got {task.status}"
+        )
+    finally:
+        conn.close()
+
+
+def test_explicit_max_retries_overrides_first_strike(kanban_home):
+    """Per-task max_retries keeps top precedence over the first-strike set."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="flash with explicit budget", assignee="worker",
+            max_retries=2,
+        )
+        conn.execute(
+            "UPDATE tasks SET model_override='deepseek-v4-flash' WHERE id=?", (tid,),
+        )
+        conn.commit()
+        _drive_protocol_violation(conn, tid, 992003)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            "explicit max_retries=2 must override the first-strike limit"
+        )
+    finally:
+        conn.close()
