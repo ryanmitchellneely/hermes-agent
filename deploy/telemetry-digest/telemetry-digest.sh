@@ -44,10 +44,16 @@ HEARTBEAT="${TELEMETRY_DIGEST_HEARTBEAT:-$STORE/telemetry-digest-heartbeat.json}
 # own history the moment model_calls-*.jsonl rotates.
 COMMIT="${TELEMETRY_DIGEST_COMMIT:-0}"
 
+# --heartbeat is passed explicitly: commit_rollup below READS $HEARTBEAT to
+# learn what the run wrote, so if the digest were left to its own default the
+# two would disagree the moment TELEMETRY_DIGEST_HEARTBEAT is set — the digest
+# would write one path, the commit step would read another, find nothing, and
+# report "nothing committed" while every run still exited 0.
 python3 "$REPO/scripts/telemetry_digest.py" \
   --since "$WINDOW" \
   --interval-seconds "$INTERVAL_S" \
   --snapshot-dir "$SNAPSHOT_DIR" \
+  --heartbeat "$HEARTBEAT" \
   "$@"
 code=$?
 

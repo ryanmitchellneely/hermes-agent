@@ -1171,6 +1171,114 @@ def render_markdown(
     return "\n".join(lines) + "\n"
 
 
+# ── compact delivery body ──────────────────────────────────────────────────
+
+# Telegram rejects a sendMessage payload over 4096 characters outright, and
+# other push channels truncate silently. The full rendering is what the file
+# on disk is for; what gets DELIVERED has to fit in one message or it does not
+# arrive at all. Measured: the full surface runs ~7.6k chars on the live store,
+# so delivering it unmodified is not a near miss, it is a guaranteed failure.
+DELIVERY_BODY_LIMIT = 4096
+
+
+def render_compact(
+    summary: dict,
+    *,
+    store: Path,
+    window_label: str,
+    evictions: Optional[list[dict]] = None,
+    surface: Optional[Path] = None,
+    limit: int = DELIVERY_BODY_LIMIT,
+) -> str:
+    """Render the push-channel body: the decisions, not the whole surface.
+
+    Keeps only what makes someone act — success rate, where the money went,
+    and the warn flags — and points at the full surface for everything else.
+    The flag list is the one unbounded section, so it is what gets trimmed
+    when the body would overflow, and a trim ALWAYS says how many it dropped.
+    A silently shortened alert list is exactly the false confidence this
+    digest exists to refuse.
+    """
+    overall = summary["overall"]
+    head: list[str] = [f"Model usage · window {window_label}"]
+
+    if not summary["calls"]:
+        head += [
+            "",
+            "NO CALLS in this window — the emit sites may have stopped firing.",
+            f"store: {store}",
+        ]
+        return "\n".join(head) + "\n"
+
+    head += [
+        f"{summary['first_ts']} → {summary['last_ts']}",
+        "",
+        f"{overall['calls']:,} calls · {_rate_cell(overall)} ok · "
+        f"{overall['failures']:,} failed "
+        f"({overall['error']}e/{overall['timeout']}t/{overall['refusal']}r)",
+        f"{_tokens_cell(overall, 'total_tokens')} tokens"
+        + (
+            f" ({overall['calls_without_tokens']} call(s) carry none, excluded)"
+            if overall["calls_without_tokens"]
+            else ""
+        ),
+        f"wall p50 {_n(overall['wall_p50_ms'], ' ms')} · "
+        f"p95 {_n(overall['wall_p95_ms'], ' ms')}",
+        "",
+        "cost split:",
+    ]
+    for name in COST_CLASSES:
+        bucket = summary["by_cost_class"].get(name)
+        if not bucket or not bucket["calls"]:
+            continue
+        head.append(
+            f"  {name}: {bucket['calls']:,} calls · "
+            f"{_tokens_cell(bucket, 'total_tokens')} tok · "
+            f"{_cost_cell(bucket, summary['pricing_available'], cost_class=name)}"
+        )
+
+    tail: list[str] = [""]
+    idle = list(evictions or [])
+    if idle:
+        named = ", ".join(str(row.get("model")) for row in idle[:3])
+        more = f" (+{len(idle) - 3} more)" if len(idle) > 3 else ""
+        tail.append(f"eviction candidates (idle): {len(idle)} — {named}{more}")
+    else:
+        tail.append("eviction candidates (idle): none")
+    if surface is not None:
+        tail.append(f"full surface: {surface}")
+    tail_text = "\n".join(tail)
+
+    warns = [flag for flag in summary["flags"] if flag["severity"] == "warn"]
+    flag_lines = [f"  • {flag['subject']} — {flag['detail']}" for flag in warns]
+
+    body_parts = ["\n".join(head), ""]
+    body_parts.append(
+        f"decision flags ({len(warns)}):" if warns else "decision flags: none"
+    )
+
+    def assemble(shown: int) -> str:
+        parts = list(body_parts) + flag_lines[:shown]
+        omitted = len(flag_lines) - shown
+        if omitted:
+            parts.append(f"  … {omitted} more flag(s) — see the full surface")
+        parts.append(tail_text)
+        return "\n".join(parts) + "\n"
+
+    shown = len(flag_lines)
+    text = assemble(shown)
+    while shown > 0 and len(text) > limit:
+        shown -= 1
+        text = assemble(shown)
+
+    if len(text) > limit:
+        # Pathological case (huge store path, absurd limit): truncate rather
+        # than hand the channel a payload it will reject outright.
+        marker = "\n… truncated to fit the delivery limit; see the full surface\n"
+        text = text[: max(0, limit - len(marker))] + marker
+    return text
+
+
 # ── serialization ──────────────────────────────────────────────────────────
 
 
@@ -1383,6 +1491,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="emit the rollup as JSON instead of markdown")
     parser.add_argument("--quiet", action="store_true", help="write files but do not print the body")
     parser.add_argument(
+        "--compact",
+        action="store_true",
+        help=(
+            "print a short delivery body (headline, cost split, decision flags) "
+            f"that fits a push channel's {DELIVERY_BODY_LIMIT}-char limit. The "
+            "FULL surface is still written to disk; only stdout is shortened. "
+            "Ignored with --json, which is machine output."
+        ),
+    )
+    parser.add_argument(
         "--no-alert-on-empty",
         action="store_true",
         help="exit 0 when the window has no calls (default: exit 1, because a "
@@ -1522,8 +1640,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ),
             )
 
+        # What is WRITTEN is always the full surface; only what is DELIVERED
+        # gets shortened. Under a no-agent cron stdout is the message body, and
+        # a body over the channel limit is rejected or truncated at the edge —
+        # so the decision flags would be exactly what fell off the end.
+        delivery = body
+        if args.compact and not args.json:
+            delivery = render_compact(
+                summary,
+                store=root,
+                window_label=args.since,
+                evictions=evictions,
+                surface=surface_path,
+            )
+
         if not args.quiet:
-            print(body)
+            print(delivery)
 
         if empty and not args.no_alert_on_empty:
             print(

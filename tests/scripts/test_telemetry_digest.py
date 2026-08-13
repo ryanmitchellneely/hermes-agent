@@ -983,3 +983,226 @@ class TestSnapshotHistory:
         )
         assert code == 1                                  # the empty-window alert
         assert list(snapdir.glob("USAGE-DIGEST-*.md"))
+
+
+class TestCompactDeliveryBody:
+    """Under a no-agent cron, stdout IS the delivered message.
+
+    Telegram rejects a payload over 4096 chars outright; the full surface
+    measures ~7.6k on the live store. So an unshortened body is not a near
+    miss, it is guaranteed non-delivery — and the decision flags, which are
+    the entire reason the digest exists, are what fall off the end.
+    """
+
+    def _summary(self, rows):
+        summary = digest.summarize(rows, class_map={}, pricing=None)
+        summary["window"] = "24h"
+        return summary
+
+    def _many_flag_rows(self, n_models=40):
+        """Enough distinct under-performing models to blow any fixed budget."""
+        now_ms = int(__import__("time").time() * 1000)
+        rows = []
+        for i in range(n_models):
+            # A healthy majority in the lane, so the lane average is high...
+            for _ in range(20):
+                rows.append(_row(model="healthy", lane=f"lane{i}", ts_epoch_ms=now_ms))
+            # ...and one model clearly below it, which trips success_below_lane.
+            for _ in range(10):
+                rows.append(
+                    _row(
+                        model=f"bad-model-with-a-long-name-{i}",
+                        lane=f"lane{i}",
+                        outcome="error",
+                        ts_epoch_ms=now_ms,
+                    )
+                )
+        return rows
+
+    def test_body_fits_the_channel_limit_even_with_many_flags(self):
+        summary = self._summary(self._many_flag_rows())
+        assert len(summary["flags"]) > 20, "fixture must actually overflow"
+
+        body = digest.render_compact(
+            summary, store=Path("/store"), window_label="24h",
+            surface=Path("/store/USAGE-DIGEST-latest.md"),
+        )
+        assert len(body) <= digest.DELIVERY_BODY_LIMIT
+
+    def test_trimmed_flags_are_counted_never_silently_dropped(self):
+        summary = self._summary(self._many_flag_rows())
+        total = len([f for f in summary["flags"] if f["severity"] == "warn"])
+
+        body = digest.render_compact(
+            summary, store=Path("/store"), window_label="24h",
+            surface=Path("/store/USAGE-DIGEST-latest.md"),
+        )
+        shown = body.count("  • ")
+        assert shown < total, "fixture should force a trim"
+        assert f"… {total - shown} more flag(s)" in body
+
+    def test_untrimmed_when_everything_fits(self):
+        now_ms = int(__import__("time").time() * 1000)
+        rows = [_row(ts_epoch_ms=now_ms) for _ in range(5)]
+        summary = self._summary(rows)
+
+        body = digest.render_compact(
+            summary, store=Path("/store"), window_label="24h"
+        )
+        assert "more flag(s)" not in body
+        assert len(body) <= digest.DELIVERY_BODY_LIMIT
+
+    def test_body_carries_what_a_decision_needs(self):
+        now_ms = int(__import__("time").time() * 1000)
+        rows = [_row(ts_epoch_ms=now_ms) for _ in range(3)]
+        rows.append(_row(ts_epoch_ms=now_ms, outcome="timeout"))
+        summary = self._summary(rows)
+
+        body = digest.render_compact(
+            summary, store=Path("/store"), window_label="24h",
+            surface=Path("/store/USAGE-DIGEST-latest.md"),
+        )
+        assert "calls" in body and "ok" in body          # headline + success
+        assert "cost split:" in body                     # the cost lever
+        assert "decision flags" in body                  # the point of it all
+        assert "/store/USAGE-DIGEST-latest.md" in body   # where the rest lives
+
+    def test_pathological_limit_still_respects_the_ceiling(self):
+        """Truncation is a backstop, not a silent one."""
+        summary = self._summary(self._many_flag_rows())
+        body = digest.render_compact(
+            summary, store=Path("/store"), window_label="24h", limit=300
+        )
+        assert len(body) <= 300
+        assert "truncated" in body
+
+    def test_empty_window_says_so_rather_than_rendering_a_blank(self):
+        summary = self._summary([_row(ts_epoch_ms=1)])
+        summary["calls"] = 0
+        body = digest.render_compact(
+            summary, store=Path("/store"), window_label="24h"
+        )
+        assert "NO CALLS" in body
+
+    def test_compact_shortens_stdout_but_never_the_written_surface(
+        self, tmp_path, capsys
+    ):
+        """The file on disk is the archive; only the delivered body is short."""
+        now_ms = int(__import__("time").time() * 1000)
+        root = _store(tmp_path, self._many_flag_rows())
+        surface = tmp_path / "OUT.md"
+
+        code = digest.main(
+            ["--dir", str(root), "--since", "24h", "--out", str(surface),
+             "--no-heartbeat", "--compact"]
+        )
+        assert code == 0
+
+        printed = capsys.readouterr().out
+        full = surface.read_text()
+
+        assert len(printed) <= digest.DELIVERY_BODY_LIMIT + 1   # trailing \n
+        assert len(full) > digest.DELIVERY_BODY_LIMIT           # archive is whole
+        assert "# Model-call usage + success surface" in full
+        assert "# Model-call usage + success surface" not in printed
+
+    def test_json_mode_ignores_compact(self, tmp_path, capsys):
+        """--json is machine output; shortening it would corrupt the payload."""
+        now_ms = int(__import__("time").time() * 1000)
+        root = _store(tmp_path, [_row(ts_epoch_ms=now_ms)])
+        code = digest.main(
+            ["--dir", str(root), "--since", "24h", "--no-heartbeat",
+             "--json", "--compact"]
+        )
+        assert code == 0
+        json.loads(capsys.readouterr().out)      # parses => was not shortened
+
+
+class TestLauncherHeartbeatContract:
+    def test_launcher_passes_the_heartbeat_path_it_later_reads(self, tmp_path):
+        """commit_rollup READS $TELEMETRY_DIGEST_HEARTBEAT to learn what the
+        run wrote. If the launcher lets the digest fall back to its own default
+        the two disagree the moment the env var is set: the digest writes one
+        path, the commit step reads another, finds nothing, and reports
+        'nothing committed' while every run still exits 0.
+        """
+        import os
+        import subprocess
+
+        store = _store(
+            tmp_path, [_row(ts_epoch_ms=int(__import__("time").time() * 1000))]
+        )
+        heartbeat = tmp_path / "custom-hb.json"
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "T1000_TELEMETRY_DIR": str(store),
+                "TELEMETRY_DIGEST_HEARTBEAT": str(heartbeat),
+                "TELEMETRY_DIGEST_COMMIT": "0",
+                "T1000_REPO": str(REPO_ROOT),
+                "HOME": str(tmp_path / "fakehome"),
+            }
+        )
+
+        proc = subprocess.run(
+            [str(REPO_ROOT / "deploy" / "telemetry-digest" / "telemetry-digest.sh")],
+            capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert heartbeat.exists(), "digest ignored the launcher's heartbeat path"
+        assert json.loads(heartbeat.read_text())["surface"]
+
+
+class TestCronWrapperIsReachableByTheScheduler:
+    """cron/scheduler.py:_run_job_script resolves --script and then requires
+    the result to be inside $HERMES_HOME/scripts. Getting this wrong fails at
+    FIRE time, not creation time — the job is created happily and then never
+    delivers, which is the exact failure this digest exists to refuse."""
+
+    def _guard(self, scripts_dir: Path, value: str):
+        """The scheduler's rule, transcribed."""
+        raw = Path(value).expanduser()
+        path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+        try:
+            path.relative_to(scripts_dir.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def test_absolute_repo_path_is_blocked(self, tmp_path):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        launcher = REPO_ROOT / "deploy" / "telemetry-digest" / "telemetry-digest.sh"
+        assert not self._guard(scripts, str(launcher))
+
+    def test_symlink_into_the_repo_is_blocked(self, tmp_path):
+        """.resolve() follows the link back out, so a symlink cannot be used
+        as a shortcut around installing a real copy."""
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "link.sh").symlink_to(
+            REPO_ROOT / "deploy" / "telemetry-digest" / "telemetry_digest_cron.sh"
+        )
+        assert not self._guard(scripts, "link.sh")
+
+    def test_real_copy_named_bare_is_allowed(self, tmp_path):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        src = REPO_ROOT / "deploy" / "telemetry-digest" / "telemetry_digest_cron.sh"
+        (scripts / src.name).write_text(src.read_text(), encoding="utf-8")
+        assert self._guard(scripts, src.name)
+
+    def test_arm_script_names_the_wrapper_bare_not_by_absolute_path(self):
+        """Regression pin: the arming script previously passed an absolute
+        repo path, which the scheduler blocks at every fire."""
+        arm = (REPO_ROOT / "deploy" / "telemetry-digest" / "arm-hermes-cron.sh").read_text()
+        assert '--script "$WRAPPER_NAME"' in arm
+        assert '--script "$LAUNCHER"' not in arm
+
+    def test_wrapper_requests_the_compact_body(self):
+        """Delivery is the wrapper's whole job; a full body would be rejected."""
+        wrapper = (
+            REPO_ROOT / "deploy" / "telemetry-digest" / "telemetry_digest_cron.sh"
+        ).read_text()
+        assert "--compact" in wrapper

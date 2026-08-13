@@ -17,6 +17,8 @@ Answers the questions the store was opened for:
 | digest generator | `scripts/telemetry_digest.py` | yes (T1000) |
 | launcher (writes surface + heartbeat) | `deploy/telemetry-digest/telemetry-digest.sh` | yes (T1000) |
 | **delivery** schedule (**not armed**) | `deploy/telemetry-digest/arm-hermes-cron.sh` | yes (T1000) |
+| cron wrapper (source of truth) | `deploy/telemetry-digest/telemetry_digest_cron.sh` | yes (T1000) |
+| cron wrapper (installed copy) | `$HERMES_HOME/scripts/telemetry_digest_cron.sh` | yes (home repo, once armed) |
 | pull-only schedule (**not armed**) | `deploy/telemetry-digest/com.ryan.t1000-telemetry-digest.plist` | yes (T1000) |
 | markdown rollup | `~/.t1000/telemetry/USAGE-DIGEST-latest.md` | **yes (home repo)** |
 | dated rollup snapshots | `~/.t1000/telemetry/digests/USAGE-DIGEST-<date>.md` | **yes (home repo)** |
@@ -255,21 +257,64 @@ interchangeable:
 | `com.ryan.t1000-telemetry-digest.plist` → launchd | runs the launcher, stdout to a log file | no — pull-only refresh |
 
 `no_agent=True` means the script *is* the job: no LLM, no tokens, no agent
-loop. The launcher's "stdout is the delivery body" contract was written for
-exactly this and needs no change.
+loop. Two constraints make that path work, and both fail at **fire** time
+rather than at creation time — i.e. the job is created happily and then never
+delivers, which is precisely the silent-telemetry failure this surface exists
+to refuse.
+
+#### The script must live inside `$HERMES_HOME/scripts`
+
+`cron/scheduler.py:_run_job_script` resolves `--script` and then requires the
+result to sit inside the scripts dir:
+
+```python
+if raw.is_absolute(): path = raw.resolve()
+else:                 path = (scripts_dir / raw).resolve()
+path.relative_to(scripts_dir_resolved)   # else -> "Blocked: ..."
+```
+
+An absolute path into this repo is **not** exempt — it is resolved and then
+rejected. A **symlink is rejected too**, because `.resolve()` follows it back
+out of the scripts dir. Verified against the live guard:
+
+```
+BLOCKED : ~/Documents/T1000/deploy/telemetry-digest/telemetry-digest.sh
+BLOCKED : <scripts>/link.sh -> (repo)
+ALLOWED : telemetry_digest_cron.sh          # real file copy, bare name
+```
+
+Hence `deploy/telemetry-digest/telemetry_digest_cron.sh`: `arm-hermes-cron.sh`
+installs it as a real copy under `$HERMES_HOME/scripts/` and passes the **bare
+filename**. Cron is per-profile (the scheduler resolves `HERMES_HOME` at call
+time), so arm it from the same profile whose gateway runs cron — the dry run
+prints the target dir and warns when it is not `~/.t1000/scripts`, where the
+existing no-agent jobs live.
+
+#### The delivered body must fit the channel
+
+Telegram rejects a `sendMessage` payload over **4096** characters outright.
+The full surface measures **~7.6k** on the live store, so delivering it
+unmodified is a guaranteed failure, and the decision flags are what would fall
+off the end. The wrapper therefore passes `--compact`, which shortens **only
+stdout** — headline, cost split, decision flags, and a pointer to the full
+surface (~800 chars on the live store). The file on disk is still written in
+full. When there are more flags than fit, the body says how many it dropped;
+it never trims them silently.
 
 ### Arm the delivering schedule — human gate, not yet done
 
 Dry run by default, because arming starts a recurring outbound message:
 
 ```bash
-deploy/telemetry-digest/arm-hermes-cron.sh          # prints what it would create
-deploy/telemetry-digest/arm-hermes-cron.sh --yes    # actually creates it
+deploy/telemetry-digest/arm-hermes-cron.sh          # prints what it would install + create
+HERMES_HOME=~/.t1000 deploy/telemetry-digest/arm-hermes-cron.sh --yes
 ```
 
 Defaults: `30 8 * * *`, `--deliver telegram`, `--no-agent`. Override with
 `TELEMETRY_DIGEST_SCHEDULE`, `TELEMETRY_DIGEST_DELIVER` (use `local` to save
-runs without sending anything).
+runs without sending anything). The installed wrapper sets
+`TELEMETRY_DIGEST_COMMIT=1` so the scheduled run keeps the rollup's history;
+set it to `0` in the wrapper to render without committing. It never pushes.
 
 Verify: `hermes cron list` · Disarm: `hermes cron remove <job_id>`
 

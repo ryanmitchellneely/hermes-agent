@@ -31,28 +31,68 @@ done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER="$HERE/telemetry-digest.sh"
+WRAPPER_SRC="$HERE/telemetry_digest_cron.sh"
 
 SCHEDULE="${TELEMETRY_DIGEST_SCHEDULE:-30 8 * * *}"
 DELIVER="${TELEMETRY_DIGEST_DELIVER:-telegram}"
 NAME="${TELEMETRY_DIGEST_JOB_NAME:-telemetry-digest}"
 
-[ -x "$LAUNCHER" ] || { echo "not executable: $LAUNCHER" >&2; exit 2; }
+# cron/scheduler.py:_run_job_script requires --script to resolve INSIDE
+# $HERMES_HOME/scripts. An absolute path into this repo is resolved and then
+# rejected ("Blocked: script path resolves outside the scripts directory"), and
+# a symlink is followed back out and rejected the same way — so the wrapper is
+# installed as a real file copy and named by its BARE filename.
+#
+# Cron is per-profile (scheduler resolves HERMES_HOME at call time), so the
+# install target is computed here rather than hardcoded: arm this from the same
+# profile whose gateway will run the job.
+SCRIPTS_DIR="${HERMES_HOME:-$HOME/.t1000}/scripts"
+WRAPPER_NAME="$(basename "$WRAPPER_SRC")"
+WRAPPER_DST="$SCRIPTS_DIR/$WRAPPER_NAME"
 
-# Absolute path on purpose: `--script` resolves RELATIVE paths under
-# $HERMES_HOME/scripts/, and this launcher lives in the repo.
+[ -x "$LAUNCHER" ] || { echo "not executable: $LAUNCHER" >&2; exit 2; }
+[ -f "$WRAPPER_SRC" ] || { echo "missing wrapper: $WRAPPER_SRC" >&2; exit 2; }
+
+# Preflight the guard itself rather than trusting this comment to stay true.
+python3 - "$SCRIPTS_DIR" "$WRAPPER_NAME" <<'PY' || exit 2
+import sys
+from pathlib import Path
+scripts_dir = Path(sys.argv[1]).expanduser().resolve()
+target = (scripts_dir / sys.argv[2]).resolve()
+try:
+    target.relative_to(scripts_dir)
+except ValueError:
+    sys.exit(f"preflight FAILED: {target} resolves outside {scripts_dir}")
+PY
+
 cmd=(hermes cron add "$SCHEDULE"
      --name "$NAME"
-     --script "$LAUNCHER"
+     --script "$WRAPPER_NAME"
      --no-agent
      --deliver "$DELIVER")
 
 if [ "$CONFIRMED" = "1" ]; then
+  mkdir -p "$SCRIPTS_DIR"
+  # Real copy, never a symlink: .resolve() would follow a link back into the
+  # repo and the sandbox check would reject it at fire time.
+  cp -f "$WRAPPER_SRC" "$WRAPPER_DST"
+  chmod +x "$WRAPPER_DST"
+  echo "installed wrapper: $WRAPPER_DST" >&2
   exec "${cmd[@]}"
 fi
 
 {
-  printf 'DRY RUN — nothing armed. Would create:\n\n  '
+  printf 'DRY RUN — nothing armed. Would install:\n\n  %s\n    -> %s\n' \
+    "$WRAPPER_SRC" "$WRAPPER_DST"
+  printf '\nand create:\n\n  '
   printf '%q ' "${cmd[@]}"
   printf '\n\nDelivery target: %s (TELEMETRY_DIGEST_DELIVER to change).\n' "$DELIVER"
-  printf 'Re-run with --yes to create it.\n'
+  printf 'Scripts dir: %s (from $HERMES_HOME; cron is per-profile).\n' "$SCRIPTS_DIR"
+  if [ "$SCRIPTS_DIR" != "$HOME/.t1000/scripts" ]; then
+    printf '\nNOTE: that is NOT %s/.t1000/scripts, where the existing no-agent\n' "$HOME"
+    printf 'jobs live. The scheduler resolves $HERMES_HOME at FIRE time, so arm\n'
+    printf 'this from the same profile whose gateway runs cron, e.g.:\n'
+    printf '  HERMES_HOME=%s/.t1000 %s --yes\n' "$HOME" "${BASH_SOURCE[0]}"
+  fi
+  printf 'Re-run with --yes to install and create it.\n'
 } >&2
