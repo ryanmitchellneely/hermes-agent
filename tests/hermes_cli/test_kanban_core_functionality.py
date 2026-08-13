@@ -1484,3 +1484,33 @@ def test_explicit_max_retries_overrides_first_strike(kanban_home):
         )
     finally:
         conn.close()
+
+
+def test_empty_completion_is_refused(kanban_home):
+    """THE EVIDENCE FLOOR (2026-08-13): 22 of 30 completions in six hours had
+    no result, no summary, and zero commits — done-counts became fiction. A
+    completion must state a deliverable or be refused."""
+    import pytest as _pytest
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="evidence floor", assignee="worker")
+        with _pytest.raises(ValueError, match="not a completion"):
+            kb.complete_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task.status != "done", "empty completion must not transition the task"
+        # with evidence, it completes
+        assert kb.complete_task(conn, tid, result="did the thing: file X, commit Y")
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()
+
+
+def test_summary_only_completion_still_allowed(kanban_home):
+    """The documented summary-only pattern must survive the evidence floor."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="summary path", assignee="worker")
+        assert kb.complete_task(conn, tid, summary="handoff: schema landed, children can read fields A/B")
+        assert kb.get_task(conn, tid).status == "done"
+    finally:
+        conn.close()

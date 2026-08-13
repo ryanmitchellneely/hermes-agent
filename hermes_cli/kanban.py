@@ -2351,13 +2351,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     )
                 print(f"kanban: {fail_open_note}", file=sys.stderr)
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                _completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except ValueError as exc:
+                failed.append(tid)
+                print(f"cannot complete {tid}: {exc}")
+                continue
+            if not _completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

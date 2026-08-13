@@ -5380,6 +5380,22 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    # EVIDENCE FLOOR (2026-08-13): a completion must SAY what was done.
+    # Measured that afternoon: 22 of 30 completions in six hours carried no
+    # result, no summary, and (sampled) zero commits on their branches — the
+    # protocol-violation error text ("report the result via kanban_complete")
+    # had taught weak models to call complete as an exit ritual, and
+    # done-counts became fiction. Either field satisfies the floor because a
+    # documented summary-only pattern exists (see the workspace-custody notes);
+    # an EMPTY completion is refused loudly so the worker states a deliverable
+    # or calls kanban_block with what is missing.
+    if not ((result or "").strip() or (summary or "").strip()):
+        raise ValueError(
+            "kanban_complete refused: empty result AND empty summary. State "
+            "what was actually done (files, commits, findings) in result=..., "
+            "or call kanban_block naming what is missing. A completion with "
+            "no evidence is not a completion."
+        )
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
