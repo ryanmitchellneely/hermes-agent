@@ -2417,7 +2417,15 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                current = kb.get_task(conn, tid)
+                if current is None:
+                    print(f"cannot block {tid} (no such task)", file=sys.stderr)
+                else:
+                    print(
+                        f"cannot block {tid}: status is '{current.status}' "
+                        "(block only transitions from running/ready)",
+                        file=sys.stderr,
+                    )
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.

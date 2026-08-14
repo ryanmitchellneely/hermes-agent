@@ -76,6 +76,22 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_create_initial_status_blocked_is_not_auto_promoted(kanban_home: Path) -> None:
+    """A task created directly with ``initial_status='blocked'`` (the
+    create-then-force-block pattern pr-kanban-sync used, t_0d09575a) must
+    stay blocked across dispatcher ticks just like an explicit
+    ``kanban_block()`` call — no separate ``block()`` call required, and
+    none should be needed: ``block_task`` only transitions from
+    running/ready, so a redundant force-block after a blocked-create
+    always failed with "cannot block"."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="HUMAN review: PR #1", initial_status="blocked")
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        for _ in range(5):
+            promoted = kb.recompute_ready(conn)
+            assert promoted == 0, "initial_status=blocked task must not auto-promote"
+            assert kb.get_task(conn, tid).status == "blocked"
 
 
 # ---------------------------------------------------------------------------

@@ -3507,6 +3507,27 @@ def create_task(
                         "estimate_status": estimate_status,
                     },
                 )
+                if initial_status == "blocked":
+                    # Without a "blocked" event, _has_sticky_block() sees no
+                    # blocked/unblocked history for this task and treats it
+                    # as non-sticky (t_0d09575a) — recompute_ready() then
+                    # vacuously promotes a parentless card straight back to
+                    # ready on its very next tick, since block_task() was
+                    # never called to record who/why it's parked. Emit the
+                    # same event block_task() would, so the sticky-block and
+                    # unblock-loop machinery see this exactly like an
+                    # explicit kanban_block() call.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked at creation",
+                            "kind": None,
+                            "recurrences": 1,
+                            "source_status": "ready",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
