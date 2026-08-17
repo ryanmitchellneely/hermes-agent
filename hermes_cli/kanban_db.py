@@ -172,6 +172,44 @@ _LOCAL_OLLAMA_PROVIDER_NAMES = frozenset(
 )
 
 
+def _profile_worker_command(hermes_home) -> "Optional[list[str]]":
+    """Return the assigned profile's ``kanban.worker_command`` argv, if any.
+
+    A profile whose config.yaml sets ``kanban.worker_command: [argv...]`` runs
+    that executable as its kanban worker instead of the hermes CLI loop. The
+    child inherits the full kanban env contract (HERMES_KANBAN_TASK /
+    WORKSPACE / BOARD / DB, profile-scoped HERMES_HOME, TERMINAL_CWD) and owes
+    the same lifecycle: exactly one terminal kanban call, or the kernel reaps
+    it as crashed. This is the paved path for foreign-runtime lanes
+    (kanban-worker-lanes.md previously named this "not yet a paved path");
+    hermes-specific per-task flags (model_override, skills, goal_mode) do not
+    apply to a foreign runtime and are ignored.
+    """
+    if not hermes_home:
+        return None
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(hermes_home)
+        try:
+            cfg = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        raw = ((cfg.get("kanban") or {}).get("worker_command")) if isinstance(cfg, dict) else None
+        if not raw or not isinstance(raw, (list, tuple)):
+            return None
+        argv = [str(part) for part in raw if str(part).strip()]
+        return argv or None
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not resolve worker_command for HERMES_HOME=%r (%s)",
+            hermes_home,
+            exc,
+        )
+        return None
+
+
 def _default_local_ollama_reasoning(task: "Task") -> Optional[str]:
     """Default ``none`` for local-Ollama kanban pins without explicit effort.
 
@@ -10639,6 +10677,13 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    # Foreign-runtime lane override: replace the fully-assembled hermes argv
+    # with the profile's own worker command. Deliberately AFTER assembly and
+    # not a branch around it — the tiny wasted assembly keeps this a two-line
+    # seam that upstream rebases can't conflict with.
+    _worker_command = _profile_worker_command(env.get("HERMES_HOME"))
+    if _worker_command:
+        cmd = _worker_command
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
