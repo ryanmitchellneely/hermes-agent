@@ -1415,27 +1415,31 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
 
 
 
-def test_flash_protocol_violation_blocks_on_first_strike(kanban_home):
-    """A flash-class model gets NO protocol-violation retries.
+def test_flash_protocol_violation_allows_exactly_one_retry(kanban_home):
+    """A flash-class model gets EXACTLY ONE protocol-violation retry.
 
-    THE MEASUREMENT THIS PINS (2026-08-13): deepseek-v4-flash completed 2 of 36
-    runs; its clean-exit-no-verb crashes do not heal on retry with the same
-    model (3-4 consecutive violations per burn case), and the dispatcher's 90s
-    respawn beats the 3m escalate cron on ready cards — so each granted retry
-    is wall-clock the ladder cannot claw back. One violation must park the card
-    where the sidecar can escalate it.
+    Ryan's FLIP (2026-08-17) moved deepseek-v4-flash from zero retries (the
+    2026-08-11 6-wide-era first-strike measurement) to a one-retry tier
+    (limit == 2): the first clean-exit violation stays at ``ready`` for one
+    respawn, and the second clean-exit violation parks the card at ``blocked``
+    so the escalate ladder can act within a cron tick. This pins limit==2.
     """
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="flash first strike", assignee="worker")
+        tid = kb.create_task(conn, title="flash one retry", assignee="worker")
         conn.execute(
             "UPDATE tasks SET model_override='deepseek-v4-flash' WHERE id=?", (tid,),
         )
         conn.commit()
         _drive_protocol_violation(conn, tid, 992001)
         task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"first violation on flash must still retry once, got {task.status}"
+        )
+        _drive_protocol_violation(conn, tid, 992002)
+        task = kb.get_task(conn, tid)
         assert task.status == "blocked", (
-            f"first violation on a first-strike model must block, got {task.status}"
+            f"second violation on flash must park the card, got {task.status}"
         )
     finally:
         conn.close()
@@ -1445,8 +1449,8 @@ def test_capable_model_keeps_bounded_violation_retries(kanban_home):
     """The negative control: the 96%-heal measurement stays honored elsewhere.
 
     Without this, a change that set the limit to 1 GLOBALLY would pass the
-    first-strike test above while silently reverting the bounded-retry design
-    for capable models.
+    one-retry flash test above while silently reverting the bounded-retry
+    design for capable models.
     """
     conn = kb.connect()
     try:
@@ -1465,8 +1469,8 @@ def test_capable_model_keeps_bounded_violation_retries(kanban_home):
         conn.close()
 
 
-def test_explicit_max_retries_overrides_first_strike(kanban_home):
-    """Per-task max_retries keeps top precedence over the first-strike set."""
+def test_explicit_max_retries_overrides_one_retry_tier(kanban_home):
+    """Per-task max_retries keeps top precedence over the one-retry tier."""
     conn = kb.connect()
     try:
         tid = kb.create_task(
@@ -1480,7 +1484,7 @@ def test_explicit_max_retries_overrides_first_strike(kanban_home):
         _drive_protocol_violation(conn, tid, 992003)
         task = kb.get_task(conn, tid)
         assert task.status == "ready", (
-            "explicit max_retries=2 must override the first-strike limit"
+            "explicit max_retries=2 must override the one-retry tier limit"
         )
     finally:
         conn.close()

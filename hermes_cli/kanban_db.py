@@ -8752,20 +8752,23 @@ def _error_fingerprint(error_text: str) -> str:
 # precedence ``_record_task_failure`` documents for every other failure kind.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 
-# Models that get NO protocol-violation retries: one clean-exit-without-verb
-# and the task blocks so the escalate ladder can move it within a cron tick.
+# deepseek-v4-flash gets EXACTLY ONE protocol-violation retry (limit == 2): a
+# first clean-exit-without-verb stays at ``ready`` for one respawn, and the
+# second clean-exit violation parks the card at ``blocked`` so the escalate
+# ladder can act within a cron tick.
 #
-# This deliberately narrows the "~96% complete on a later run" measurement
-# behind the bounded retry above — that number is dominated by capable models
-# where a finalize nudge lands next attempt. deepseek-v4-flash is the
-# counterexample, measured 2026-08-13 across all boards: 36 flash-profile runs,
-# 2 completed, 20 crashed (55.6%), and the two live burn cases each spent 3-4
-# consecutive violations (63 min on t_25a59802, ~32 min on t_d107022a's C4 run)
-# before gave_up finally parked them where the escalate sidecar could act. The
-# dispatcher's 90s respawn beats the 3m escalate cron on ready cards, so every
-# retry granted here is wall-clock the ladder cannot claw back. Small sample
-# (n=36, 3 cards) — if flash starts finishing M cards, shrink or empty this set.
-_PROTOCOL_VIOLATION_FIRST_STRIKE_MODELS = frozenset({"deepseek-v4-flash"})
+# This supersedes the 2026-08-11 6-wide-era measurement (kevin-real-estate-tools
+# KB doc / DEEPSEEK-HARNESS-LANE.md D3) that gave flash ZERO retries: 36
+# flash-profile runs across boards measured 55.6% crashed, and the two live burn
+# cases each spent 3-4 consecutive violations before gave_up parked them. Flash
+# clean-exit crashes do not heal on retry with the same model, so flash stays
+# below the general 3-limit above; Ryan's FLIP (2026-08-17) softened that to one
+# granted retry so a finalize nudge can land once before the second violation
+# hands the card to the escalate ladder. The old "shrink or empty this set once
+# flash finishes M cards" exit was unreachable — flash never healed — and is
+# dropped: the ladder wins the wall-clock race at ``blocked``, not at the ready
+# respawn the 90s dispatcher beats the 3m escalate cron on.
+_PROTOCOL_VIOLATION_ONE_RETRY_MODELS = frozenset({"deepseek-v4-flash"})
 
 # How far back to walk a task's closed runs when counting the violation
 # streak. The streak trips at a handful of violations, so anything beyond a
@@ -9044,8 +9047,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # Explicit per-task budget keeps top precedence, as for
                     # every other failure kind.
                     violation_limit = int(task_override)
-                elif _model in _PROTOCOL_VIOLATION_FIRST_STRIKE_MODELS:
-                    violation_limit = 1
+                elif _model in _PROTOCOL_VIOLATION_ONE_RETRY_MODELS:
+                    # Flash-class models get exactly one retry (limit == 2):
+                    # the second clean-exit violation parks the card.
+                    violation_limit = 2
                 else:
                     violation_limit = _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 if streak < violation_limit:
