@@ -10629,6 +10629,30 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    # Launchd-spawned workers run outside the login session, so `gh` — which
+    # reads only GH_TOKEN/GITHUB_TOKEN and cannot use a git credential
+    # helper — has no credential path at all (git itself is covered by a
+    # GIT_CONFIG_GLOBAL credential helper). When the operator names a token
+    # helper command, run it and export its stdout as GH_TOKEN. Best-effort:
+    # a mint failure must never block the spawn — the worker just runs
+    # without GitHub, exactly as it would have before. An inherited
+    # GH_TOKEN/GITHUB_TOKEN wins; the helper is a fallback, not an override.
+    _gh_token_cmd = env.get("HERMES_KANBAN_GH_TOKEN_CMD", "").strip()
+    if _gh_token_cmd and not env.get("GH_TOKEN") and not env.get("GITHUB_TOKEN"):
+        try:
+            _mint = subprocess.run(  # noqa: S603 -- operator-configured helper
+                [_gh_token_cmd],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if _mint.returncode == 0 and _mint.stdout.strip():
+                env["GH_TOKEN"] = _mint.stdout.strip()
+        except Exception:
+            _log.debug(
+                "kanban: GH_TOKEN helper failed for task %s", task.id, exc_info=True
+            )
+
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
