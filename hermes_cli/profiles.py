@@ -680,6 +680,19 @@ def _read_distribution_meta(profile_dir: Path) -> tuple:
         return None, None, None
 
 
+def resolve_profile_default_model(name: str) -> tuple:
+    """Return ``(model, provider)`` a profile resolves to with no task override.
+
+    Used by the kanban dispatcher to stamp ``task_runs`` for profile-default
+    runs (FLEET-ECON-0). Thin wrapper over :func:`_read_config_model`.
+    """
+    try:
+        profile_dir = get_profile_dir(name)
+    except ValueError:
+        return None, None
+    return _read_config_model(profile_dir)
+
+
 def _read_config_model(profile_dir: Path) -> tuple:
     """Read model/provider from a profile's config.yaml. Returns (model, provider)."""
     config_path = profile_dir / "config.yaml"

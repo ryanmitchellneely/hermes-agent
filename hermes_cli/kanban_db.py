@@ -1268,6 +1268,8 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    resolved_model: Optional[str] = None
+    resolved_provider: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1275,6 +1277,7 @@ class Run:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+        keys = row.keys()
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1292,6 +1295,12 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            resolved_model=(
+                row["resolved_model"] if "resolved_model" in keys else None
+            ),
+            resolved_provider=(
+                row["resolved_provider"] if "resolved_provider" in keys else None
+            ),
         )
 
 
@@ -1485,7 +1494,12 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Model/provider resolved at claim time (FLEET-ECON-0). Task override
+    -- when set, else the claiming profile's config.yaml default. NULL is
+    -- honest for pre-column rows and for runs that never had a worker.
+    resolved_model      TEXT,
+    resolved_provider   TEXT
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2680,6 +2694,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "ON task_events(run_id, id)"
     )
 
+    # FLEET-ECON-0: stamp the model that will serve the run even when the
+    # task has no model_override. Existing rows stay NULL until backfill.
+    runs_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "resolved_model" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "resolved_model", "resolved_model TEXT")
+        if "resolved_provider" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "resolved_provider", "resolved_provider TEXT"
+            )
+
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
     ).fetchone() is not None
@@ -2812,7 +2840,7 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, resolved_model TEXT, resolved_provider TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -9305,6 +9333,57 @@ def _record_task_failure(
     return blocked
 
 
+def _resolve_run_model_attribution(claimed: "Task") -> tuple:
+    """Resolve the ``(model, provider)`` that will actually serve this run.
+
+    Task-level ``model_override``/``provider_override`` win when set.
+    Otherwise resolve the claiming profile's ``config.yaml`` default — the
+    last point the dispatcher can observe before the worker subprocess
+    starts. Live fallbacks inside the worker stay invisible here; per-call
+    telemetry is the SoT for what answered. NULL is honest when nothing
+    is resolvable. See FLEET-ECON-0 (t_e7e74c61).
+    """
+    if claimed.model_override:
+        return claimed.model_override, claimed.provider_override
+    if not claimed.assignee:
+        return None, None
+    try:
+        from hermes_cli.profiles import resolve_profile_default_model
+    except Exception:
+        return None, None
+    try:
+        return resolve_profile_default_model(claimed.assignee)
+    except Exception:
+        return None, None
+
+
+def _stamp_run_model_attribution(conn: sqlite3.Connection, claimed: "Task") -> None:
+    """Persist the resolved model/provider onto ``claimed``'s current run row.
+
+    Best-effort telemetry stamp, not load-bearing for dispatch. A write
+    failure must not abort the caller's tick (would strand a claimed task
+    that never spawned).
+    """
+    if claimed.current_run_id is None:
+        return
+    model, provider = _resolve_run_model_attribution(claimed)
+    if not model and not provider:
+        return
+    try:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET resolved_model = ?, resolved_provider = ? "
+                "WHERE id = ?",
+                (model, provider, claimed.current_run_id),
+            )
+    except Exception:
+        _log.debug(
+            "kanban: model attribution stamp failed for run %s",
+            claimed.current_run_id,
+            exc_info=True,
+        )
+
+
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
 def _record_spawn_failure(
@@ -10036,6 +10115,7 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        _stamp_run_model_attribution(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10174,6 +10254,7 @@ def _dispatch_once_locked(
         )
         if claimed is None:
             continue
+        _stamp_run_model_attribution(conn, claimed)
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
