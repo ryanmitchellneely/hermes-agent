@@ -41,6 +41,14 @@ STATE_PATH = DESK / "cache" / "playbook-sweep-state.json"
 HEARTBEAT_PATH = DESK / "cache" / "playbook-sweep-heartbeat.json"
 WINDOW_SECS = int(os.environ.get("PLAYBOOK_WINDOW_SECS") or 24 * 3600)
 STALE_DAYS = int(os.environ.get("PLAYBOOK_STALE_DAYS") or 90)
+# A blocked run carrying one of these is a deliberate human gate, not a
+# failure — never a miss candidate (lowercase; matched as substrings).
+DELIBERATE_PARK_MARKERS = [
+    "do not free-fire",
+    "human pr review",
+    "not for unattended dispatch",
+    "waits on",
+]
 HERMES = os.environ.get("PLAYBOOK_HERMES_BIN", str(Path.home() / ".local" / "bin" / "hermes"))
 
 
@@ -248,6 +256,13 @@ def sweep(dry_run: bool = False) -> dict:
             counts["failures"] += 1
             matched = match_entries(entries, failure["text"])
             if not matched:
+                # Deliberate parks are not failures: a run blocked by design
+                # (human gates, pr-kanban-sync holds) must not nominate
+                # itself as a missing playbook entry. First live run proved
+                # the need — 3 of 3 surfaced "candidates" were review holds.
+                hay = (failure["text"] or "").lower()
+                if any(m in hay for m in DELIBERATE_PARK_MARKERS):
+                    continue
                 # Corpus growth: an unmatched failure is a candidate entry.
                 # Deduped per (board, task) in state; surfaced max 3 per run
                 # so the Telegram line stays a nudge, not a firehose.

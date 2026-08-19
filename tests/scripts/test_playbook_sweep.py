@@ -215,3 +215,21 @@ def test_repair_budget_is_a_hard_stop(sweep_mod, tmp_path, capsys):
     out = capsys.readouterr().out
     assert counts["repairs"] == sweep_mod.REPAIR_BUDGET == 3
     assert "repair budget spent" in out
+
+
+def test_deliberate_parks_never_nominate_as_misses(sweep_mod, tmp_path, capsys):
+    """A run blocked by design (human gate) is not a failure — the first
+    live run surfaced 3 review-holds as 'candidates', hence this filter."""
+    now = int(time.time())
+    _mk_board(
+        tmp_path, "mesh",
+        [
+            ("t_gate", "blocked", "HUMAN PR review — do not free-fire. Sticky.", None, now - 60),
+            ("t_real", "crashed", "novel genuine failure zzz", None, now - 60),
+        ],
+    )
+    sweep_mod.comment_hit = lambda *a: True
+    counts = sweep_mod.sweep(dry_run=False)
+    out = capsys.readouterr().out
+    assert counts["misses"] == 1
+    assert "t_real" in out and "t_gate" not in out
