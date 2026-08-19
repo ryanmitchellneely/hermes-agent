@@ -233,3 +233,64 @@ def test_deliberate_parks_never_nominate_as_misses(sweep_mod, tmp_path, capsys):
     out = capsys.readouterr().out
     assert counts["misses"] == 1
     assert "t_real" in out and "t_gate" not in out
+
+
+def _pb_entry(tmp_path, extra_fm=""):
+    pb = tmp_path / "pbg"
+    pb.mkdir(exist_ok=True)
+    (pb / "PB-901-gate.md").write_text(
+        '---\nid: PB-901\nclass: t\nmatch:\n  - "gateboom"\nverified: 2026-08-19\n'
+        'sources:\n  - "x"\nrepair: "patch something"\nrepair_assignee: worker\n'
+        f"repair_auto: true\n{extra_fm}---\n\n**Fix:** f\n",
+        encoding="utf-8",
+    )
+    return pb
+
+
+def test_gauntlet_gate_fail_closed_undeclared_repair_never_arms(sweep_mod, tmp_path):
+    """t_18792526 rule: no repair_class declaration => patch-class => parked,
+    even with repair_auto: true. Arming a patch requires the ADR-073
+    promotion-record path, which does not exist yet."""
+    entries = sweep_mod.parse_entries(_pb_entry(tmp_path))
+    assert entries[0]["repair_class"] == "patch"
+    blocks = []
+    real_run = sweep_mod.subprocess.run
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 0
+            stdout = "Created t_9999beef\n"
+        if "block" in cmd:
+            blocks.append(cmd)
+        return R()
+
+    sweep_mod.subprocess.run = fake_run
+    try:
+        new_id = sweep_mod.draft_repair_card("mesh", "t_src", entries[0], dry_run=False)
+    finally:
+        sweep_mod.subprocess.run = real_run
+    assert new_id == "t_9999beef"
+    assert len(blocks) == 1 and "GAUNTLET GATE" in blocks[0][6]
+
+
+def test_report_class_with_auto_still_arms(sweep_mod, tmp_path):
+    entries = sweep_mod.parse_entries(_pb_entry(tmp_path, "repair_class: report\n"))
+    assert entries[0]["repair_class"] == "report"
+    blocks = []
+    real_run = sweep_mod.subprocess.run
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 0
+            stdout = "Created t_8888beef\n"
+        if "block" in cmd:
+            blocks.append(cmd)
+        return R()
+
+    sweep_mod.subprocess.run = fake_run
+    try:
+        new_id = sweep_mod.draft_repair_card("mesh", "t_src", entries[0], dry_run=False)
+    finally:
+        sweep_mod.subprocess.run = real_run
+    assert new_id == "t_8888beef"
+    assert blocks == []  # armed: no block call

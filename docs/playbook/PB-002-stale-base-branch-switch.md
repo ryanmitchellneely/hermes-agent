@@ -11,6 +11,7 @@ sources:
 repair: "REPORT-ONLY deploy-drift audit, modify nothing: run md5 -q on ~/.t1000/bin/dsh_kanban_worker.py and on ~/.t1000/src/kevin-real-estate-tools/docs/agent-coordination/devbot/harness-bench/dsh_kanban_worker.py, then the same pair for dsh-k2-local.yml. Completion summary must state MATCH or MISMATCH per file pair with both hashes. A MISMATCH means the deployed dsh lane is running code that diverged from canonical — say so explicitly. Do not edit, copy, or delete anything."
 repair_assignee: worker
 repair_auto: true
+repair_class: report
 ---
 
 **Symptom:** an automated git flow fails switching/creating a branch with

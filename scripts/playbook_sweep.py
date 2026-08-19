@@ -69,6 +69,7 @@ def parse_entries(playbook_dir: Path) -> list[dict]:
         repair = re.search(r'^repair:\s*"(.*)"\s*$', head, re.M)
         repair_assignee = re.search(r"^repair_assignee:\s*(\S+)", head, re.M)
         repair_auto = re.search(r"^repair_auto:\s*true\s*$", head, re.M)
+        repair_class = re.search(r"^repair_class:\s*(\S+)", head, re.M)
         if pid and patterns:
             entries.append(
                 {
@@ -86,6 +87,15 @@ def parse_entries(playbook_dir: Path) -> list[dict]:
                         repair_assignee.group(1) if repair_assignee else "worker"
                     ),
                     "repair_auto": bool(repair_auto),
+                    # Gauntlet gate (t_18792526, Ryan approved 2026-08-19):
+                    # FAIL CLOSED — an entry that does not explicitly declare
+                    # repair_class: report is treated as patch-class, and
+                    # patch-class repairs can never arm from here: they park
+                    # until a Gauntlet promotion record exists (ADR-073
+                    # packet-1 schema) and Kevin's K2-side half is ruled.
+                    "repair_class": (
+                        repair_class.group(1) if repair_class else "patch"
+                    ),
                 }
             )
     return entries
@@ -217,12 +227,28 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
     if create.returncode != 0 or not m:
         return None
     new_id = m.group(1)
-    if not entry["repair_auto"]:
+    # repair_auto only means "armed" for report-class repairs. Patch-class
+    # (the fail-closed default) always parks: arming it requires the ADR-073
+    # promotion-record path, which does not exist yet (t_18792526 half b/c).
+    armed = entry["repair_auto"] and entry["repair_class"] == "report"
+    if not armed:
+        if entry["repair_class"] != "report":
+            reason = (
+                f"GAUNTLET GATE ({entry['id']} is {entry['repair_class']}-class): "
+                f"a patch-producing repair cannot arm without an ADR-073 "
+                f"promotion record; K2-side candidate-class registration is "
+                f"pending Kevin's ruling (design: mesh t_18792526). Human may "
+                f"still run this attended."
+            )
+        else:
+            reason = (
+                f"auto-drafted repair for {entry['id']} — human: unblock to arm, "
+                f"archive if the hit was noise"
+            )
         subprocess.run(
             [
                 HERMES, "kanban", "--board", board, "block", new_id,
-                f"auto-drafted repair for {entry['id']} — human: unblock to arm, "
-                f"archive if the hit was noise",
+                reason,
                 "--kind", "needs_input",
             ],
             capture_output=True,
@@ -231,7 +257,7 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
         )
     print(
         f"PLAYBOOK REPAIR drafted: {board}/{new_id} ({entry['id']}, "
-        f"{'ARMED' if entry['repair_auto'] else 'parked needs_input'})"
+        f"{'ARMED' if armed else 'parked needs_input'})"
     )
     return new_id
 
