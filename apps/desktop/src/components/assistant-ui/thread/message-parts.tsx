@@ -16,7 +16,7 @@ import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { SCAFFOLD_LABEL_CLASS, SCAFFOLD_META_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
 import { useI18n } from '@/i18n'
 import { generatedImageFromResult } from '@/lib/generated-images'
-import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
+import { formatLocalReasoning } from '@/lib/reasoning-blocks'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 
@@ -174,7 +174,7 @@ const ThinkingDisclosure: FC<{
             // and inherits the disclosure-level opacity fade defined in
             // styles.css (~0.67 at rest, 1 on hover/focus).
             'mt-0.5 w-full min-w-0 max-w-full overflow-hidden wrap-anywhere pb-1',
-            isPreview && 'max-h-40'
+            isPreview && 'max-h-72'
           )}
           ref={scrollRef}
         >
@@ -246,11 +246,11 @@ const ReasoningTextPart: ReasoningMessagePartComponent = () => {
 
   return (
     <MarkdownTextContent
-      containerClassName="text-xs leading-snug text-muted-foreground/85"
+      containerClassName="text-[length:var(--conversation-caption-font-size)] leading-relaxed italic text-(--ui-text-secondary)"
       containerProps={{ 'data-slot': 'aui_reasoning-text' } as ComponentProps<'div'>}
       disableArtifacts
       isRunning={status.type === 'running' || messageRunning}
-      text={separateGluedReasoningBlocks(text.trimStart())}
+      text={formatLocalReasoning(text)}
     />
   )
 }

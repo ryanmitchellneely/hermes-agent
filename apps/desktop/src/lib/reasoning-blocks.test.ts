@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
+import { formatLocalReasoning, separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
 
 describe('separateGluedReasoningBlocks', () => {
   it('splits heading-onto-heading parts (the `****` run)', () => {
@@ -44,5 +44,40 @@ describe('separateGluedReasoningBlocks', () => {
 
   it('does not split a heading that already opens the text', () => {
     expect(separateGluedReasoningBlocks('**Only one part**')).toBe('**Only one part**')
+  })
+})
+
+describe('formatLocalReasoning', () => {
+  it('strips a local "The user wants…" preamble and breaks discourse turns', () => {
+    const wall =
+      'The user wants a sentence of exactly 7 words. Let me think of words starting with each letter. Actually, that first try is awkward. So I will try again.'
+
+    expect(formatLocalReasoning(wall)).toBe(
+      [
+        'Let me think of words starting with each letter.',
+        '',
+        'Actually, that first try is awkward.',
+        '',
+        'So I will try again.'
+      ].join('\n')
+    )
+  })
+
+  it('leaves already-paragraphed or fenced thoughts alone', () => {
+    const paragraphed = 'First beat.\n\nSecond beat.'
+    const fenced = 'Let me look:\n```python\nprint(1)\n```\nDone.'
+
+    expect(formatLocalReasoning(paragraphed)).toBe(paragraphed)
+    expect(formatLocalReasoning(fenced)).toBe(fenced)
+  })
+
+  it('is a no-op on short Grok-style summaries', () => {
+    expect(formatLocalReasoning('Checking the live tunnel next.')).toBe('Checking the live tunnel next.')
+  })
+
+  it('keeps a one-sentence "The user is asking…" thought', () => {
+    expect(formatLocalReasoning('The user is asking what this file is.')).toBe(
+      'The user is asking what this file is.'
+    )
   })
 })

@@ -29,3 +29,23 @@ const GLUED_AFTER_PROSE = /(?<=[^\s*])(\*\*(?=[^\s*])[^\n]*?\*\*)/g
 export function separateGluedReasoningBlocks(text: string): string {
   return text.replace(GLUED_HEADING_RUN, '**\n\n**').replace(GLUED_AFTER_PROSE, '\n\n$1')
 }
+
+// Local CoT (Qwen / 120b / Flash) is often one long first-person paragraph
+// that starts with "The user wants…". Grok already ships short headed
+// summaries, so this is a no-op when the text already has air.
+const LOCAL_PREAMBLE = /^(?:The user (?:wants|wanted|asked|is asking|says|said)\b[^.!?\n]{8,220}[.!?]\s*)/i
+const DISCOURSE_BREAK =
+  /(?<=[.!?])[ \t]+(?=(?:Let me|Let's|Actually,|Wait,|So |Now |Therefore |Looking at |We need |I need |The bug:|Next,|Hmm[,.]|Okay[,.]))/g
+
+export function formatLocalReasoning(text: string): string {
+  const separated = separateGluedReasoningBlocks(text.trimStart())
+
+  if (!separated || separated.includes('```') || /\n\s*\n/.test(separated)) {
+    return separated
+  }
+
+  const stripped = separated.replace(LOCAL_PREAMBLE, '')
+  const body = stripped.trim() ? stripped : separated
+
+  return body.replace(DISCOURSE_BREAK, '\n\n')
+}

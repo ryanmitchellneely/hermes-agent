@@ -1790,6 +1790,20 @@ body.guest-pointer-lock :is(webview, iframe) {
   --disclosure-caret-rest: 0.4;
 }
 
+/* Local CoT is a long inner voice, not a second answer. Keep it caption-sized,
+   italic, secondary — prose tokens otherwise paint it as body text. */
+[data-slot='aui_reasoning-text'],
+[data-slot='aui_reasoning-text'] :is(p, li, blockquote) {
+  color: var(--ui-text-secondary);
+  font-style: italic;
+  font-size: var(--conversation-caption-font-size);
+  line-height: 1.55;
+}
+
+[data-slot='aui_reasoning-text'] :is(code, pre, kbd) {
+  font-style: normal;
+}
+
 /* A streaming turn is sealed into several assistant bubbles as it goes
    (`message.interim`) and rehydrates into fewer, so the same two blocks are
    sometimes siblings inside one bubble and sometimes split across two. The
