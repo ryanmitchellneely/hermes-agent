@@ -633,3 +633,16 @@ the ground it stands on. Delta, measured live:
   at the cloud gateway.
 
 Kickoff remains Ryan's, per the plan's own header law.
+
+## ✅ V2 LANDED — 2026-08-19 20:24:42Z (append-only close-out)
+
+The flip is done: `t1000-gateway` (systemd, k2vps) is the sole Telegram writer,
+dispatcher holds the lock over the migrated boards, riders run with VPS paths
+(unit drop-in `vps-paths.conf`), timezone fixed America/Chicago, secrets landed
+(Ryan, option a) with the git/gh mint chain proven on-box. Mac is glass: gateway
+plist retired `.mac-glass`; `com.ryan.launchd_watchdog` was the resurrection
+daemon (and the probable 08-17 16:16 restart actor — PB-009's last thread).
+Rollback: `/opt/t1000/home-standby-v017` + Mac plists preserved. Residuals:
+VPS mesh card `t_cb5b0bd5` (12 paused Mac-workdir crons, dsh-lane provisioning,
+desktop remote attach, sqlite runtime). Full receipts: mesh `t_18ba6dbd` (V0)
+and `t_72b85b29` (V1+V2) on the now-authoritative VPS boards.
