@@ -169,12 +169,76 @@ def comment_hit(board: str, task_id: str, entry: dict, dry_run: bool) -> bool:
     return r.returncode == 0
 
 
+# Scoped repair-drafting (Ryan sanction 2026-08-19: "test it making legit
+# work on its own. We can scope it to a few runs"). The TOTAL number of
+# cards this machinery may ever draft is budgeted in state; when the budget
+# is spent it warns once and stops. Raising PLAYBOOK_REPAIR_BUDGET is a
+# deliberate human act, not something the sweep can do to itself.
+REPAIR_BUDGET = int(os.environ.get("PLAYBOOK_REPAIR_BUDGET") or 3)
+
+
+def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> str | None:
+    """Draft the repair card for a hit entry carrying a repair: instruction.
+
+    Returns the new card id (or a dry-run marker), None on failure. Cards
+    are born armed only when the entry says ``repair_auto: true``; otherwise
+    create-then-block sticky (PB-006: --initial-status alone does not hold).
+    """
+    title = f"AUTO-REPAIR ({entry['id']}): follow-up to {task_id}"
+    body = (
+        f"Auto-drafted by playbook_sweep: {board}/{task_id} hit {entry['id']}. "
+        f"REPAIR INSTRUCTION: {entry['repair']} "
+        f"Context: the PLAYBOOK HIT comment on {task_id}, and "
+        f"docs/playbook/{Path(entry['path']).name}."
+    )
+    if dry_run:
+        print(f"[dry-run] would draft repair card on {board} for {entry['id']}")
+        return "dry-run"
+    create = subprocess.run(
+        [
+            HERMES, "kanban", "--board", board, "create", title,
+            "--body", body,
+            "--assignee", entry["repair_assignee"],
+            "--created-by", "playbook-sweep",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    m = re.search(r"Created\s+(t_[0-9a-f]+)", create.stdout or "")
+    if create.returncode != 0 or not m:
+        return None
+    new_id = m.group(1)
+    if not entry["repair_auto"]:
+        subprocess.run(
+            [
+                HERMES, "kanban", "--board", board, "block", new_id,
+                f"auto-drafted repair for {entry['id']} — human: unblock to arm, "
+                f"archive if the hit was noise",
+                "--kind", "needs_input",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    print(
+        f"PLAYBOOK REPAIR drafted: {board}/{new_id} ({entry['id']}, "
+        f"{'ARMED' if entry['repair_auto'] else 'parked needs_input'})"
+    )
+    return new_id
+
+
 def sweep(dry_run: bool = False) -> dict:
     entries = parse_entries(PLAYBOOK_DIR)
     state = _load_state()
     seen = set(tuple(x) for x in state["commented"])
     since = time.time() - WINDOW_SECS
-    counts = {"boards": 0, "failures": 0, "hits": 0, "misses": 0, "entries": len(entries)}
+    counts = {
+        "boards": 0, "failures": 0, "hits": 0, "misses": 0,
+        "repairs": 0, "entries": len(entries),
+    }
+    state.setdefault("repairs", [])
+    drafted = set(tuple(x) for x in state["repairs"])
     miss_seen = set(tuple(x) for x in state.get("misses", []))
     new_misses: list[str] = []
     for db_path in sorted(BOARDS_DIR.glob("*/kanban.db")):
@@ -200,15 +264,34 @@ def sweep(dry_run: bool = False) -> dict:
                 continue
             for entry in matched:
                 key = (board, failure["task_id"], entry["id"])
-                if key in seen:
-                    continue
-                if comment_hit(board, failure["task_id"], entry, dry_run):
-                    counts["hits"] += 1
-                    seen.add(key)
-                    state["commented"].append(list(key))
-                    print(
-                        f"PLAYBOOK HIT {entry['id']} -> {board}/{failure['task_id']}"
-                    )
+                if key not in seen:
+                    if comment_hit(board, failure["task_id"], entry, dry_run):
+                        counts["hits"] += 1
+                        seen.add(key)
+                        state["commented"].append(list(key))
+                        print(
+                            f"PLAYBOOK HIT {entry['id']} -> {board}/{failure['task_id']}"
+                        )
+                # Detect->Diagnose->Repair, scoped: drafting is deduped
+                # separately from commenting so a pre-existing hit can still
+                # seed its repair card once the entry gains a repair: field.
+                if entry.get("repair"):
+                    rkey = (board, failure["task_id"], entry["id"], "repair")
+                    if rkey in drafted:
+                        continue
+                    if len(drafted) >= REPAIR_BUDGET:
+                        if not state.get("repair_budget_warned"):
+                            print(
+                                f"WARN playbook repair budget spent "
+                                f"({REPAIR_BUDGET} drafts) — raising "
+                                f"PLAYBOOK_REPAIR_BUDGET is a human decision"
+                            )
+                            state["repair_budget_warned"] = True
+                        continue
+                    if draft_repair_card(board, failure["task_id"], entry, dry_run):
+                        counts["repairs"] += 1
+                        drafted.add(rkey)
+                        state["repairs"].append(list(rkey))
     for line in new_misses:
         print(line)
     for e in stale_entries(entries):

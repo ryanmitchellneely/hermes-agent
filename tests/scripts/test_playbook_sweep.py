@@ -182,3 +182,36 @@ def test_repair_fields_parse_when_present(sweep_mod, tmp_path):
     assert entries[0]["repair"] == "run the fixer"
     assert entries[0]["repair_assignee"] == "worker"
     assert entries[0]["repair_auto"] is False
+
+
+RUN_935_SHORT = "git/PR failed: failed to create branch 'ryan/dsh/t_x' from 'origin/main'"
+
+
+def test_repair_draft_seeded_from_hit_and_budgeted(sweep_mod, tmp_path, capsys):
+    """Scoped Detect->Diagnose->Repair: a hit on a repair-carrying entry
+    drafts exactly one card, dedupes on rerun, and the total is budgeted."""
+    now = int(time.time())
+    _mk_board(tmp_path, "mesh", [("t_hit", "blocked", RUN_935_SHORT, None, now - 60)])
+    drafted = []
+    sweep_mod.comment_hit = lambda *a: True
+    sweep_mod.draft_repair_card = (
+        lambda b, t, e, d: drafted.append((b, t, e["id"])) or "t_new"
+    )
+    c1 = sweep_mod.sweep(dry_run=False)
+    c2 = sweep_mod.sweep(dry_run=False)
+    assert c1["repairs"] == 1 and c2["repairs"] == 0
+    assert drafted == [("mesh", "t_hit", "PB-002")]
+
+
+def test_repair_budget_is_a_hard_stop(sweep_mod, tmp_path, capsys):
+    now = int(time.time())
+    _mk_board(
+        tmp_path, "mesh",
+        [(f"t_h{i}", "blocked", RUN_935_SHORT, None, now - 60) for i in range(5)],
+    )
+    sweep_mod.comment_hit = lambda *a: True
+    sweep_mod.draft_repair_card = lambda *a: "t_new"
+    counts = sweep_mod.sweep(dry_run=False)
+    out = capsys.readouterr().out
+    assert counts["repairs"] == sweep_mod.REPAIR_BUDGET == 3
+    assert "repair budget spent" in out
