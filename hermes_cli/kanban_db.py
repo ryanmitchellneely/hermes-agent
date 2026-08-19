@@ -6897,7 +6897,37 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "todo" if undone_parents else "ready"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _event_author() -> str:
+    """Best-effort provenance for park/unpark events (t_481edae3).
+
+    A deliberate human gate must not be removable anonymously: on
+    2026-08-19 a hand-parked card was unblocked 46s later with an EMPTY
+    event payload, an unattended worker claimed it, and the board could
+    not say whether a human, a tool, or a dashboard click did it. Workers
+    carry HERMES_PROFILE; humans at a shell resolve to their OS user;
+    surfaces that know better (dashboard) pass an explicit author.
+    """
+    author = (
+        os.environ.get("HERMES_KANBAN_EVENT_AUTHOR")
+        or os.environ.get("HERMES_PROFILE")
+        or ""
+    ).strip()
+    if author:
+        return author
+    try:
+        import getpass
+
+        return getpass.getuser() or "unknown"
+    except Exception:  # noqa: BLE001 — attribution must never break the verb
+        return "unknown"
+
+
+def unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    author: Optional[str] = None,
+) -> bool:
     """Transition ``blocked``/``scheduled`` to its safe resumable phase.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
@@ -6947,14 +6977,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
+        payload: dict = {"by": author or _event_author()}
+        if new_status != "ready" or resume_status != "ready":
+            payload.update({"status": new_status, "resume_status": resume_status})
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
@@ -7960,7 +7986,11 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(
+            conn, task_id, "scheduled",
+            {"reason": reason, "by": _event_author()},
+            run_id=run_id,
+        )
         return True
 
 
