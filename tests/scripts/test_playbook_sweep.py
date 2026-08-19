@@ -132,3 +132,53 @@ def test_heartbeat_written(sweep_mod, tmp_path):
     sweep_mod.sweep(dry_run=False)
     hb = sweep_mod.HEARTBEAT_PATH.read_text(encoding="utf-8")
     assert '"boards": 1' in hb and '"ts"' in hb
+
+
+def test_unmatched_failure_surfaces_as_miss_candidate(sweep_mod, tmp_path, capsys):
+    """Corpus growth: a failure no entry matches must nominate itself —
+    once. Deduped per (board, task) so the nudge doesn't repeat every 30m."""
+    now = int(time.time())
+    _mk_board(
+        tmp_path, "mesh",
+        [("t_novel", "crashed", "some entirely novel failure mode xyzzy", None, now - 60)],
+    )
+    sweep_mod.comment_hit = lambda *a: True
+    c1 = sweep_mod.sweep(dry_run=False)
+    out1 = capsys.readouterr().out
+    assert c1["misses"] == 1
+    assert "PLAYBOOK MISS candidate: mesh/t_novel" in out1
+    c2 = sweep_mod.sweep(dry_run=False)
+    out2 = capsys.readouterr().out
+    assert c2["misses"] == 0
+    assert "t_novel" not in out2
+
+
+def test_miss_lines_capped_at_three_per_run(sweep_mod, tmp_path, capsys):
+    now = int(time.time())
+    _mk_board(
+        tmp_path, "mesh",
+        [(f"t_m{i}", "blocked", f"novel failure number {i} qwerty", None, now - 60)
+         for i in range(6)],
+    )
+    sweep_mod.comment_hit = lambda *a: True
+    counts = sweep_mod.sweep(dry_run=False)
+    out = capsys.readouterr().out
+    assert counts["misses"] == 6  # all tracked in state
+    assert out.count("PLAYBOOK MISS candidate") == 3  # only 3 surfaced
+
+
+def test_repair_fields_parse_when_present(sweep_mod, tmp_path):
+    """The repair seam (Detect->Diagnose->Repair) parses; consumption of it
+    is a separate, human-sanctioned step — see t_c3a4b01d follow-up."""
+    pb = tmp_path / "pb"
+    pb.mkdir()
+    (pb / "PB-900-test.md").write_text(
+        '---\nid: PB-900\nclass: t\nmatch:\n  - "boom"\nverified: 2026-08-19\n'
+        'sources:\n  - "x"\nrepair: "run the fixer"\nrepair_assignee: worker\n'
+        "---\n\n**Fix:** f\n",
+        encoding="utf-8",
+    )
+    entries = sweep_mod.parse_entries(pb)
+    assert entries[0]["repair"] == "run the fixer"
+    assert entries[0]["repair_assignee"] == "worker"
+    assert entries[0]["repair_auto"] is False

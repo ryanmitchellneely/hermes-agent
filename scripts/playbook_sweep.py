@@ -58,6 +58,9 @@ def parse_entries(playbook_dir: Path) -> list[dict]:
         verified = re.search(r"^verified:\s*(\S+)", head, re.M)
         fix = re.search(r"\*\*Fix[^:]*:\*\*\s*(.+?)(?:\n\n|\Z)", body, re.S)
         fix_line = " ".join(fix.group(1).split())[:300] if fix else "(see entry)"
+        repair = re.search(r'^repair:\s*"(.*)"\s*$', head, re.M)
+        repair_assignee = re.search(r"^repair_assignee:\s*(\S+)", head, re.M)
+        repair_auto = re.search(r"^repair_auto:\s*true\s*$", head, re.M)
         if pid and patterns:
             entries.append(
                 {
@@ -66,6 +69,15 @@ def parse_entries(playbook_dir: Path) -> list[dict]:
                     "fix_line": fix_line,
                     "verified": verified.group(1) if verified else None,
                     "path": str(path),
+                    # Detect->Diagnose->REPAIR: an entry may carry a card-able
+                    # repair instruction. Without repair_auto: true the drafted
+                    # card is parked blocked/needs_input (human arms it) — the
+                    # machinery ships dormant and earns trust per entry.
+                    "repair": repair.group(1) if repair else None,
+                    "repair_assignee": (
+                        repair_assignee.group(1) if repair_assignee else "worker"
+                    ),
+                    "repair_auto": bool(repair_auto),
                 }
             )
     return entries
@@ -136,6 +148,7 @@ def _save_state(state: dict) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     # Cap growth: keep the newest 2000 dedupe keys.
     state["commented"] = state["commented"][-2000:]
+    state["misses"] = state.get("misses", [])[-2000:]
     STATE_PATH.write_text(json.dumps(state), encoding="utf-8")
 
 
@@ -161,13 +174,31 @@ def sweep(dry_run: bool = False) -> dict:
     state = _load_state()
     seen = set(tuple(x) for x in state["commented"])
     since = time.time() - WINDOW_SECS
-    counts = {"boards": 0, "failures": 0, "hits": 0, "entries": len(entries)}
+    counts = {"boards": 0, "failures": 0, "hits": 0, "misses": 0, "entries": len(entries)}
+    miss_seen = set(tuple(x) for x in state.get("misses", []))
+    new_misses: list[str] = []
     for db_path in sorted(BOARDS_DIR.glob("*/kanban.db")):
         board = db_path.parent.name
         counts["boards"] += 1
         for failure in recent_failures(db_path, since):
             counts["failures"] += 1
-            for entry in match_entries(entries, failure["text"]):
+            matched = match_entries(entries, failure["text"])
+            if not matched:
+                # Corpus growth: an unmatched failure is a candidate entry.
+                # Deduped per (board, task) in state; surfaced max 3 per run
+                # so the Telegram line stays a nudge, not a firehose.
+                mkey = (board, failure["task_id"])
+                if mkey not in miss_seen:
+                    miss_seen.add(mkey)
+                    state.setdefault("misses", []).append(list(mkey))
+                    counts["misses"] += 1
+                    if len(new_misses) < 3:
+                        snippet = " ".join((failure["text"] or "").split())[:110]
+                        new_misses.append(
+                            f"PLAYBOOK MISS candidate: {board}/{failure['task_id']} — {snippet}"
+                        )
+                continue
+            for entry in matched:
                 key = (board, failure["task_id"], entry["id"])
                 if key in seen:
                     continue
@@ -178,6 +209,8 @@ def sweep(dry_run: bool = False) -> dict:
                     print(
                         f"PLAYBOOK HIT {entry['id']} -> {board}/{failure['task_id']}"
                     )
+    for line in new_misses:
+        print(line)
     for e in stale_entries(entries):
         print(f"WARN playbook entry {e['id']} unverified >{STALE_DAYS}d — re-verify or retire")
     if not dry_run:
