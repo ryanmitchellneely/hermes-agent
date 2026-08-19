@@ -48,6 +48,10 @@ DELIBERATE_PARK_MARKERS = [
     "human pr review",
     "not for unattended dispatch",
     "waits on",
+    # k2-intake's own parked notifications (first live sweep after the
+    # bridge shipped nominated all 4 of them as "unknown failures").
+    "intake notification",
+    "human triage",
 ]
 HERMES = os.environ.get("PLAYBOOK_HERMES_BIN", str(Path.home() / ".local" / "bin" / "hermes"))
 
