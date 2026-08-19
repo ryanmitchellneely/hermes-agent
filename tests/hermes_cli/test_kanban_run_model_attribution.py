@@ -27,10 +27,21 @@ def isolated_kanban_home_with_profiles(monkeypatch):
     nothing and must not raise).
     """
     test_home = tempfile.mkdtemp(prefix="kanban_run_model_attribution_test_")
+    # Review dispatch on this branch is config-gated (kanban.review_profiles)
+    # AND never assigns the implementer to review its own work
+    # (pick_reviewer_profile excludes the assignee — t_6f7689e4/t_eaeae889).
+    # So the review-lane test needs a DISTINCT reviewer profile, and the
+    # claim-time stamp is expected to carry the REVIEWER's profile default.
+    with open(os.path.join(test_home, "config.yaml"), "w", encoding="utf-8") as fh:
+        yaml.safe_dump({"kanban": {"review_profiles": ["rev"]}}, fh)
     coder_dir = os.path.join(test_home, "profiles", "coder")
     os.makedirs(coder_dir, exist_ok=True)
     with open(os.path.join(coder_dir, "config.yaml"), "w", encoding="utf-8") as fh:
         yaml.safe_dump({"model": {"default": "gpt-oss:120b", "provider": "spark"}}, fh)
+    rev_dir = os.path.join(test_home, "profiles", "rev")
+    os.makedirs(rev_dir, exist_ok=True)
+    with open(os.path.join(rev_dir, "config.yaml"), "w", encoding="utf-8") as fh:
+        yaml.safe_dump({"model": {"default": "rev-model", "provider": "spark"}}, fh)
     os.makedirs(os.path.join(test_home, "profiles", "bare"), exist_ok=True)
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
@@ -111,9 +122,9 @@ def test_profile_with_no_config_yaml_leaves_columns_null(isolated_kanban_home_wi
 def test_review_run_is_stamped_from_dispatch_once(
     isolated_kanban_home_with_profiles,
 ):
-    """Review claims on this tree keep the implementer assignee (no
-    review_profiles rewrite). The stamp must still fire through the real
-    review lane of ``dispatch_once`` and record that profile's default."""
+    """The stamp must fire through the real review lane of ``dispatch_once``
+    and record the REVIEWER profile's default — this branch never lets the
+    implementer claim its own review, so the reviewer is a distinct profile."""
     kb = isolated_kanban_home_with_profiles
     with kb.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
@@ -126,5 +137,5 @@ def test_review_run_is_stamped_from_dispatch_once(
         kb.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
     with kb.connect_closing() as conn:
         row = _current_run_row(kb, conn, task_id)
-        assert row["resolved_model"] == "gpt-oss:120b"
+        assert row["resolved_model"] == "rev-model"
         assert row["resolved_provider"] == "spark"
