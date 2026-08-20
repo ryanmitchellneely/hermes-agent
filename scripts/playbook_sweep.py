@@ -144,15 +144,25 @@ def recent_failures(db_path: Path, since: float) -> list[dict]:
             "AND outcome IN ('blocked', 'crashed') ORDER BY ended_at",
             (since,),
         ).fetchall()
-        return [
-            {
-                "task_id": r["task_id"],
-                "run_id": int(r["id"]),
-                "text": " ".join(filter(None, [r["summary"], r["error"]])),
-                "ended_at": r["ended_at"],
-            }
-            for r in rows
-        ]
+        out = []
+        for r in rows:
+            try:
+                st = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (r["task_id"],)
+                ).fetchone()
+                task_status = st["status"] if st else None
+            except sqlite3.Error:
+                task_status = None
+            out.append(
+                {
+                    "task_id": r["task_id"],
+                    "run_id": int(r["id"]),
+                    "text": " ".join(filter(None, [r["summary"], r["error"]])),
+                    "ended_at": r["ended_at"],
+                    "task_status": task_status,
+                }
+            )
+        return out
     except sqlite3.Error:
         return []
     finally:
@@ -275,6 +285,12 @@ def sweep(dry_run: bool = False) -> dict:
         "boards": 0, "failures": 0, "hits": 0, "misses": 0,
         "repairs": 0, "entries": len(entries),
     }
+    # The honest metric (Ryan, 2026-08-20): `failures` counts every
+    # blocked/crashed run-row in the window — deliberate parks, resolved
+    # cards' historical rows, everything. `actionable` counts only DISTINCT
+    # cards that are still live (not done/archived) and not a deliberate
+    # human gate: the residue actually waiting on someone.
+    actionable_cards = set()
     state.setdefault("repairs", [])
     drafted = set(tuple(x) for x in state["repairs"])
     miss_seen = set(tuple(x) for x in state.get("misses", []))
@@ -284,6 +300,12 @@ def sweep(dry_run: bool = False) -> dict:
         counts["boards"] += 1
         for failure in recent_failures(db_path, since):
             counts["failures"] += 1
+            hay_a = (failure["text"] or "").lower()
+            if (
+                failure.get("task_status") not in ("done", "archived")
+                and not any(m in hay_a for m in DELIBERATE_PARK_MARKERS)
+            ):
+                actionable_cards.add((board, failure["task_id"]))
             matched = match_entries(entries, failure["text"])
             if not matched:
                 # Deliberate parks are not failures: a run blocked by design
@@ -337,6 +359,7 @@ def sweep(dry_run: bool = False) -> dict:
                         counts["repairs"] += 1
                         drafted.add(rkey)
                         state["repairs"].append(list(rkey))
+    counts["actionable"] = len(actionable_cards)
     for line in new_misses:
         print(line)
     for e in stale_entries(entries):

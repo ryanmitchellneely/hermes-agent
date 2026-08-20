@@ -294,3 +294,36 @@ def test_report_class_with_auto_still_arms(sweep_mod, tmp_path):
         sweep_mod.subprocess.run = real_run
     assert new_id == "t_8888beef"
     assert blocks == []  # armed: no block call
+
+
+def test_actionable_counts_only_live_nondeliberate_cards(sweep_mod, tmp_path):
+    """`failures` counts rows; `actionable` counts distinct live cards that
+    are neither deliberate parks nor already-resolved — the residue that is
+    actually waiting on someone (Ryan, 2026-08-20)."""
+    now = int(time.time())
+    db_dir = tmp_path / "boards" / "mesh"
+    db_dir.mkdir(parents=True)
+    conn = sqlite3.connect(db_dir / "kanban.db")
+    conn.execute(
+        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, "
+        "outcome TEXT, summary TEXT, error TEXT, ended_at INTEGER)"
+    )
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+    rows = [
+        ("t_gate0000", "blocked", "HUMAN PR review — do not free-fire", "blocked"),
+        ("t_done0000", "blocked", "novel failure alpha", "done"),
+        ("t_live0000", "blocked", "novel failure beta", "blocked"),
+        ("t_live0000", "crashed", "novel failure beta again", "blocked"),  # same card twice
+        ("t_live0001", "crashed", "novel failure gamma", "ready"),
+    ]
+    for tid, out, summ, tstat in rows:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, outcome, summary, error, ended_at) VALUES (?,?,?,?,?)",
+            (tid, out, summ, None, now - 60),
+        )
+        conn.execute("INSERT OR IGNORE INTO tasks (id, status) VALUES (?,?)", (tid, tstat))
+    conn.commit(); conn.close()
+    sweep_mod.comment_hit = lambda *a: True
+    counts = sweep_mod.sweep(dry_run=True)
+    assert counts["failures"] == 5      # every row
+    assert counts["actionable"] == 2    # t_live0000 (deduped) + t_live0001
