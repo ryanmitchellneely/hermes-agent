@@ -36,13 +36,21 @@ auth failure.
 **Fix (interim):** revive the dead provider first (see below), THEN re-arm.
 Re-pinning to a live lane mid-loop loses to the estimator re-stamp.
 
-**xAI re-auth on the VPS has a trap of its own:** the gateway and serve
-daemons hold auth state in memory and flush the WHOLE file back to disk —
-a re-auth done while they run is silently erased on the next flush (this
-killed the 2026-08-19 revival overnight). Sequence that works:
-`systemctl stop t1000-serve t1000-gateway` → `hermes auth logout xai-oauth`
-→ `hermes auth add xai-oauth --type oauth --no-browser` (device flow) →
-test with `hermes -z ... -m grok` → start both units.
+**xAI re-auth on the VPS had a trap — CORRECTED 2026-08-20 ~16:00Z:** the
+first diagnosis blamed daemon in-memory flushes; the REAL eraser was the
+pre-flip Mac launchd agent `com.ryan.t1000-failover-heartbeat`, whose
+`heartbeat.sh` rsynced the frozen Mac `auth.json` + `config.yaml` over
+`/opt/t1000/home/` (killed the 2026-08-19 revival overnight and two same-day
+fixes; proven by mtime forensics — every reverted file carried the Mac
+original's mtime exactly). Both failover plists are retired `.mac-glass`
+(same family as the PB-009 watchdog). With the heartbeat dead, re-auth works
+with daemons running: `hermes auth add xai-oauth --type oauth --no-browser`
+(device flow; an operator can run it via `ssh -tt` in the background and
+hand the human just the URL+code), then prune the pool to the fresh entry
+and **sync it into every `profiles/*/auth.json`** — workers read their own
+profile store, not the root one (a passing root-store test proves nothing
+about worker lanes). Test with `hermes -z ... -m grok` from a
+t1000-readable cwd.
 
 **Root fix (carded, mesh t_7af7daf9):** health-gate both the estimator's
 suggestions and the escalation ladder's targets; neither may override an
