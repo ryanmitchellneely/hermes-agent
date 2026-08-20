@@ -139,7 +139,10 @@ def _create_parked_card(spec: dict, finding: dict) -> str | None:
         + "\n\nRe-run in a K2 checkout for the full list. This card is a "
         f"NOTIFICATION: triage it — work it, split it, or archive it. It "
         f"auto-completes when the checker returns clean. Card updates its "
-        f"count via comments while the finding persists."
+        f"count via comments while the finding persists. FINISH PROTOCOL for "
+        f"any worker dispatched on this card: if your deliverable changed code "
+        f"or opened a PR, end with `kanban request-review` (NOT `complete`) so "
+        f"the board reviewer lane issues an independent verdict."
     )
     create = _hermes(
         [
