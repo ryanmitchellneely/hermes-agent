@@ -221,7 +221,11 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
         f"Auto-drafted by playbook_sweep: {board}/{task_id} hit {entry['id']}. "
         f"REPAIR INSTRUCTION: {entry['repair']} "
         f"Context: the PLAYBOOK HIT comment on {task_id}, and "
-        f"docs/playbook/{Path(entry['path']).name}."
+        f"docs/playbook/{Path(entry['path']).name}. "
+        "FINISH PROTOCOL: if your deliverable changed code or opened a PR, end "
+        "the run with `kanban request-review` (NOT `complete`) so the board "
+        "reviewer lane issues an independent verdict; report-only deliverables "
+        "may `complete` directly."
     )
     if dry_run:
         print(f"[dry-run] would draft repair card on {board} for {entry['id']}")
