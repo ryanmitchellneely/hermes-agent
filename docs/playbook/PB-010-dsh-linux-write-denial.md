@@ -8,41 +8,50 @@ match:
   - "grant the necessary permission or allow the creation of new files"
 verified: 2026-08-20
 sources:
-  - "mesh t_e26a4c82 runs 973/974 (cloud K2 acceptance)"
-  - "probe matrix /tmp/dsh-probe (root-owned, denied) vs /tmp/dsh-owned (t1000-owned, WROTE) — rc.6 and rc.8 identical"
+  - "mesh t_e26a4c82 runs 973/974/97x (cloud K2 acceptance, three attempts)"
+  - "probe matrix on k2vps 2026-08-20 01:20-02:00Z (see measurement table below)"
 ---
 
-**Symptom:** a dsh run reports the work understood but not done, citing
-sandbox/permission restrictions; the model may claim it wrote the file
-"to /tmp instead", and raw tool-call fragments (`</tool_call>`) can leak
-into its prose.
+**Symptom:** on the VPS, a dsh run reports the work understood but not done,
+citing sandbox/permission restrictions — sometimes claiming it wrote the file
+"to /tmp instead". Raw tool-call fragments (`</tool_call>`, `</function>`)
+often leak into the model's prose on the same runs.
 
-**Diagnosis:** the workspace directory is **not owned by the user dsh runs
-as**. dsh's `workspace-write` mode grants exactly `workspaceRoot`, `/tmp`,
-and `os.tmpdir()` — but a grant is not a chmod: ordinary POSIX ownership
-still applies underneath. A root-created workspace with a `t1000` worker
-denies every write, and the model then narrates a plausible-sounding
-sandbox story around it.
+**What is actually measured** (k2vps, dsh 0.1.0-rc.6 AND rc.8 identical,
+worker user `t1000`, `--profile headless`):
 
-**Fix:** `chown -R <worker-user> <workspace>` (and its parent clone). On
-the VPS the whole home needed it once after migration — `rsync -a`
-preserved Mac UIDs. Verify with a scratch probe as the worker user before
-blaming the harness:
-`sudo -u <user> ... dsh --profile headless --patch <yml> "create a file named x.txt containing ok"`
-then `ls` for the artifact.
+| workspace | owner | result |
+|---|---|---|
+| `/tmp/dsh-probe` | root | ✗ denied |
+| `/tmp/dsh-owned` | t1000 | ✓ **wrote** |
+| `/tmp` (explicit path target) | t1000 | ✓ **wrote** |
+| `/opt/t1000/home/wstest` | t1000 | ✗ denied |
+| same, with `TMPDIR` pointed at it | t1000 | ✗ denied (TMPDIR *is* honored — node put its loader dir there — but the write still refused) |
+| K2 worktree under `/opt/t1000/home/src/...` | t1000, `touch` proven writable | ✗ denied |
 
-**Don't:** conclude "dsh cannot write on Linux" — it can, in both rc.6 and
-rc.8 (measured 2026-08-20). And do not flip
-`DSH_PERMISSION_MODE=danger-full-access` chasing this: that env var is read
-by **nothing** in the package on any platform (verified by source grep) —
-the wrapper's pin is inert, and the real mode comes from the
-`dsh-sandbox-policy` plugin's `defaultMode`.
+**Diagnosis (honest boundary):** writes land **only under literal `/tmp`**.
+The sandbox source (`@deepseek-ai/dsh-sandbox/lib/index.js`) says
+`workspace-write` grants `[workspaceRoot, "/tmp", os.tmpdir()]` — but
+granting the third slot via `TMPDIR` does not unlock it, so the blocker is
+not simply the writable-roots list. Directory ownership is a **separate,
+real** precondition (root-owned workspaces fail regardless) — necessary but
+not sufficient. Root cause of the non-`/tmp` denial is **still unknown**;
+`DSH_PERMISSION_MODE` is not it (that variable is read by nothing in the
+package, verified by grep — the wrapper's pin is inert on every platform).
 
-**Correction record (2026-08-19 → 08-20):** this entry first claimed dsh's
-write toolchain was broken on Linux. That was wrong. The probe dirs used to
-"prove" it were root-owned, so every write was denied by plain filesystem
-permissions; two models' confabulation-shaped explanations made the wrong
-story fit. The lesson survives in inverted form: **a model's stated reason
-is unreliable in BOTH directions** — do not trust its explanation, and do
-not dismiss it either; probe the mechanism (ownership, mode, artifact
-presence) directly.
+**Fix (interim):** route edit-class cards on the VPS to the hermes `worker`
+lane, which writes normally. dsh stays a read/analysis lane there. On the
+Mac desk the same binary historically wrote into K2 worktrees fine (PRs
+#5149, #5160), so this is environment-specific, not a flat "Linux" verdict.
+
+**Candidate unlock, untested (needs a human call):** point
+`DSH_TARGET_REPO` at a clone under `/tmp` so worktrees inherit the one
+grant that works. Trade-off: `/tmp` is volatile across reboots, so the
+clone must be re-creatable on demand.
+
+**Don't:** trust *or* dismiss the model's stated reason. This entry has been
+wrong twice by doing each in turn — first concluding "dsh can't write on
+Linux" (mechanism wrong), then "it's only ownership" (over-corrected from a
+`/tmp` test that could not distinguish the two, because `/tmp` is granted
+unconditionally). Probe the mechanism with a matrix that varies one thing at
+a time, and check for the artifact with `ls`.
