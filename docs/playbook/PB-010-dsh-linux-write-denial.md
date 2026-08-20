@@ -4,45 +4,45 @@ class: dsh-runtime
 match:
   - "sandbox permissions restrictions"
   - "unable to perform the actual file modification"
-  - "</tool_call>"
+  - "permission issues when trying to create the file"
   - "grant the necessary permission or allow the creation of new files"
-verified: 2026-08-19
+verified: 2026-08-20
 sources:
   - "mesh t_e26a4c82 runs 973/974 (cloud K2 acceptance)"
-  - "direct probes /tmp/dsh-probe (both qwen3-coder:30b and gpt-oss:120b, bwrap installed made no difference)"
+  - "probe matrix /tmp/dsh-probe (root-owned, denied) vs /tmp/dsh-owned (t1000-owned, WROTE) — rc.6 and rc.8 identical"
 ---
 
-**Symptom:** a dsh-lane card on the VPS reports the work "understood" but not
-done, citing sandbox/permission restrictions; or raw tool-call fragments
-(`</tool_call>`, `</function>`) leak into the model's plain-text output.
+**Symptom:** a dsh run reports the work understood but not done, citing
+sandbox/permission restrictions; the model may claim it wrote the file
+"to /tmp instead", and raw tool-call fragments (`</tool_call>`) can leak
+into its prose.
 
-**Diagnosis:** dsh 0.1.0-rc.6's file-write toolchain does not function on
-Linux — probed directly with two different models in a world-writable scratch
-dir under `workspace-write`: neither can create a file, and installing
-bubblewrap changes nothing. The models' "permission restrictions" explanations
-are CONFABULATED — they describe their own inert tool calls, not a real
-policy. Do not trust the model's stated reason for this class; probe with
-`ls` for the artifact.
+**Diagnosis:** the workspace directory is **not owned by the user dsh runs
+as**. dsh's `workspace-write` mode grants exactly `workspaceRoot`, `/tmp`,
+and `os.tmpdir()` — but a grant is not a chmod: ordinary POSIX ownership
+still applies underneath. A root-created workspace with a `t1000` worker
+denies every write, and the model then narrates a plausible-sounding
+sandbox story around it.
 
-**Investigation state (2026-08-19, time-boxed source read):** the sandbox
-source (`@deepseek-ai/dsh-sandbox/lib/index.js`, readable) proves
-`workspace-write` ALWAYS allows `/tmp` — and probes in /tmp are denied, so
-the runtime mode is not workspace-write on Linux. Bigger: **nothing in the
-package reads `DSH_PERMISSION_MODE`** — the wrapper's env pin is a no-op on
-every platform (on macOS it merely coincided with a permissive default).
-Mode really comes from the `dsh-sandbox-policy` plugin's `defaultMode`
-(host composition, not located in the minified dist); a patch-overlay guess
-(`id: sandbox-policy`) did not take (silent-skip or wrong theory). The
-recurring leak of raw `</tool_call>` fragments from two different models
-suggests the write TOOL may not register at all on Linux — which would
-produce exactly these symptoms regardless of mode.
+**Fix:** `chown -R <worker-user> <workspace>` (and its parent clone). On
+the VPS the whole home needed it once after migration — `rsync -a`
+preserved Mac UIDs. Verify with a scratch probe as the worker user before
+blaming the harness:
+`sudo -u <user> ... dsh --profile headless --patch <yml> "create a file named x.txt containing ok"`
+then `ls` for the artifact.
 
-**Fix (interim):** route edit-class cards on the VPS to the hermes `worker`
-lane (writes proven live during V0). Keep dsh cards read/analysis-only on
-Linux until the write path is fixed. Fix paths to investigate: read dsh's
-sandbox/tool-registration source for Linux, try a newer rc, or file upstream
-(deepseek-ai/deepseek-harness) with the probe transcript.
+**Don't:** conclude "dsh cannot write on Linux" — it can, in both rc.6 and
+rc.8 (measured 2026-08-20). And do not flip
+`DSH_PERMISSION_MODE=danger-full-access` chasing this: that env var is read
+by **nothing** in the package on any platform (verified by source grep) —
+the wrapper's pin is inert, and the real mode comes from the
+`dsh-sandbox-policy` plugin's `defaultMode`.
 
-**Don't:** flip `DSH_PERMISSION_MODE=danger-full-access` to "fix" it — on the
-VPS the worker user owns the whole home including secrets/, and there is no
-evidence the mode is the problem (both modes deny).
+**Correction record (2026-08-19 → 08-20):** this entry first claimed dsh's
+write toolchain was broken on Linux. That was wrong. The probe dirs used to
+"prove" it were root-owned, so every write was denied by plain filesystem
+permissions; two models' confabulation-shaped explanations made the wrong
+story fit. The lesson survives in inverted form: **a model's stated reason
+is unreliable in BOTH directions** — do not trust its explanation, and do
+not dismiss it either; probe the mechanism (ownership, mode, artifact
+presence) directly.
