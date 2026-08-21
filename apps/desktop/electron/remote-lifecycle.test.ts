@@ -1060,6 +1060,66 @@ test('connect preserves an exact-owned backend when reuse proof transport fails'
   assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
 })
 
+test('connect replaces an owned backend whose pid is alive but whose listener is gone', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/print\("LISTENING"/, 'DEAD\n'], // the recorded port has no listener
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '999\n'],
+    [/kill -0 999/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=43000\n']
+  ])
+
+  const result = await connect(
+    connectDeps(ssh, {
+      reuseToken,
+      probeReuseProof: async () => {
+        throw new Error('connect ECONNREFUSED 127.0.0.1:50001')
+      },
+      adoptServedToken: async () => 'fresh'
+    })
+  )
+
+  assert.equal(result.reused, false)
+  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+})
+
+test('connect keeps an owned backend when the probe fails but its port still listens', async () => {
+  const reuseToken = 'stored-token'
+  const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/print\("LISTENING"/, 'LISTENING\n']
+  ])
+
+  await assert.rejects(
+    () =>
+      connect(
+        connectDeps(ssh, {
+          reuseToken,
+          probeReuseProof: async () => {
+            throw new Error('connection reset')
+          }
+        })
+      ),
+    (error: any) => error.kind === 'transient-transport-error'
+  )
+  assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
+})
+
 test('connect replaces an exact-owned backend only after authenticated stale proof', async () => {
   const reuseToken = 'stored-token'
   const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })

@@ -357,6 +357,38 @@ async function remotePidAlive(ssh, pid) {
   }
 }
 
+// A live pid does NOT imply a live listener: the backend's socket can die while
+// the process keeps running (e.g. the ssh login scope that spawned it is torn
+// down). Only the box can tell us, so ask it. Unknown counts as listening —
+// never reap a backend we cannot prove is dead.
+async function remotePortListening(ssh, port) {
+  const p = Number(port)
+
+  if (!Number.isInteger(p) || p <= 0) {
+    return false
+  }
+
+  try {
+    const script =
+      'import socket\n' +
+      's=socket.socket()\n' +
+      's.settimeout(2)\n' +
+      'try:\n' +
+      ` s.connect(("127.0.0.1",${p}))\n` +
+      ' print("LISTENING")\n' +
+      'except OSError:\n' +
+      ' print("DEAD")\n' +
+      'finally:\n' +
+      ' s.close()'
+
+    const out = await ssh.exec(`python3 -c ${shq(script)}`)
+
+    return String(out || '').trim() !== 'DEAD'
+  } catch {
+    return true
+  }
+}
+
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
 async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
@@ -721,13 +753,24 @@ async function connect(deps) {
         try {
           reuseClassification = await probeReuseProof(baseUrl, reuseToken, lock.spawnNonce)
         } catch (cause) {
-          const error: any = new Error('Could not verify the existing SSH backend.')
-          error.kind = 'transient-transport-error'
-          error.cause = cause
-          throw error
+          // A probe failure is only transient if the backend can still answer.
+          // When its listener is gone the pid check above keeps passing, so
+          // every later boot re-forwards to the same dead port and fails the
+          // same way — nothing reaps it and the app never recovers. An
+          // unreachable port is terminal for THIS backend: treat it as stale
+          // and spawn a fresh one.
+          if (await remotePortListening(ssh, lock.port)) {
+            const error: any = new Error('Could not verify the existing SSH backend.')
+            error.kind = 'transient-transport-error'
+            error.cause = cause
+            throw error
+          }
+
+          log(`backend pid=${lock.pid} is alive but nothing listens on ${lock.port}; replacing it`)
+          reuseClassification = 'unreachable-stale'
         }
 
-        if (reuseClassification === 'authenticated-stale') {
+        if (reuseClassification === 'authenticated-stale' || reuseClassification === 'unreachable-stale') {
           assertNotAborted(signal)
           await cancelForwardSafe(deps, localPort, lock.port)
           await cleanupStale(ssh, ownershipId, lock)
