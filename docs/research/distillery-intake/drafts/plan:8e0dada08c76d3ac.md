@@ -7,8 +7,8 @@ source_path: ~/.hermes/plans/2026-08-07_182701-k2-devbot-local-spark.md
 source_ref: a05703367d2bb35c
 board: null
 captured_at: 2026-08-09T03:15:16Z
-status: draft
-status_changed_at: 2026-08-09T03:15:16Z
+status: stale
+status_changed_at: 2026-08-20T21:31:20Z
 superseded_by: null
 ```
 

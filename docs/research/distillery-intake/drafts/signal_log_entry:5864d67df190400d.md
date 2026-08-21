@@ -7,8 +7,8 @@ source_path: ~/Documents/T1000/docs/research/signal-log/entries/SIG-20260807-02_
 source_ref: 5b99b337e2f44b9b
 board: null
 captured_at: 2026-08-09T03:15:16Z
-status: draft
-status_changed_at: 2026-08-09T03:15:16Z
+status: stale
+status_changed_at: 2026-08-20T21:31:20Z
 superseded_by: null
 ```
 

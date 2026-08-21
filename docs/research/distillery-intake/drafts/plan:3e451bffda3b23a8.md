@@ -7,8 +7,8 @@ source_path: ~/.hermes/plans/2026-08-07_074000-mac-mini-student-model.md
 source_ref: 437e504f684c0552
 board: null
 captured_at: 2026-08-09T03:15:16Z
-status: draft
-status_changed_at: 2026-08-09T03:15:16Z
+status: stale
+status_changed_at: 2026-08-20T21:31:20Z
 superseded_by: null
 ```
 

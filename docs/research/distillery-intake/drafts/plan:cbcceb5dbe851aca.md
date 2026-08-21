@@ -7,8 +7,8 @@ source_path: ~/.hermes/plans/2026-08-06_222342-spark-inference-experiments.md
 source_ref: de287d75d6c0d462
 board: null
 captured_at: 2026-08-09T03:15:16Z
-status: draft
-status_changed_at: 2026-08-09T03:15:16Z
+status: stale
+status_changed_at: 2026-08-20T21:31:20Z
 superseded_by: null
 ```
 

@@ -6,7 +6,7 @@ match:
   - "unable to perform the actual file modification"
   - "permission issues when trying to create the file"
   - "grant the necessary permission or allow the creation of new files"
-verified: 2026-08-20
+verified: 2026-08-21
 sources:
   - "mesh t_e26a4c82 runs 973/974/97x (cloud K2 acceptance, three attempts)"
   - "probe matrix on k2vps 2026-08-20 01:20-02:00Z (see measurement table below)"
@@ -55,3 +55,37 @@ Linux" (mechanism wrong), then "it's only ownership" (over-corrected from a
 `/tmp` test that could not distinguish the two, because `/tmp` is granted
 unconditionally). Probe the mechanism with a matrix that varies one thing at
 a time, and check for the artifact with `ls`.
+
+## Correction (2026-08-21) — root cause found; everything above is symptom archaeology
+
+**The sandbox was never the blocker.** Instrumented on k2vps (strace -f -e
+trace=execve on live headless runs):
+
+1. bwrap cannot run unprivileged on this box (Ubuntu 24.04,
+   `kernel.apparmor_restrict_unprivileged_userns=1` denies the uid map), so
+   the runner chain falls back to Landlock — which **works**: the launcher
+   run by hand with `--rw <workspace>` wrote into
+   `/opt/t1000/home/wstest` (the exact class the matrix above marks denied).
+   Probe verdict "partial (older ABI)" is informational, not disabling.
+2. Under the lane's pinned model (`qwen3-coder:30b` via the ollama
+   `openai-completions` route), the model's tool-call XML **never parses**:
+   strace shows ZERO sandbox spawns, raw `</tool_call>` fragments leak into
+   prose, no file appears. No tool executed, nothing was denied — the model
+   then **confabulated "sandbox permission restrictions"**, and those exact
+   phrases became this entry's match lines.
+3. Same probe pinned to `gpt-oss:120b` on the same route: the write tool
+   executes and the file lands in the workspace, first try.
+4. End-to-end receipt: smoke card `t_75d24720` → dsh (gpt-oss:120b) wrote
+   `SMOKE.md` in a K2 worktree → wrapper draft PR **#5320** by
+   `app/k2-dsh-lane`. Full lane parity on the VPS.
+
+**Fix (live 2026-08-21):** deployed `dsh-k2-local.yml` default flipped
+`qwen3-coder:30b` → `gpt-oss:120b`. The read-only-lane interim above is
+RETIRED. The Mac never differed in kernel or sandbox — it ran DS4-flash,
+whose tool calls parse.
+
+**Standing lesson (third instance for this entry):** the matrix varied
+workspace and ownership but never THE MODEL, and `/tmp` "successes" were
+parse-luck noise. When a harness reports permission errors, first prove a
+tool call EXECUTED (strace for the launcher spawn) before believing any
+stated reason. Ownership rows remain true as plain DAC.

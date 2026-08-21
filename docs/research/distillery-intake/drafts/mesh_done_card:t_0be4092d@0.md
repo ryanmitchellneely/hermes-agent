@@ -7,8 +7,8 @@ source_path: t_0be4092d
 source_ref: t_0be4092d@0
 board: mesh
 captured_at: 2026-08-09T03:15:16Z
-status: draft
-status_changed_at: 2026-08-09T03:15:16Z
+status: stale
+status_changed_at: 2026-08-20T21:31:20Z
 superseded_by: null
 ```
 
