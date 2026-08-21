@@ -296,6 +296,34 @@ def test_report_class_with_auto_still_arms(sweep_mod, tmp_path):
     assert blocks == []  # armed: no block call
 
 
+def test_drafted_body_carries_repair_class_marker(sweep_mod, tmp_path):
+    """Wrapper contract (t_18792526): the drafted card body carries a
+    machine-readable repair-class line the dsh wrapper's gauntlet gate
+    reads. Without the stamp, a patch-class card is indistinguishable from
+    an ordinary card at PR time."""
+    entries = sweep_mod.parse_entries(_pb_entry(tmp_path))
+    assert entries[0]["repair_class"] == "patch"
+    creates = []
+    real_run = sweep_mod.subprocess.run
+
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 0
+            stdout = "Created t_7777beef\n"
+        if "create" in cmd:
+            creates.append(cmd)
+        return R()
+
+    sweep_mod.subprocess.run = fake_run
+    try:
+        sweep_mod.draft_repair_card("mesh", "t_src", entries[0], dry_run=False)
+    finally:
+        sweep_mod.subprocess.run = real_run
+    assert len(creates) == 1
+    body = creates[0][creates[0].index("--body") + 1]
+    assert body.rstrip().endswith("repair-class: patch")
+
+
 def test_actionable_counts_only_live_nondeliberate_cards(sweep_mod, tmp_path):
     """`failures` counts rows; `actionable` counts distinct live cards that
     are neither deliberate parks nor already-resolved — the residue that is

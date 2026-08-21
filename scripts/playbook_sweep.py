@@ -227,6 +227,11 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
         "reviewer lane issues an independent verdict; report-only deliverables "
         "may `complete` directly."
     )
+    # Machine marker for the dsh wrapper's gauntlet gate (t_18792526 wrapper
+    # half): the wrapper treats any non-"report" class as promotion-record-
+    # required, restrictive direction only. Stamped by the sweep so the
+    # wrapper reads the sweep's own line, not card prose.
+    body += f"\n\nrepair-class: {entry['repair_class']}"
     if dry_run:
         print(f"[dry-run] would draft repair card on {board} for {entry['id']}")
         return "dry-run"
