@@ -197,7 +197,11 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
         assert kb.claim_task(conn, t) is None
 
         events = kb.list_events(conn, t)
-        assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+        # Payload also carries "by" (event author) — assert on the reason only.
+        assert any(
+            e.kind == "scheduled" and e.payload.get("reason") == "run next week"
+            for e in events
+        )
 
 
 
@@ -1020,7 +1024,7 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
     with kb.connect() as conn:
         # A is done.
         a = kb.create_task(conn, title="parent-done")
-        kb.complete_task(conn, a)
+        kb.complete_task(conn, a, result="done")
 
         # C is running (not done) — blocks child B.
         c = kb.create_task(conn, title="parent-running")
