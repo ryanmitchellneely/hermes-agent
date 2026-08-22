@@ -115,7 +115,10 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         task = kb.get_task(conn, tid)
 
     workspace, branch = kb._resolve_worktree_workspace(task)
-    assert workspace == (repo / ".worktrees" / tid).resolve()
+    # Fresh fallback worktrees land in the sibling container (PB-012).
+    assert workspace == (
+        repo.parent / (repo.name + ".worktrees") / tid
+    ).resolve()
     assert branch == f"wt/{tid}"
     # The sibling's checkout is untouched, still on its own branch.
     assert (occupied / "README.md").exists()

@@ -32,6 +32,12 @@ absolute ones.
 
 **Do NOT** grant danger-full-access for this, and do not treat the denial as a
 sandbox defect (PB-010's corrected lesson applies: prove what was actually
-denied before believing the stated reason). Structural cure worth a card if
-this recurs: move kanban worktrees OUTSIDE the clone tree so no twin path
-exists.
+denied before believing the stated reason).
+
+**Structural cure LANDED (2026-08-22, harness card t_463b3d5f):** kanban
+worktrees now materialize in the sibling container `<repo>.worktrees/<task-id>`
+— the clone is no longer an ancestor of the workspace, so no twin path is
+reachable. Existing legacy in-repo checkouts are reused until they gc out.
+Engine side activates on the next gateway restart; pre-relocation cards keep
+hitting this trap until then, so the comment-and-unblock fix above stays
+relevant for the transition.

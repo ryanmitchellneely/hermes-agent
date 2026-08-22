@@ -3265,11 +3265,13 @@ def create_task(
                 and source_task.workspace_path
             ):
                 source_path = Path(source_task.workspace_path)
-                if (
-                    source_path.is_absolute()
+                source_repo = (
+                    _repo_root_for_worktree_path(source_path)
+                    if source_path.is_absolute()
                     and source_path.name == source_task.id
-                    and source_path.parent.name == ".worktrees"
-                ):
+                    else None
+                )
+                if source_repo is not None:
                     project_slug = None
                     if source_task.branch_name:
                         prefix, separator, leaf = source_task.branch_name.partition("/")
@@ -3287,7 +3289,7 @@ def create_task(
                         except ValueError:
                             project_slug = None
                     if project_slug:
-                        project_repo = str(source_path.parent.parent)
+                        project_repo = str(source_repo)
                         project_obj = _pdb.Project(
                             id=project_id,
                             slug=project_slug,
@@ -3483,11 +3485,12 @@ def create_task(
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
                 # Project-linked or dir→worktree-rewritten path: a fresh
-                # worktree dir under the repo plus (when project resolves) a
-                # deterministic branch (project slug + task id).
+                # worktree dir in the repo's sibling container plus (when
+                # project resolves) a deterministic branch (project slug +
+                # task id).
                 if workspace_kind == "worktree" and project_repo and not workspace_path:
-                    workspace_path = os.path.join(
-                        project_repo, ".worktrees", task_id
+                    workspace_path = str(
+                        _worktree_target(Path(project_repo), task_id)
                     )
                 if project_obj is not None and workspace_kind == "worktree":
                     if not branch_name:
@@ -7445,8 +7448,8 @@ def decompose_triage_task(
                 # directory on the first-dispatched sibling's branch, with
                 # no lock — siblings can be promoted and dispatched
                 # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
+                # materializes a fresh per-task worktree (sibling
+                # container) per child from the board anchor.
                 child_ws_path = None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
@@ -7743,6 +7746,70 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+_WORKTREE_CONTAINER_SUFFIX = ".worktrees"
+
+
+def _worktree_container(repo_root: Path) -> Path:
+    """Sibling container for per-task worktrees: ``<parent>/<name>.worktrees``.
+
+    Per-task worktrees used to live INSIDE the clone
+    (``<repo>/.worktrees/<task-id>``), which made the clone an ancestor of
+    every sandboxed workspace: each tracked file had a reachable twin at the
+    clone's own path, models edited the twin, and workspace-write sandboxes
+    denied it correctly (playbook PB-012). A sibling container keeps the same
+    filesystem while removing the ancestor relationship, so no twin path is
+    reachable by walking up from inside the workspace.
+    """
+    return repo_root.parent / (repo_root.name + _WORKTREE_CONTAINER_SUFFIX)
+
+
+def _worktree_target(repo_root: Path, task_id: str) -> Path:
+    """Where ``task_id``'s worktree lives under ``repo_root``.
+
+    Prefers the sibling container; an existing legacy in-repo checkout
+    (``<repo>/.worktrees/<task-id>``) is reused so pre-relocation tasks keep
+    their workspace across re-dispatch.
+    """
+    legacy = repo_root / ".worktrees" / task_id
+    if legacy.exists():
+        return legacy
+    return _worktree_container(repo_root) / task_id
+
+
+def _repo_root_for_worktree_path(path: Path) -> Optional[Path]:
+    """Recover the repo root that owns worktree ``path``, either layout.
+
+    Legacy: ``<repo>/.worktrees/<id>`` -> ``<repo>``.
+    Sibling: ``<parent>/<name>.worktrees/<id>`` -> ``<parent>/<name>``.
+    Shape-only — returns None when the path matches neither layout; callers
+    that need a real repo must still verify with git.
+    """
+    parent = path.parent
+    if parent.name == ".worktrees":
+        return parent.parent
+    if (
+        parent.name.endswith(_WORKTREE_CONTAINER_SUFFIX)
+        and parent.name != _WORKTREE_CONTAINER_SUFFIX
+    ):
+        return parent.parent / parent.name[: -len(_WORKTREE_CONTAINER_SUFFIX)]
+    return None
+
+
+def _owning_repo_root(requested: Path) -> Optional[Path]:
+    """Repo root owning an explicit worktree target path, either layout.
+
+    Tries the shape-based recovery first (a sibling container is NOT inside
+    its repo, so the legacy walk-up cannot find it), then falls back to
+    walking up from the requested path's parent.
+    """
+    shaped = _repo_root_for_worktree_path(requested)
+    if shaped is not None:
+        top = _git_toplevel(shaped)
+        if top is not None:
+            return top
+    return _repo_root_for_worktree_target(requested.parent)
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -7780,11 +7847,12 @@ def _resolve_worktree_workspace(
 
     When ``task.workspace_path`` is unset, the anchor is the board's
     ``default_workdir`` (a persistent project checkout). This keeps every
-    worktree task under a meaningful, board-owned repo — ``<repo>/.worktrees/
-    <task-id>`` — instead of silently landing under the dispatcher's current
-    working directory (which is whatever directory the gateway happened to be
-    launched from, e.g. the Hermes checkout). If no anchor is configured
-    anywhere, we fail loudly rather than guess.
+    worktree task under a meaningful, board-owned repo — the sibling
+    container ``<repo>.worktrees/<task-id>`` — instead of silently landing
+    under the dispatcher's current working directory (which is whatever
+    directory the gateway happened to be launched from, e.g. the Hermes
+    checkout). If no anchor is configured anywhere, we fail loudly rather
+    than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
@@ -7812,7 +7880,7 @@ def _resolve_worktree_workspace(
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        target = repo_root / ".worktrees" / task.id
+        target = _worktree_target(repo_root, task.id)
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
@@ -7835,9 +7903,9 @@ def _resolve_worktree_workspace(
         # branch — silent cross-task provenance corruption, and unsafe
         # when siblings run concurrently. Fall back to a fresh worktree
         # of our own under the same repo.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        fallback_root = _owning_repo_root(requested)
         if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
+            fallback = _worktree_target(fallback_root, task.id)
             if fallback.resolve(strict=False) != requested_resolved:
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
@@ -7848,11 +7916,11 @@ def _resolve_worktree_workspace(
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
-        target = repo_root / ".worktrees" / task.id
+        target = _worktree_target(repo_root, task.id)
         _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
-    repo_root = _repo_root_for_worktree_target(requested.parent)
+    repo_root = _owning_repo_root(requested)
     if repo_root is None:
         raise ValueError(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
@@ -7877,13 +7945,14 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       compute the absolute path themselves.
     - ``worktree``: a real linked git worktree. If ``workspace_path`` names
       a repo root, Hermes treats it as an anchor and materializes a linked
-      worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
-      a concrete target path, Hermes creates/reuses that linked worktree. With
-      no ``workspace_path``, Hermes anchors on the board's ``default_workdir``
-      and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
-      ``default_workdir`` is configured it raises rather than guessing from the
-      dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
+      worktree in the sibling container ``<repo>.worktrees/<task-id>``
+      (an existing legacy ``<repo>/.worktrees/<task-id>`` checkout is
+      reused). If ``workspace_path`` names a concrete target path, Hermes
+      creates/reuses that linked worktree. With no ``workspace_path``,
+      Hermes anchors on the board's ``default_workdir`` and materializes
+      the per-task sibling worktree; if no ``default_workdir`` is
+      configured it raises rather than guessing from the dispatcher's CWD.
+      When ``branch_name`` is empty, Hermes uses ``wt/<task-id>``.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -11757,13 +11826,14 @@ def gc_stale_worktrees(
 
     MESH-INFRA-2 disk policy: worktree isolation is cheap at create time but
     unbounded growth is not. Only touches paths that look like Hermes
-    per-task worktrees (``…/.worktrees/<task_id>``) for tasks in
+    per-task worktrees — the sibling container ``<repo>.worktrees/<task_id>``
+    or the legacy in-repo ``<repo>/.worktrees/<task_id>`` — for tasks in
     ``done``/``archived`` whose ``completed_at`` (or ``created_at`` fallback)
     is older than ``older_than_seconds``.
 
-    Never deletes the main checkout, never walks outside ``.worktrees/``,
-    and never removes a worktree still referenced by a non-terminal task.
-    Returns counts: ``{removed, skipped, errors}``.
+    Never deletes the main checkout, never walks outside a worktree
+    container, and never removes a worktree still referenced by a
+    non-terminal task. Returns counts: ``{removed, skipped, errors}``.
     """
     cutoff = int(time.time()) - int(older_than_seconds)
     rows = conn.execute(
@@ -11809,8 +11879,12 @@ def gc_stale_worktrees(
         except (OSError, TypeError, ValueError):
             skipped += 1
             continue
-        # Safety: only ``…/.worktrees/<task_id>`` shaped paths for THIS task.
-        if path.name != row["id"] or path.parent.name != ".worktrees":
+        # Safety: only per-task worktree shaped paths (either layout) for
+        # THIS task.
+        repo_root = (
+            _repo_root_for_worktree_path(path) if path.name == row["id"] else None
+        )
+        if repo_root is None:
             skipped += 1
             continue
         if str(path) in live_paths:
@@ -11819,7 +11893,6 @@ def gc_stale_worktrees(
         if not path.exists():
             skipped += 1
             continue
-        repo_root = path.parent.parent
         try:
             # Prefer git's own remover so the worktree registry stays clean.
             result = subprocess.run(

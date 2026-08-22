@@ -151,6 +151,32 @@ def test_kanban_task_worktrees_collapse_into_one_bucket():
     assert _lane_ids(project)[-1] == "/repo::kanban"
 
 
+def test_sibling_container_kanban_worktrees_collapse_too():
+    """PB-012 relocation: `<repo>.worktrees/t_<hex>` groups like the legacy layout."""
+    resolve = _resolver(
+        {
+            "/srv/repo": ("/srv/repo", "/srv/repo"),
+            "/srv/repo.worktrees/t_aaaaaaaa": ("/srv/repo", "/srv/repo.worktrees/t_aaaaaaaa"),
+            "/srv/repo.worktrees/t_bbbbbbbb": ("/srv/repo", "/srv/repo.worktrees/t_bbbbbbbb"),
+        }
+    )
+    sessions = [
+        _session("/srv/repo", branch="main"),
+        _session("/srv/repo.worktrees/t_aaaaaaaa"),
+        _session("/srv/repo.worktrees/t_bbbbbbbb"),
+    ]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = tree["projects"][0]
+    kanban = [g for repo in project["repos"] for g in repo["groups"] if g.get("isKanban")]
+
+    assert len(kanban) == 1
+    assert kanban[0]["path"] == "/srv/repo.worktrees"
+    assert len(kanban[0]["sessions"]) == 2
+    # The bucket sorts below the real main branch.
+    assert _lane_ids(project)[-1] == "/srv/repo::kanban"
+
+
 def test_user_worktree_under_dotworktrees_is_its_own_lane_not_kanban():
     # A user "New worktree" lives at <repo>/.worktrees/<slug> (no t_ id), so it
     # must NOT collapse into the kanban bucket — it gets its own linked lane.

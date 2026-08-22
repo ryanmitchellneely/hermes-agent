@@ -98,10 +98,10 @@ def test_git_default_workdir_omitted_kind_is_worktree(fresh_home, tmp_path):
         task = kb.get_task(conn, tid)
         assert task.workspace_kind == "worktree"
         # Anchored under board default_workdir (repo root) until resolve, or
-        # pre-keyed under .worktrees when project_repo pathing runs.
+        # pre-keyed in the sibling container when project_repo pathing runs.
         assert task.workspace_path in {
             str(repo),
-            str(repo / ".worktrees" / tid),
+            str(repo.parent / (repo.name + ".worktrees") / tid),
         }
     finally:
         conn.close()
@@ -144,7 +144,9 @@ def test_dir_main_repo_rewritten_to_worktree(fresh_home, tmp_path):
         )
         task = kb.get_task(conn, tid)
         assert task.workspace_kind == "worktree"
-        assert task.workspace_path == str(repo / ".worktrees" / tid)
+        assert task.workspace_path == str(
+            repo.parent / (repo.name + ".worktrees") / tid
+        )
     finally:
         conn.close()
 
@@ -228,6 +230,106 @@ def test_gc_stale_worktrees_only_removes_aged_terminal(fresh_home, tmp_path):
         )
         conn.commit()
         stats = kb.gc_stale_worktrees(conn, older_than_seconds=0, board="gcboard")
+        assert stats["removed"] == 1
+        assert not target.exists()
+    finally:
+        conn.close()
+
+
+def test_resolve_workspace_materializes_sibling_worktree(fresh_home, tmp_path):
+    """PB-012 clone-twin cure: new worktrees land OUTSIDE the clone tree."""
+    repo = _make_repo(tmp_path)
+    kb.create_board("sib", name="Sib", default_workdir=str(repo))
+    conn = kb.connect(board="sib")
+    try:
+        tid = kb.create_task(conn, title="edit a file", board="sib")
+        task = kb.get_task(conn, tid)
+        resolved = kb.resolve_workspace(task, board="sib")
+        expected = repo.parent / (repo.name + ".worktrees") / tid
+        assert resolved == expected
+        assert resolved.exists()
+        # The clone must not be an ancestor of the workspace.
+        assert repo.resolve() not in resolved.resolve().parents
+        # Still a linked worktree of the repo (same git common dir).
+        out = subprocess.run(
+            ["git", "-C", str(resolved), "rev-parse", "--git-common-dir"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert Path(out).resolve() == (repo / ".git").resolve()
+    finally:
+        conn.close()
+
+
+def test_resolve_workspace_reuses_legacy_in_repo_checkout(fresh_home, tmp_path):
+    """Pre-relocation tasks keep their in-repo checkout across re-dispatch."""
+    repo = _make_repo(tmp_path)
+    kb.create_board("leg", name="Leg", default_workdir=str(repo))
+    conn = kb.connect(board="leg")
+    try:
+        tid = kb.create_task(conn, title="old task", board="leg")
+        legacy = repo / ".worktrees" / tid
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-b",
+                f"wt/{tid}",
+                str(legacy),
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        task = kb.get_task(conn, tid)
+        resolved = kb.resolve_workspace(task, board="leg")
+        assert resolved == legacy
+    finally:
+        conn.close()
+
+
+def test_gc_removes_sibling_layout_worktree(fresh_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = repo.parent / (repo.name + ".worktrees") / "t_sibtask1"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "worktree",
+            "add",
+            "-b",
+            "wt/t_sibtask1",
+            str(target),
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    kb.create_board("gcsib", name="GCSib", default_workdir=str(repo))
+    conn = kb.connect(board="gcsib")
+    try:
+        tid = kb.create_task(
+            conn,
+            title="old sibling",
+            board="gcsib",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/t_sibtask1",
+        )
+        conn.execute(
+            "UPDATE tasks SET id = ?, workspace_path = ?, status = 'done', "
+            "completed_at = 1, created_at = 1 WHERE id = ?",
+            ("t_sibtask1", str(target), tid),
+        )
+        conn.commit()
+        stats = kb.gc_stale_worktrees(conn, older_than_seconds=0, board="gcsib")
         assert stats["removed"] == 1
         assert not target.exists()
     finally:

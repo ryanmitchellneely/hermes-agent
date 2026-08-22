@@ -42,10 +42,11 @@ Resolve = Callable[[str], Optional[dict]]
 # project that lives on the other host.
 Exists = Callable[[str], bool]
 
-# Only KANBAN-TASK worktrees (`<repo>/.worktrees/t_<hex>`, the `t_…` id kanban_db
-# mints) collapse into one lane; user-named "New worktree" dirs under
-# `.worktrees/` stay as their own lanes.
-_KANBAN_DIR_RE = re.compile(r"^(.*[/\\]\.worktrees)[/\\]t_[0-9a-f]+[/\\]?$")
+# Only KANBAN-TASK worktrees (the `t_…` id kanban_db mints, in either the
+# sibling container `<repo>.worktrees/t_<hex>` or the legacy in-repo
+# `<repo>/.worktrees/t_<hex>`) collapse into one lane; user-named
+# "New worktree" dirs under `.worktrees/` stay as their own lanes.
+_KANBAN_DIR_RE = re.compile(r"^(.*[/\\][^/\\]*\.worktrees)[/\\]t_[0-9a-f]+[/\\]?$")
 _TRUNK_BRANCHES = {"main", "master", "trunk", "develop"}
 DEFAULT_BRANCH_LABEL = "main"
 

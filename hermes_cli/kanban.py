@@ -985,7 +985,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument(
         "--worktree-retention-days", type=int, default=14,
         help="Remove done/archived per-task git worktrees older than N days "
-             "(default: 14). Only <repo>/.worktrees/<task_id> paths are eligible.",
+             "(default: 14). Only per-task worktree paths are eligible — "
+             "the <repo>.worktrees/<task_id> sibling container or the "
+             "legacy in-repo <repo>/.worktrees/<task_id>.",
     )
 
     # --- repair ---
