@@ -30,7 +30,12 @@ itself, where it cannot be skipped by forgetting.
   is an ordinary observable organ (heartbeat + surface per the K2 observability
   principle).
 - **Write discipline:** any failure a session resolves that had no hit becomes a
-  new entry in the same change that fixes it. The sweep also surfaces
+  new entry in the same change that fixes it. A `repair:` instruction is code
+  that runs somewhere specific: write it for the EXECUTING runtime (k2vps as
+  `t1000` since the 2026-08-19 flip -- absolute Linux paths, never `~` or Mac
+  paths/commands) and **execute every command in that runtime once before
+  arming it**. All five armed entries carried dead Mac paths until 2026-08-24
+  (`a0a56d8db`) because the signed PB-002 template was never re-run post-flip. The sweep also surfaces
   no-hit-blocked cards as entry candidates, so the corpus grows from real
   misses, not speculation.
 - **Staleness:** entries carry `verified` + `sources`. v0: the sweep warns on
