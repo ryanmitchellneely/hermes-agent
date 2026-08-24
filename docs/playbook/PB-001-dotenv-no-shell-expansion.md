@@ -9,6 +9,10 @@ verified: 2026-08-19
 sources:
   - "K2 PR #5156 (lane doc §10 failure classes)"
   - "mesh t_da63b06a run-934"
+repair: "REPORT-ONLY env-file audit, modify nothing: run grep -nE '\$HOME|\$[A-Z_]+/|~/[^ ]*\$' on /Users/ryan/.t1000/.env and /Users/ryan/.t1000/secrets/dsh-bot.env (the two files fixed live on 2026-08-18). Completion summary must list every remaining non-absolute-path line found in either file, or state CLEAN if none. If the failing card's own error text names a path from an env file other than these two, name that file explicitly as a NEW SITE not covered by the 2026-08-18 fix. Do not edit, copy, or delete anything."
+repair_assignee: worker
+repair_auto: true
+repair_class: report
 ---
 
 **Symptom:** a path or credential env var works when a shell script sources the

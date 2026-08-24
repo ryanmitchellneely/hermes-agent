@@ -10,6 +10,10 @@ verified: 2026-08-19
 sources:
   - "K2 DEEPSEEK-HARNESS-LANE.md §9 (two PATH traps, one blocked dispatch each)"
   - "mesh t_3e630202, t_6ad51c8c"
+repair: "REPORT-ONLY launchd-PATH audit, modify nothing: read /Users/ryan/Library/LaunchAgents/ai.hermes.gateway.plist.mac-glass and confirm (a) ProgramArguments[0] is an absolute path, not a bare command, and (b) EnvironmentVariables.PATH leads with /Users/ryan/Documents/T1000/venv/bin before any system path entry. Completion summary must state PASS/FAIL for each of the two checks, quoting the actual ProgramArguments[0] value and the first three PATH entries. Do not edit, copy, or delete anything."
+repair_assignee: worker
+repair_auto: true
+repair_class: report
 ---
 
 **Symptom:** a worker/child process can't find an executable that works fine in

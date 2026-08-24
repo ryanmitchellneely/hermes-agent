@@ -9,6 +9,10 @@ verified: 2026-08-22
 sources:
   - "k2 t_94a4db9a runs 1453 (deny) / 1454 (clean) — the patch-class live-fire, 2026-08-22"
   - "dsh session trajectory session-370a6a26 (edit tool targeted the clone path; sandbox denied)"
+repair: "REPORT-ONLY structural-cure-activation audit, modify nothing: run 'ls -d /Users/ryan/Documents/kevin-real-estate-tools.worktrees' (the sibling-container path from the 2026-08-22 cure, harness card t_463b3d5f) and 'ls /Users/ryan/Documents/kevin-real-estate-tools/.worktrees/ | wc -l' (the legacy in-repo count). Completion summary must state ACTIVE (cure is live) if the sibling container exists, or NOT YET ACTIVE (quoting the legacy count) if it does not -- either way, restate PB-012's fix verbatim (repo-relative paths in card bodies, never absolute; do not grant danger-full-access) so it lands wherever this hit surfaces. Do not edit, copy, or delete anything."
+repair_assignee: worker
+repair_auto: true
+repair_class: report
 ---
 
 **Symptom:** a dsh run on a card that edits an EXISTING repo file reports

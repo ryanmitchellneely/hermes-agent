@@ -10,6 +10,10 @@ verified: 2026-08-19
 sources:
   - "mesh t_7fa5ce83 (root cause + fix), t_df743692, t_12ecbf2f"
   - "T1000 7ec01d2703 (GH_TOKEN mint seam)"
+repair: "REPORT-ONLY credential-mint audit, modify nothing: read /Users/ryan/Library/LaunchAgents/ai.hermes.gateway.plist.mac-glass and confirm GIT_CONFIG_GLOBAL points at /Users/ryan/.t1000/fleet-gitconfig and HERMES_KANBAN_GH_TOKEN_CMD points at /Users/ryan/.t1000/bin/k2app-token (the App-token mint pattern from T1000 7ec01d2703) rather than being absent or pointing at a keychain-dependent helper. Completion summary must quote both values and state PASS/FAIL against the expected pattern. Do not edit, copy, or delete anything."
+repair_assignee: worker
+repair_auto: true
+repair_class: report
 ---
 
 **Symptom:** GitHub (or any keychain-backed) auth works interactively but every
