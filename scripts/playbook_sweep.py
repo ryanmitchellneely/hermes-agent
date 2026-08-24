@@ -208,13 +208,131 @@ def comment_hit(board: str, task_id: str, entry: dict, dry_run: bool) -> bool:
 # deliberate human act, not something the sweep can do to itself.
 REPAIR_BUDGET = int(os.environ.get("PLAYBOOK_REPAIR_BUDGET") or 3)
 
+# Option A (Kevin's K2 inbox-5251 ruling, 2026-08-23): a patch class may arm
+# when the K2 repo carries, AT origin/main, BOTH a registry row with a real
+# enumerated scope AND a promoted record for that class. This check is
+# deliberately shallow — registry row + scope shape + record verdict — because
+# the dsh wrapper's gate re-validates everything fail-closed at PR time (deep
+# record validation, base-loaded registry, per-path scope enforcement). The
+# sweep's copy exists only to decide born-armed vs parked; a false positive
+# here still cannot push code past the wrapper.
+_K2_REPO_CANDIDATES = (
+    HOME / "src" / "kevin-real-estate-tools",              # VPS shape
+    Path.home() / "Documents" / "kevin-real-estate-tools", # Mac shape
+)
+K2_REPO = Path(
+    os.environ.get("PLAYBOOK_K2_REPO")
+    or next((str(p) for p in _K2_REPO_CANDIDATES if p.is_dir()), str(_K2_REPO_CANDIDATES[0]))
+)
+_K2_REGISTRY = "docs/gauntlets/candidate-class-registry.json"
+_K2_PROMOTIONS = "docs/promotions"
 
-def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> str | None:
+
+def _k2_show(rel: str, repo: Path) -> str | None:
+    """K2 file content at origin/main — never the working tree (may be stale/dirty)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "show", f"origin/main:{rel}"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _scope_is_real(scope: object) -> bool:
+    """Mirrors the wrapper's rider check: real path list + positive int cap."""
+    if not isinstance(scope, dict):
+        return False
+    allowed = scope.get("allowed_paths")
+    cap = scope.get("max_files")
+    return (
+        isinstance(allowed, list)
+        and bool(allowed)
+        and all(isinstance(a, str) and a.strip() and a.strip() != "/" for a in allowed)
+        and isinstance(cap, int)
+        and not isinstance(cap, bool)
+        and cap >= 1
+    )
+
+
+def validated_patch_classes(repo: Path | None = None) -> set[str]:
+    """Classes that may arm patch drafting. FAIL-CLOSED: any error -> empty.
+
+    A class qualifies only when K2 origin/main carries a registry row with a
+    real enumerated scope AND at least one promotions record for it with
+    verdict:promoted. Best-effort fetch first so origin/main means today.
+    """
+    repo = repo or K2_REPO
+    if not (repo / ".git").exists() and not (repo / "HEAD").exists():
+        return set()
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo), "fetch", "--quiet", "origin", "main"],
+            timeout=60, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # stale origin/main is still origin/main; the wrapper re-checks
+    reg_text = _k2_show(_K2_REGISTRY, repo)
+    if reg_text is None:
+        return set()
+    try:
+        rows = json.loads(reg_text).get("classes", [])
+    except ValueError:
+        return set()
+    scoped = {
+        r.get("id") for r in rows
+        if isinstance(r, dict) and r.get("id") and _scope_is_real(r.get("scope"))
+    }
+    if not scoped:
+        return set()
+    promoted: set[str] = set()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "ls-tree", "--name-only",
+             "origin/main", _K2_PROMOTIONS + "/"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=30, check=False,
+        )
+        names = [l.strip() for l in (proc.stdout or "").splitlines() if l.strip().endswith(".json")]
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    for rel in names:
+        blob = _k2_show(rel, repo)
+        if blob is None:
+            continue
+        try:
+            doc = json.loads(blob)
+        except ValueError:
+            continue
+        cls = doc.get("candidate_class")
+        if cls in scoped and doc.get("verdict") == "promoted":
+            promoted.add(cls)
+    return promoted
+
+
+def draft_repair_card(
+    board: str,
+    task_id: str,
+    entry: dict,
+    dry_run: bool,
+    validated: frozenset[str] | set[str] = frozenset(),
+) -> str | None:
     """Draft the repair card for a hit entry carrying a repair: instruction.
 
     Returns the new card id (or a dry-run marker), None on failure. Cards
-    are born armed only when the entry says ``repair_auto: true``; otherwise
-    create-then-block sticky (PB-006: --initial-status alone does not hold).
+    are born armed only when the entry says ``repair_auto: true`` AND the
+    class may arm: report-class always may; a patch class only when it is in
+    ``validated`` (Option A — a scoped registry row plus a promoted record at
+    K2 origin/main; see validated_patch_classes). Otherwise create-then-block
+    sticky (PB-006: --initial-status alone does not hold).
+
+    A validated patch-class card is created project-linked (``--project k2
+    --workspace worktree``, assignee dsh) so it dispatches into a real K2
+    worktree and the wrapper's PR flow — where the gate re-validates the
+    class, record, and scope fail-closed before any push.
     """
     title = f"AUTO-REPAIR ({entry['id']}): follow-up to {task_id}"
     body = (
@@ -232,16 +350,21 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
     # required, restrictive direction only. Stamped by the sweep so the
     # wrapper reads the sweep's own line, not card prose.
     body += f"\n\nrepair-class: {entry['repair_class']}"
+    is_report = entry["repair_class"] == "report"
+    class_validated = entry["repair_class"] in validated
     if dry_run:
         print(f"[dry-run] would draft repair card on {board} for {entry['id']}")
         return "dry-run"
+    create_args = [
+        HERMES, "kanban", "--board", board, "create", title,
+        "--body", body,
+        "--assignee", "dsh" if class_validated else entry["repair_assignee"],
+        "--created-by", "playbook-sweep",
+    ]
+    if class_validated:
+        create_args += ["--project", "k2", "--workspace", "worktree"]
     create = subprocess.run(
-        [
-            HERMES, "kanban", "--board", board, "create", title,
-            "--body", body,
-            "--assignee", entry["repair_assignee"],
-            "--created-by", "playbook-sweep",
-        ],
+        create_args,
         capture_output=True,
         text=True,
         timeout=60,
@@ -250,18 +373,19 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
     if create.returncode != 0 or not m:
         return None
     new_id = m.group(1)
-    # repair_auto only means "armed" for report-class repairs. Patch-class
-    # (the fail-closed default) always parks: arming it requires the ADR-073
-    # promotion-record path, which does not exist yet (t_18792526 half b/c).
-    armed = entry["repair_auto"] and entry["repair_class"] == "report"
+    # repair_auto means "armed" for report-class repairs, and — since Kevin's
+    # Option-A ruling (K2 inbox-5251, 2026-08-23) — for patch classes whose
+    # registry row carries a real scope and whose promoted record stands at
+    # K2 origin/main. Everything else parks sticky.
+    armed = entry["repair_auto"] and (is_report or class_validated)
     if not armed:
-        if entry["repair_class"] != "report":
+        if not is_report:
             reason = (
                 f"GAUNTLET GATE ({entry['id']} is {entry['repair_class']}-class): "
-                f"a patch-producing repair cannot arm without an ADR-073 "
-                f"promotion record; K2-side candidate-class registration is "
-                f"pending Kevin's ruling (design: mesh t_18792526). Human may "
-                f"still run this attended."
+                f"this class is not validated at K2 origin/main (needs a "
+                f"registry row with an enumerated scope AND a promoted "
+                f"ADR-073 record — Option A per inbox-5251). Human may still "
+                f"run this attended, or mint the class via the live-fire path."
             )
         else:
             reason = (
@@ -287,6 +411,14 @@ def draft_repair_card(board: str, task_id: str, entry: dict, dry_run: bool) -> s
 
 def sweep(dry_run: bool = False) -> dict:
     entries = parse_entries(PLAYBOOK_DIR)
+    # Option-A class check costs a K2 fetch — only pay it when some entry
+    # could actually use it (armed patch-class repair instruction present).
+    validated: frozenset[str] = frozenset()
+    if any(
+        e.get("repair") and e["repair_auto"] and e["repair_class"] != "report"
+        for e in entries
+    ):
+        validated = frozenset(validated_patch_classes())
     state = _load_state()
     seen = set(tuple(x) for x in state["commented"])
     since = time.time() - WINDOW_SECS
@@ -364,7 +496,10 @@ def sweep(dry_run: bool = False) -> dict:
                             )
                             state["repair_budget_warned"] = True
                         continue
-                    if draft_repair_card(board, failure["task_id"], entry, dry_run):
+                    if draft_repair_card(
+                        board, failure["task_id"], entry, dry_run,
+                        validated=validated,
+                    ):
                         counts["repairs"] += 1
                         drafted.add(rkey)
                         state["repairs"].append(list(rkey))

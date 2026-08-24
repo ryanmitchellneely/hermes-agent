@@ -195,7 +195,7 @@ def test_repair_draft_seeded_from_hit_and_budgeted(sweep_mod, tmp_path, capsys):
     drafted = []
     sweep_mod.comment_hit = lambda *a: True
     sweep_mod.draft_repair_card = (
-        lambda b, t, e, d: drafted.append((b, t, e["id"])) or "t_new"
+        lambda b, t, e, d, **k: drafted.append((b, t, e["id"])) or "t_new"
     )
     c1 = sweep_mod.sweep(dry_run=False)
     c2 = sweep_mod.sweep(dry_run=False)
@@ -210,7 +210,7 @@ def test_repair_budget_is_a_hard_stop(sweep_mod, tmp_path, capsys):
         [(f"t_h{i}", "blocked", RUN_935_SHORT, None, now - 60) for i in range(5)],
     )
     sweep_mod.comment_hit = lambda *a: True
-    sweep_mod.draft_repair_card = lambda *a: "t_new"
+    sweep_mod.draft_repair_card = lambda *a, **k: "t_new"
     counts = sweep_mod.sweep(dry_run=False)
     out = capsys.readouterr().out
     assert counts["repairs"] == sweep_mod.REPAIR_BUDGET == 3
@@ -355,3 +355,119 @@ def test_actionable_counts_only_live_nondeliberate_cards(sweep_mod, tmp_path):
     counts = sweep_mod.sweep(dry_run=True)
     assert counts["failures"] == 5      # every row
     assert counts["actionable"] == 2    # t_live0000 (deduped) + t_live0001
+
+
+# ---- Option A arming (Kevin's K2 inbox-5251 ruling) ----------------------
+
+import json
+import subprocess as _sp
+
+
+def _k2_fixture_repo(tmp_path, *, scope=True, record=True, verdict="promoted"):
+    """A K2-shaped git repo whose origin/main carries registry (+record)."""
+    repo = tmp_path / "k2"
+    repo.mkdir(parents=True)
+    _sp.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _sp.run(["git", "config", "user.email", "t@t.t"], cwd=repo, check=True)
+    _sp.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    row = {"id": "dsh-lane-autonomous-patch", "version": 1}
+    if scope:
+        row["scope"] = {
+            "allowed_paths": ["docs/agent-coordination/devbot/"],
+            "max_files": 5,
+        }
+    reg = repo / "docs" / "gauntlets" / "candidate-class-registry.json"
+    reg.parent.mkdir(parents=True)
+    reg.write_text(json.dumps({"schema_version": 1, "classes": [row]}))
+    if record:
+        rec = repo / "docs" / "promotions" / "2026-08-22-x.json"
+        rec.parent.mkdir(parents=True)
+        rec.write_text(
+            json.dumps(
+                {"candidate_class": "dsh-lane-autonomous-patch", "verdict": verdict}
+            )
+        )
+    _sp.run(["git", "add", "-A"], cwd=repo, check=True)
+    _sp.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    _sp.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=repo, check=True)
+    return repo
+
+
+def test_validated_needs_scope_and_promoted_record(sweep_mod, tmp_path):
+    good = _k2_fixture_repo(tmp_path, scope=True, record=True)
+    assert sweep_mod.validated_patch_classes(good) == {"dsh-lane-autonomous-patch"}
+
+
+def test_validated_refuses_scopeless_row(sweep_mod, tmp_path):
+    repo = _k2_fixture_repo(tmp_path, scope=False, record=True)
+    assert sweep_mod.validated_patch_classes(repo) == set()
+
+
+def test_validated_refuses_missing_or_unpromoted_record(sweep_mod, tmp_path):
+    no_rec = _k2_fixture_repo(tmp_path, scope=True, record=False)
+    assert sweep_mod.validated_patch_classes(no_rec) == set()
+    rejected = _k2_fixture_repo(tmp_path / "b", scope=True, verdict="rejected")
+    assert sweep_mod.validated_patch_classes(rejected) == set()
+
+
+def test_validated_fails_closed_without_repo(sweep_mod, tmp_path):
+    assert sweep_mod.validated_patch_classes(tmp_path / "nowhere") == set()
+
+
+def _capture_hermes(monkeypatch, sweep_mod):
+    """Fake the hermes CLI: record argv, answer create with a card id."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        class R:
+            returncode = 0
+            stdout = "Created t_abc12345 (ready, assignee=-)"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(sweep_mod.subprocess, "run", fake_run)
+    return calls
+
+
+PATCH_ENTRY = {
+    "id": "PB-099",
+    "patterns": ["x"],
+    "fix_line": "f",
+    "path": "docs/playbook/PB-099-x.md",
+    "repair": "fix the thing",
+    "repair_assignee": "worker",
+    "repair_auto": True,
+    "repair_class": "dsh-lane-autonomous-patch",
+}
+
+
+def test_validated_patch_class_births_armed_project_card(sweep_mod, monkeypatch):
+    calls = _capture_hermes(monkeypatch, sweep_mod)
+    out = sweep_mod.draft_repair_card(
+        "k2", "t_fail1", dict(PATCH_ENTRY), dry_run=False,
+        validated=frozenset({"dsh-lane-autonomous-patch"}),
+    )
+    assert out == "t_abc12345"
+    create = calls[0]
+    assert "--project" in create and "k2" in create
+    assert "--workspace" in create and "worktree" in create
+    assert create[create.index("--assignee") + 1] == "dsh"
+    # Armed: no block call follows the create.
+    assert not any("block" in c for c in calls[1:])
+
+
+def test_unvalidated_patch_class_parks_sticky(sweep_mod, monkeypatch):
+    calls = _capture_hermes(monkeypatch, sweep_mod)
+    sweep_mod.draft_repair_card(
+        "mesh", "t_fail2", dict(PATCH_ENTRY), dry_run=False,
+        validated=frozenset(),
+    )
+    blocks = [c for c in calls if "block" in c]
+    assert blocks, "unvalidated patch class must park sticky"
+    reason = blocks[0][blocks[0].index("block") + 2]
+    assert "not validated" in reason
+    # And it must NOT be project-linked or handed to dsh.
+    create = calls[0]
+    assert "--project" not in create
+    assert create[create.index("--assignee") + 1] == "worker"
