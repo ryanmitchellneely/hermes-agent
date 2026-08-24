@@ -8,7 +8,7 @@ verified: 2026-08-19
 sources:
   - "K2 PR #5156 (fix: preposition_bot_branch)"
   - "mesh t_005bf18a, t_da63b06a run-935"
-repair: "REPORT-ONLY deploy-drift audit, modify nothing: run md5 -q on ~/.t1000/bin/dsh_kanban_worker.py and on ~/.t1000/src/kevin-real-estate-tools/docs/agent-coordination/devbot/harness-bench/dsh_kanban_worker.py, then the same pair for dsh-k2-local.yml. Completion summary must state MATCH or MISMATCH per file pair with both hashes. A MISMATCH means the deployed dsh lane is running code that diverged from canonical — say so explicitly. Do not edit, copy, or delete anything."
+repair: "REPORT-ONLY deploy-drift audit, modify nothing: run md5sum /opt/t1000/home/bin/dsh_kanban_worker.py /opt/t1000/home/src/kevin-real-estate-tools/docs/agent-coordination/devbot/harness-bench/dsh_kanban_worker.py (deployed wrapper vs canonical in the K2 checkout, both on k2vps — md5sum, not the Mac-only md5 -q; the Mac ~/.t1000 paths this entry originally named are a frozen mirror since the 2026-08-19 VPS flip). Completion summary must state MATCH or MISMATCH with both hashes. A MISMATCH means the deployed dsh lane is running code that diverged from canonical — say so explicitly. Do not edit, copy, or delete anything."
 repair_assignee: worker
 repair_auto: true
 repair_class: report

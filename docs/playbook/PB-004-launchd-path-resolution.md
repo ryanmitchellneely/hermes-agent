@@ -10,7 +10,7 @@ verified: 2026-08-19
 sources:
   - "K2 DEEPSEEK-HARNESS-LANE.md §9 (two PATH traps, one blocked dispatch each)"
   - "mesh t_3e630202, t_6ad51c8c"
-repair: "REPORT-ONLY launchd-PATH audit, modify nothing: read /Users/ryan/Library/LaunchAgents/ai.hermes.gateway.plist.mac-glass and confirm (a) ProgramArguments[0] is an absolute path, not a bare command, and (b) EnvironmentVariables.PATH leads with /Users/ryan/Documents/T1000/venv/bin before any system path entry. Completion summary must state PASS/FAIL for each of the two checks, quoting the actual ProgramArguments[0] value and the first three PATH entries. Do not edit, copy, or delete anything."
+repair: "REPORT-ONLY spawn-PATH audit, modify nothing: from inside this card's own run (a gateway child, so its env IS the live spawn surface) run echo \$PATH and command -v python3. PASS if PATH leads with /opt/t1000/venv/bin before any system entry AND python3 resolves inside /opt/t1000/venv/bin; FAIL otherwise, quoting the first three PATH entries and the resolved python3 path. (The Mac launchd plists this entry documents are glassed since the 2026-08-19 VPS flip; the gateway's child env is the live surface for the same failure class, and the unit file itself is root-only -- audit the inherited env, not the config.) Do not edit, copy, or delete anything."
 repair_assignee: worker
 repair_auto: true
 repair_class: report
