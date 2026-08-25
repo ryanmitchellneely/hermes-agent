@@ -62,6 +62,8 @@ Refresh when adding signals: edit this table + entry Status.
 | Align C2 fields with multi-concurrency decode bench style | SIG-20260808-04 sparkDash | P1 | bench_concurrency metrics parity | **open — no card** (fold into C2 when the ladders report) |
 | Evidence gates / clarify-before-build | SIG-20260807-04 OMH | P1 | "what happened / didn't" in workflows | **open — no card** (adjacent: `t_8b3c9a73` intake-row rule) |
 | Same-family cascade skip-reprefill (when engines support) | SIG-20260808-03 NVIDIA KV transfer | P1 | Watch vLLM/SGLang; not DIY maps | watch — no card wanted |
+| **Adviser-rung escalation** — local model keeps the loop; frontier returns ONE gated, PII-screened, TEXT-ONLY answer. Vendor TB2.1: local 59.6 @ ~$0 → +adviser 73.0 @ ~$0.415 vs frontier-alone 82.4 @ ~$0.65 (~60% of the gain, all context stays local) | SIG-20260825-01 Perplexity Portable Computer | P1 | Design note: rung placement in the ladder + trigger + distillation/preflight + approval UX + fail-closed; decide fork vs upstream-PR to `hermes-agent` | **carded 2026-08-25** `t_a133f091` ST-17 (blocked: Ryan picks lane) |
+| **Harness teardown vs hermes-agent (our upstream)** — their harness on stock 27B beats hermes-agent 82.6 vs 74.0 (vendor bench): context rationing, compact CLI tool defs vs MCP, skills load/unload, fail-closed sandbox, PII preflight | SIG-20260825-01 Perplexity Portable Computer | P1 | Phase (a) read-only delta enumeration vs upstream code; phase (b) install the deb on ryan-spark (meets spec exactly) and read the harness on disk | **carded 2026-08-25** `t_610d4184` ST-16 (blocked: Ryan — Pro/Max sub + Spark memory window, 120b resident) |
 
 ## Backfill debt
 
