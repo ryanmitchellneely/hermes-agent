@@ -52,7 +52,20 @@ logger = logging.getLogger("tools.tool_search")
 # Bridge tool names. These names are reserved and may not collide with a
 # user/plugin/MCP tool — registration of any tool with these names is
 # rejected by the registry's existing override-protection logic.
-TOOL_SEARCH_NAME = "tool_search"
+#
+# NOT "tool_search": xAI reserves that exact function name for its own
+# built-in tool and rejects the ENTIRE request with a non-retryable
+# HTTP 400 before anything runs —
+#   {'code': 'invalid-argument',
+#    'error': 'The function name tool_search is reserved for the tool_search tool'}
+# Observed live on 2026-08-25 against xai-oauth / grok-4.6: every session
+# routed there died instantly, and the failed session was discarded rather
+# than persisted. The wire name, the dispatch comparison
+# (model_tools.py, `function_name == TOOL_SEARCH_NAME`) and the prose in the
+# bridge descriptions all derive from this constant, so they move together.
+# The CONFIG key is a separate literal (`tools.tool_search`) and is
+# deliberately unchanged, so existing configs keep working.
+TOOL_SEARCH_NAME = "tool_find"
 TOOL_DESCRIBE_NAME = "tool_describe"
 TOOL_CALL_NAME = "tool_call"
 

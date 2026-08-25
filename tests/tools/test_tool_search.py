@@ -14,6 +14,8 @@ from typing import List, Dict, Any
 
 import pytest
 
+from tools.tool_search import TOOL_SEARCH_NAME
+
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
@@ -208,7 +210,7 @@ class TestAssembly:
 
     def test_idempotent_when_bridge_already_present(self):
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig, BRIDGE_TOOL_NAMES
-        defs = [_td("terminal", "Run shell"), _td("tool_search", "old")]
+        defs = [_td("terminal", "Run shell"), _td(TOOL_SEARCH_NAME, "old")]
         result = assemble_tool_defs(
             defs,
             context_length=200_000,
@@ -217,7 +219,7 @@ class TestAssembly:
         names = [(t["function"]["name"]) for t in result.tool_defs]
         # The pre-existing tool_search was stripped (it would be re-injected if
         # activation happened; here it didn't).
-        assert "tool_search" not in names
+        assert TOOL_SEARCH_NAME not in names
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +291,7 @@ class TestHandleFunctionCallIntegration:
         """The dispatcher recognizes the bridge tool by name."""
         import model_tools
         result = model_tools.handle_function_call(
-            function_name="tool_search",
+            function_name=TOOL_SEARCH_NAME,
             function_args={"query": "nothing matches this"},
         )
         parsed = json.loads(result)
@@ -321,7 +323,7 @@ class TestHandleFunctionCallIntegration:
         )
 
         result = model_tools.handle_function_call(
-            function_name="tool_search",
+            function_name=TOOL_SEARCH_NAME,
             function_args={"query": "private-query"},
             session_id="private-session",
             task_id="private-task",
@@ -432,7 +434,7 @@ class TestRegression_ToolsetScoping:
         # tool_search scoped to the github toolset must not count the
         # out-of-scope plugin tool (or any of the host registry).
         result = model_tools.handle_function_call(
-            function_name="tool_search",
+            function_name=TOOL_SEARCH_NAME,
             function_args={"query": "mcp_scoped_gh", "limit": 5},
             enabled_toolsets=["mcp-scoped-gh"],
         )
@@ -500,7 +502,7 @@ class TestCatalogListing:
         result = assemble_tool_defs(defs, context_length=1_000_000, config=cfg)
         search = next(
             td for td in result.tool_defs
-            if td["function"]["name"] == "tool_search"
+            if td["function"]["name"] == TOOL_SEARCH_NAME
         )
         description_tokens = estimate_tokens_from_schemas([search])
         # Includes the bridge schema around the listing, so allow modest
@@ -543,7 +545,7 @@ class TestCatalogListing:
             config=ToolSearchConfig.from_raw({"enabled": "on", "listing": "off"}),
         )
         assert result.activated
-        search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
+        search = next(t for t in result.tool_defs if t["function"]["name"] == TOOL_SEARCH_NAME)
         assert "mcp_x_0" not in search["function"]["description"]
 
 
@@ -616,3 +618,44 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+class TestProviderReservedNames:
+    """The bridge names go on the wire as function names, so a provider that
+    reserves one rejects the ENTIRE request, not just that tool."""
+
+    # xAI reserves `tool_search` for its own built-in. Observed live
+    # 2026-08-25 on xai-oauth / grok-4.6: non-retryable HTTP 400,
+    #   {'code': 'invalid-argument',
+    #    'error': 'The function name tool_search is reserved for the tool_search tool'}
+    # Every session routed there died before running anything.
+    XAI_RESERVED = frozenset({"tool_search"})
+
+    def test_no_bridge_name_is_reserved_by_a_known_provider(self):
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+        clash = BRIDGE_TOOL_NAMES & self.XAI_RESERVED
+        assert not clash, (
+            f"bridge tool name(s) {sorted(clash)} are reserved by xAI; a request "
+            "carrying one is rejected whole with a non-retryable 400. Rename the "
+            "constant in tools/tool_search.py — the wire name, the dispatch "
+            "comparison and the bridge prose all derive from it."
+        )
+
+    def test_the_emitted_schema_uses_the_constant_not_a_literal(self):
+        """Negative control: if an emitted name is hard-coded rather than
+        derived, renaming the constant would leave the reserved name on the
+        wire and this suite would still pass."""
+        from tools.tool_search import (
+            assemble_tool_defs, ToolSearchConfig, TOOL_SEARCH_NAME,
+        )
+        defs = [_td(f"mcp_x_{i}", "Deferred.") for i in range(30)]
+        result = assemble_tool_defs(
+            defs, context_length=1000,
+            config=ToolSearchConfig.from_raw({"enabled": "on", "listing": "off"}),
+        )
+        # NOT a skip: a control that opts out when the thing under test did not
+        # run is the failure mode this whole change is about.
+        assert result.activated, "bridge did not activate; the assertion below would be vacuous"
+        emitted = {t["function"]["name"] for t in result.tool_defs}
+        assert TOOL_SEARCH_NAME in emitted
+        assert "tool_search" not in emitted or TOOL_SEARCH_NAME == "tool_search"
