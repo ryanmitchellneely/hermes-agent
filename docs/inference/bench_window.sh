@@ -34,7 +34,10 @@ set -uo pipefail
 
 SPARK=spark
 VPS=k2vps
-SERVE=~/models/flash-next/serve-gptoss.sh   # on spark
+# SINGLE-QUOTED on purpose: an unquoted ~ expands on the LOCAL machine and
+# ships /Users/<you>/... to the Spark, which then cannot find it. Every path
+# in this file is remote; let the REMOTE shell expand it.
+SERVE='~/models/flash-next/serve-gptoss.sh'
 BENCH_PORT=11439                            # see THE PORT FENCE above
 MODEL_PORT=8898                             # llama.cpp on spark
 RESIDENTS=(gpt-oss:120b qwen3.8:27b hermes3:8b-16k)
@@ -50,6 +53,18 @@ lane_busy() {
   echo "${n:-1}"   # fail safe: unknown counts as busy
 }
 
+# Set once the evict has happened: any later failure must put the box back.
+# A half-open window (models evicted, bench server never started) leaves the
+# live lane with nothing loaded. That happened on 2026-08-27; hence this trap.
+WINDOW_DIRTY=0
+restore_on_failure() {
+  [ "$WINDOW_DIRTY" = "1" ] || exit 1
+  printf '\n!! open failed after eviction — restoring the box before exiting\n' >&2
+  WINDOW_DIRTY=0
+  close_window || true
+  exit 1
+}
+
 open_window() {
   local mode="${1:-ngram-mod}"
 
@@ -59,12 +74,33 @@ open_window() {
   echo "lane quiet."
 
   say "evicting ollama residents"
+  WINDOW_DIRTY=1; trap restore_on_failure ERR EXIT
   for m in "${RESIDENTS[@]}"; do ssh "$SPARK" "ollama stop $m" >/dev/null 2>&1; done
-  sleep 4
-  ssh "$SPARK" 'free -g | head -2'
+
+  # ---- THE GUARD THIS SCRIPT EXISTS FOR (added after an outage) ------------
+  # 2026-08-27: this step used to `sleep 4` and proceed. `ollama stop` returns
+  # as soon as the unload is REQUESTED, not when the memory is actually free,
+  # so the 63 GB llama.cpp allocation could start while the residents were
+  # still resident. ryan-spark went down hard mid-load and needed a physical
+  # power cycle; the devbot lane was dark for ~25 minutes. A timer is not a
+  # guard — POLL for the memory, and refuse to serve without real headroom.
+  local need_gb=${MODEL_GB:-64}
+  local head_gb=${HEADROOM_GB:-12}
+  local want=$(( need_gb + head_gb ))
+  say "waiting for memory to actually free (need ${want}GB: ${need_gb} model + ${head_gb} headroom)"
+  local free_gb=0 waited=0
+  while [ "$waited" -lt 180 ]; do
+    free_gb=$(ssh "$SPARK" "free -g | awk '/^Mem:/{print \$7}'" 2>/dev/null)
+    free_gb=${free_gb:-0}
+    echo "  available: ${free_gb}GB (want >= ${want}GB), ${waited}s"
+    [ "$free_gb" -ge "$want" ] && break
+    sleep 10; waited=$(( waited + 10 ))
+  done
+  [ "$free_gb" -ge "$want" ] || die "only ${free_gb}GB free after ${waited}s, need ${want}GB. REFUSING to load — this is the check whose absence took the box down on 2026-08-27. Investigate what still holds memory before retrying."
+  echo "memory clear: ${free_gb}GB available."
 
   say "serving gpt-oss:120b via llama.cpp (spec: $mode)"
-  ssh "$SPARK" "setsid nohup $SERVE $mode < /dev/null > ~/models/flash-next/bench-window.log 2>&1 & disown" >/dev/null
+  ssh "$SPARK" "setsid nohup $SERVE $mode < /dev/null > \$HOME/models/flash-next/bench-window.log 2>&1 & disown" >/dev/null
   local n=0
   until ssh "$SPARK" "curl -s -m 3 http://127.0.0.1:$MODEL_PORT/v1/models" 2>/dev/null | grep -q gpt-oss; do
     n=$((n+1)); [ $n -gt 80 ] && die "model never came up; see ~/models/flash-next/bench-window.log on spark"
@@ -81,6 +117,7 @@ open_window() {
   ssh "$VPS" "curl -s -m 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:$BENCH_PORT/v1/models" \
     | grep -q 200 || die "VPS cannot reach the bench endpoint. Check permitlisten on the sparklink key (see THE PORT FENCE) and /tmp/bench-tunnel.log on spark."
 
+  WINDOW_DIRTY=0; trap - ERR EXIT
   say "WINDOW OPEN"
   echo "  worker endpoint (from the VPS): http://127.0.0.1:$BENCH_PORT/v1"
   echo "  close it with: $0 close"
@@ -104,7 +141,11 @@ close_window() {
   # and would fail every clean close. The [b]racket idiom stops pgrep -f
   # from ALSO matching its own command string (that self-match cost real time
   # twice on 2026-08-27, reporting phantom processes).
-  local stray;    stray=$(ssh "$SPARK" "pgrep -fc '[b]uild-qwen4exp/bin/llama-server'" 2>/dev/null || echo 0)
+  # pgrep -fc PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0` used to
+  # append a second zero and the assertion compared "0\n0" against "0" — a clean
+  # restore reported FAIL. Take the first line and default only if empty.
+  local stray;    stray=$(ssh "$SPARK" "pgrep -fc '[b]uild-qwen4exp/bin/llama-server' 2>/dev/null; true" 2>/dev/null | head -1)
+  stray=${stray:-0}
   local lane;     lane=$(ssh "$VPS" "curl -s -m 6 -o /dev/null -w '%{http_code}' http://127.0.0.1:11435/v1/models" 2>/dev/null)
   echo "  ollama residents: $resident (want ${#RESIDENTS[@]})"
   echo "  stray llama-server: $stray (want 0)"
