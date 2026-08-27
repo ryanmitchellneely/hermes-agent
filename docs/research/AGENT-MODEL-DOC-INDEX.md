@@ -18,6 +18,7 @@
 | “What model lanes exist on my desk?” | skill **`t1000-model-desk`** + `docs/CLAUDE-ACP-LANE.md` |
 | “What’s the local/Spark/MBP fleet story?” | skill **`local-inference-fleet`** |
 | “Spark tok/s / side-door / spec-dec plan?” | plan B17 + mesh `t_99c5d345` |
+| “DS4 vs Qwen3.8-Flash-Next? Is a speed number real or speculation?” | `docs/inference/BAKEOFF-DS4-VS-QWEN38-FLASH-NEXT.md` + models `t_3c3569cd` |
 | “Student model / mini distill?” | plan B18 + `~/Documents/student-lab/docs/` + `t_848b57b7` |
 | “DevBot / Kevin Spark?” | `kevin-real-estate-tools/docs/agent-coordination/devbot/` + `t_d11fa676` |
 | “X/repo flex → steals?” | `T1000/docs/research/signal-log/` + skill **`signal-log`** |
