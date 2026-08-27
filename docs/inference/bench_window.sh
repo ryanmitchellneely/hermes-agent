@@ -68,6 +68,36 @@ restore_on_failure() {
 open_window() {
   local mode="${1:-ngram-mod}"
 
+  # ---- HARD BLOCK: proven crash mechanism, not yet fixable from here -------
+  # 2026-08-27, TWICE. Root cause from the previous-boot kernel log:
+  #   13:18:57 ollama: load_tensors: loading model tensors  (gpt-oss:120b)
+  #   13:18:58 kernel: NVRM: Check failed: Out of memory [NV_ERR_NO_MEMORY]
+  # Two ~64GB copies of the SAME model loading at once (ollama and ours)
+  # exhausted the GPU allocator on a 121GB unified-memory box and wedged it:
+  # kernel alive, userspace dead (LAN ping fine, sshd could not fork). Both
+  # times needed a physical power cycle.
+  #
+  # `ollama stop <model>` EVICTS, it does not EXCLUDE: the daemon reloads on
+  # the next request, and something does request 120b. The real fix is
+  # stopping the ollama SERVICE for the window, which needs root on spark that
+  # this account lacks. nvidia-smi also reports N/A for memory on GB10, so
+  # there is no GPU-memory instrument to guard with; the old free -g check
+  # measured system RAM while the failure was in the GPU allocator.
+  #
+  # Until one of those is solved, opening a window is a coin flip on the box
+  # the devbot lane depends on. Refuse by default.
+  if ! ssh "$SPARK" 'sudo -n systemctl is-active ollama' >/dev/null 2>&1; then
+    [ "${BENCH_FORCE:-0}" = "1" ] || die "REFUSING to open a window.
+  Cannot stop the ollama service on $SPARK (no passwordless sudo), so nothing
+  prevents it reloading gpt-oss:120b while we load our own copy. That race
+  hard-wedged this box twice on 2026-08-27 (NVRM out-of-memory, physical power
+  cycle both times).
+  Fix one first:
+    - grant NOPASSWD for systemctl stop/start ollama on $SPARK, or
+    - identify and quiesce whatever re-requests 120b during a window.
+  Override with BENCH_FORCE=1 only if you are watching the box."
+  fi
+
   say "preflight: devbot lane must be quiet"
   local busy; busy=$(lane_busy)
   [ "$busy" = "0" ] || die "devbot lane has $busy dispatchable card(s). Wait for it to drain — evicting now would kill a running job."
