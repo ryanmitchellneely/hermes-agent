@@ -106,6 +106,22 @@ _RISK_PATTERNS = (
     "explore options",
     "trade-?off",
     "threat model",
+    # Credential-disclosure risk screen. Added after K2
+    # harness-and-model-lane-findings.md (Sec-15, 2026-08-28): a production
+    # dispatch card that asked a worker to read and report a credential
+    # value tripped none of the patterns above (no security/auth/encrypt
+    # keyword appears in "report the value of SENDGRID_API_KEY"), so the
+    # estimator never routed it away from local. Bare "token" is
+    # deliberately excluded -- this codebase discusses LLM tokens in nearly
+    # every card body, and that word would misfire the risk screen on
+    # routine estimation work rather than credential handling.
+    "secret",
+    "credential",
+    "api[_ -]?key",
+    r"\.env\b",
+    "password",
+    "private[_ -]?key",
+    "exfiltrat",
 )
 
 

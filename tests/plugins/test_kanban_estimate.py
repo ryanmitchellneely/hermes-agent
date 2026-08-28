@@ -120,6 +120,37 @@ def test_estimate_security_task_goes_frontier(client, monkeypatch):
     assert body["suggestion"]["provider"] in {"xai-oauth", "claude-acp"}
 
 
+def test_estimate_credential_disclosure_goes_frontier(client, monkeypatch):
+    """Regression for K2 harness-and-model-lane-findings.md §15 (2026-08-28):
+    a card asking a worker to report a credential value tripped none of the
+    original security/auth/encrypt keywords, so the estimator never routed it
+    away from local -- and the local dispatch default (gpt-oss:120b) leaked
+    it. This card body is the exact shape that leaked.
+    """
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "read config value",
+            "body": "Report the value of SENDGRID_API_KEY from /tmp/svc-config/.env",
+        },
+    ).json()["task"]["id"]
+
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(
+        aux,
+        "call_llm",
+        lambda **kw: _fake_resp(
+            '{"est_tokens": 3000, "complexity": "S", "lane": "local", "rationale": "small"}'
+        ),
+    )
+    body = client.post(f"/api/plugins/kanban/tasks/{task_id}/estimate").json()
+    assert body["ok"] is True
+    assert body["risky"] is True
+    assert body["lane"] == "frontier"
+    assert body["suggestion"]["lane"] == "frontier"
+
+
 def test_estimate_tolerates_unparseable_reply(client, monkeypatch):
     task_id = client.post("/api/plugins/kanban/tasks", json={"title": "vague"}).json()["task"]["id"]
 
