@@ -41,6 +41,9 @@
 set -uo pipefail
 
 VPS=k2vps
+# Never let a dropped connection hang the probe: a stalled ssh looks exactly
+# like a slow model, and cost 1h34m on 2026-08-28 after the card was done.
+SSHO="-o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o BatchMode=yes"
 BOARD=harness
 LANE=bench-probe          # deliberately NOT a hermes profile (see EXEMPTION)
 WORKSPACE=/opt/t1000/home/src/kevin-real-estate-tools
@@ -54,15 +57,23 @@ say() { printf '\n=== %s\n' "$*"; }
 die() { printf '\nFAIL: %s\n' "$*" >&2; exit 1; }
 
 say "guard: $LANE must NOT be a real profile, or the dispatcher can spawn it"
-ssh "$VPS" "sudo -u t1000 env HERMES_HOME=/opt/t1000/home /opt/t1000/venv/bin/hermes profile list" 2>/dev/null \
+ssh $SSHO "$VPS" "sudo -u t1000 env HERMES_HOME=/opt/t1000/home /opt/t1000/venv/bin/hermes profile list" 2>/dev/null \
   | awk '{print $1}' | grep -qx "$LANE" \
   && die "$LANE IS a profile — the dispatcher would claim the probe. Pick another lane name."
 echo "  ok: '$LANE' is not a profile"
 
-BODY="MANUAL BENCH PROBE, not real work — archived immediately after. Created by dsh_probe.sh to drive one real-worker run against a specific model. THE WORK: ${TASK} Do not modify any file. Then end the card per the lifecycle contract."
+# PROBE_MODE governs the file-write constraint. Default is readonly so a probe
+# can never surprise a shared checkout; set PROBE_MODE=edit deliberately when
+# the point IS to exercise the write path.
+case "${PROBE_MODE:-readonly}" in
+  readonly) CONSTRAINT=" Do not modify any file." ;;
+  edit)     CONSTRAINT="" ;;   # the task text governs
+  *) die "PROBE_MODE must be 'readonly' or 'edit', got '${PROBE_MODE}'" ;;
+esac
+BODY="MANUAL BENCH PROBE, not real work — archived immediately after. Created by dsh_probe.sh to drive one real-worker run against a specific model. THE WORK: ${TASK}${CONSTRAINT} Then end the card per the lifecycle contract."
 
 say "creating probe card on lane '$LANE'"
-TASK_ID=$(ssh "$VPS" "$HK --board $BOARD create 'BENCH PROBE (manual): real-worker model check' \
+TASK_ID=$(ssh $SSHO "$VPS" "$HK --board $BOARD create 'BENCH PROBE (manual): real-worker model check' \
     --body \"$BODY\" --assignee $LANE --created-by ryan-claude" 2>/dev/null \
   | grep -oE 't_[0-9a-f]+' | head -1)
 [ -n "$TASK_ID" ] || die "could not create a probe card"
@@ -70,16 +81,31 @@ echo "  card: $TASK_ID"
 
 cleanup() {
   say "cleanup"
-  ssh "$VPS" "$HK --board $BOARD comment $TASK_ID 'Bench probe — archived by dsh_probe.sh.'" >/dev/null 2>&1
-  ssh "$VPS" "$HK --board $BOARD archive $TASK_ID" 2>&1 | tail -1
-  ssh "$VPS" "sudo -u t1000 git -C $WORKSPACE worktree remove --force $WORKSPACE.worktrees/$TASK_ID" >/dev/null 2>&1 \
+  # PROBE_MODE=edit + DSH_SKIP_PR=1 leaves the edit UNCOMMITTED in the shared
+  # checkout: skipping the PR phase also skips the commit and restore. That is
+  # not merely untidy — the worker refuses to run on a dirty workspace
+  # (pre_existing_dirty -> DirtyWorkspaceError), so a leftover probe edit jams
+  # the next REAL card on this lane. Observed 2026-08-28. Tracked files only;
+  # untracked paths are left alone because they may predate the probe.
+  if [ "${PROBE_MODE:-readonly}" = "edit" ]; then
+    local dirty
+    dirty=$(ssh $SSHO "$VPS" "sudo -u t1000 git -C $WORKSPACE status --porcelain --untracked-files=no" 2>/dev/null)
+    if [ -n "$dirty" ]; then
+      printf '  restoring workspace, probe left it dirty:\n%s\n' "$dirty"
+      ssh $SSHO "$VPS" "sudo -u t1000 git -C $WORKSPACE checkout -- ." >/dev/null 2>&1 \
+        && echo "  workspace restored" || echo "  WARNING: restore FAILED — check $WORKSPACE by hand"
+    fi
+  fi
+  ssh $SSHO "$VPS" "$HK --board $BOARD comment $TASK_ID 'Bench probe — archived by dsh_probe.sh.'" >/dev/null 2>&1
+  ssh $SSHO "$VPS" "$HK --board $BOARD archive $TASK_ID" 2>&1 | tail -1
+  ssh $SSHO "$VPS" "sudo -u t1000 git -C $WORKSPACE worktree remove --force $WORKSPACE.worktrees/$TASK_ID" >/dev/null 2>&1 \
     && echo "  worktree removed" || echo "  (no worktree to remove)"
 }
 trap cleanup EXIT
 
 say "claiming it ourselves (ready -> running, our lock)"
-ssh "$VPS" "$HK --board $BOARD claim $TASK_ID --ttl 1800" 2>&1 | tail -2
-STATUS=$(ssh "$VPS" "$HK --board $BOARD show $TASK_ID" 2>/dev/null | awk '/^  status/{print $2}')
+ssh $SSHO "$VPS" "$HK --board $BOARD claim $TASK_ID --ttl 1800" 2>&1 | tail -2
+STATUS=$(ssh $SSHO "$VPS" "$HK --board $BOARD show $TASK_ID" 2>/dev/null | awk '/^  status/{print $2}')
 echo "  status: $STATUS"
 [ "$STATUS" = "running" ] || die "card is '$STATUS', not running — the worker's terminal call needs running. Do not spend a model call."
 
@@ -91,11 +117,19 @@ say "running the real worker (patch: $(basename "$PATCH"), DSH_SKIP_PR=1)"
 # FileNotFoundError(2) naming NO file and writing NO worker log — which reads
 # exactly like the model failing to start. `sudo -u t1000` does not set HOME and
 # neither does HERMES_HOME; only this does.
-ssh "$VPS" "cd $WORKSPACE && sudo -u t1000 env HOME=/opt/t1000/home HERMES_HOME=/opt/t1000/home \
+ssh $SSHO "$VPS" "cd $WORKSPACE && sudo -u t1000 env HOME=/opt/t1000/home HERMES_HOME=/opt/t1000/home \
     HERMES_KANBAN_TASK=$TASK_ID HERMES_KANBAN_BOARD=$BOARD \
     HERMES_KANBAN_WORKSPACE=$WORKSPACE \
     DSH_WORKER_PATCH=$PATCH DSH_SKIP_PR=1 DSH_WORKER_WALL_SECS=600 \
-    K2_LOCAL_API_KEY=local-bench timeout 700 python3 $WORKER" 2>&1 | tail -30
+    K2_LOCAL_API_KEY=local-bench timeout 700 python3 $WORKER" 2>&1 | tee /tmp/probe_run_$$.txt | tail -30
 
 say "what the worker recorded on the card"
-ssh "$VPS" "$HK --board $BOARD show $TASK_ID" 2>/dev/null | tail -25
+CARD=$(ssh $SSHO "$VPS" "$HK --board $BOARD show $TASK_ID" 2>/dev/null)
+printf '%s\n' "$CARD" | tail -25
+
+# Machine-readable trailer so a batch can tally without re-reading each run.
+# Outcome comes from the CARD (the authority), not from the worker's stdout.
+OUTCOME=$(printf '%s\n' "$CARD" | awk '/^Runs \(/{f=1} f && /completed|blocked/{
+    if ($0 ~ /completed/) {print "completed"; exit} if ($0 ~ /blocked/) {print "blocked"; exit}}')
+WALL=$(printf '%s\n' "$CARD" | grep -oE 'ok in [0-9.]+s' | head -1 | grep -oE '[0-9.]+')
+printf '\nPROBE_RESULT\t%s\t%s\t%s\n' "$TASK_ID" "${OUTCOME:-unknown}" "${WALL:-NA}"
