@@ -71,7 +71,7 @@ Rules:
 - **Verify restoration, never assume.** `close` asserts three residents, zero
   stray `llama-server`, and lane endpoint HTTP 200 — and fails loudly otherwise.
 
-## Running the real worker against a bench window
+## Running the bench worker against a bench window
 
 The synthetic conformance harness measures the harness. To measure the real
 thing, drive `dsh_kanban_worker.py` (K2 repo,
@@ -112,7 +112,16 @@ Three things to know:
   100% failure rates); every one was caught by reading a conversation, none by
   staring at the summary.
 
-## Running the REAL dsh worker against a bench model (`dsh_probe.sh`)
+## Running the bench dsh worker against a bench model (`dsh_probe.sh`)
+> **⚠️ Corrected 2026-08-28:** everything below calling `dsh_kanban_worker.py`
+> "the REAL worker" is wrong. It is the BENCH harness (K2 `harness-bench/`,
+> zero production invocations). The production DevBot path is
+> `hermes -p dsh chat -q "work kanban task <id>"` — the Hermes agent on the
+> `dsh` PROFILE's pinned model **qwen3.8:27b**. The profile and the DeepSeek
+> CLI share the name "dsh"; they are unrelated. Canonical write-up: K2
+> `docs/knowledge-base/harness-and-model-lane-findings.md` §14. The bench
+> mechanics below (exemption, traps, scripts) all remain valid AS A BENCH.
+
 
 The synthetic conformance bench replays card bodies at a raw endpoint. It cannot
 tell you whether a model can drive the ACTUAL harness — real tools, real
@@ -147,7 +156,7 @@ run if `bench-probe` ever becomes a real profile.
    exist, and the wrapper dies with a bare `FileNotFoundError(2)` naming **no
    file** and writing **no worker log** — indistinguishable from the model
    failing to start. Pass `HOME=/opt/t1000/home` explicitly.
-2. **The real harness needs ~19k context before the model does any work.**
+2. **The bench harness needs ~19k context before the model does any work.**
    dsh's system prompt + one card measured **18,789 tokens**; at `-c 16384`
    every run dies `CONTEXT_WINDOW_EXCEEDED` having never exercised the model.
    Use `serve-b01b-bigctx.sh` (49152) for real-worker runs — its numbers are
@@ -157,9 +166,9 @@ run if `bench-probe` ever becomes a real profile.
    remote shell. Use `fuser -k <port>/tcp`, or split kill and start into two
    invocations.
 
-### Result, 2026-08-28 — flash-next drives the real harness
+### Result, 2026-08-28 — flash-next drives the bench harness
 
-Two real cards, both **completed** through the real worker, both verified
+Two real cards, both **completed** through the bench worker, both verified
 correct against the source afterward:
 
 | task | wall | outcome |

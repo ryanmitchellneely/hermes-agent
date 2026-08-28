@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# dsh_probe.sh — run the REAL dsh worker against a chosen model, once, safely.
+# dsh_probe.sh — run the BENCH dsh worker against a chosen model, once, safely.
+#
+# ⚠️ NAMING (corrected 2026-08-28): dsh_kanban_worker.py is the BENCH harness,
+# not the production DevBot path. Production is `hermes -p dsh chat` on the dsh
+# PROFILE (model qwen3.8:27b) — the profile and the DeepSeek CLI merely share a
+# name. This probe measures a model under a full agentic harness; it does NOT
+# measure the production lane. See K2 harness-and-model-lane-findings.md §14.
 #
 # THE PROBLEM
 # dsh_kanban_worker.py needs its card in RUNNING: the wrapper owns the terminal
@@ -109,7 +115,7 @@ STATUS=$(ssh $SSHO "$VPS" "$HK --board $BOARD show $TASK_ID" 2>/dev/null | awk '
 echo "  status: $STATUS"
 [ "$STATUS" = "running" ] || die "card is '$STATUS', not running — the worker's terminal call needs running. Do not spend a model call."
 
-say "running the real worker (patch: $(basename "$PATCH"), DSH_SKIP_PR=1)"
+say "running the bench worker (patch: $(basename "$PATCH"), DSH_SKIP_PR=1)"
 # HOME is load-bearing and NOT the same as HERMES_HOME. getent says t1000's home
 # is /opt/t1000, but the actual content lives one level down in /opt/t1000/home,
 # so every Path.home() lookup in the worker (DSH_BIN, NODE22, LOGS) resolves to a
