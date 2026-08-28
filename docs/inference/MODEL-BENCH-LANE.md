@@ -111,3 +111,65 @@ Three things to know:
   2026-08-27 produced confident wrong numbers (including two separate bogus
   100% failure rates); every one was caught by reading a conversation, none by
   staring at the summary.
+
+## Running the REAL dsh worker against a bench model (`dsh_probe.sh`)
+
+The synthetic conformance bench replays card bodies at a raw endpoint. It cannot
+tell you whether a model can drive the ACTUAL harness — real tools, real
+worktree, real lifecycle. `dsh_probe.sh` does that, one card at a time.
+
+    ./dsh_probe.sh /opt/t1000/home/bin/dsh-flashnext.yml "<task text>"
+
+### The dispatcher exemption (why this is safe to run on a live board)
+
+A hand-made probe card sitting in `ready` is exactly what the dispatcher claims.
+On 2026-08-27 it grabbed one within seconds and ran it on **gpt-oss:120b** — the
+lane's model, not the one under test. That is the worst kind of failure: the run
+LOOKS like a successful bench of the model you meant to test.
+
+`kanban_db.dispatch` skips any ready task whose assignee is not a real Hermes
+profile, bucketing it `skipped_nonspawnable`. The comment at that branch states
+the intent outright — such lanes *"are pulled by terminals via claim_task
+directly and should NEVER auto-spawn"*. So the probe is assigned to
+**`bench-probe`**, which is deliberately not a profile. Verified live: the card
+sat `ready` and unclaimed across ~5 dispatcher ticks. No race, no TTL to beat.
+
+`--initial-status running` does NOT work as a substitute: it leaves `claim_lock`
+NULL and `recompute_ready` returns a parentless card to `ready` — the claimable
+state. The assignee is the durable fix; the script guards on it and refuses to
+run if `bench-probe` ever becomes a real profile.
+
+### Three traps that each cost a run
+
+1. **`HOME` is not `HERMES_HOME`.** `getent passwd t1000` says `/opt/t1000`, but
+   the content lives in `/opt/t1000/home`. Every `Path.home()` lookup in the
+   worker (`DSH_BIN`, `NODE22`, `LOGS`) then points at a path that does not
+   exist, and the wrapper dies with a bare `FileNotFoundError(2)` naming **no
+   file** and writing **no worker log** — indistinguishable from the model
+   failing to start. Pass `HOME=/opt/t1000/home` explicitly.
+2. **The real harness needs ~19k context before the model does any work.**
+   dsh's system prompt + one card measured **18,789 tokens**; at `-c 16384`
+   every run dies `CONTEXT_WINDOW_EXCEEDED` having never exercised the model.
+   Use `serve-b01b-bigctx.sh` (49152) for real-worker runs — its numbers are
+   deliberately NOT comparable to the pinned 16384 throughput bench.
+3. **`pkill -f` matches the shell running it.** Killing a server with a pattern
+   while the same command line also contains the server's path kills your own
+   remote shell. Use `fuser -k <port>/tcp`, or split kill and start into two
+   invocations.
+
+### Result, 2026-08-28 — flash-next drives the real harness
+
+Two real cards, both **completed** through the real worker, both verified
+correct against the source afterward:
+
+| task | wall | outcome |
+|---|---|---|
+| summarize `main()` of `scripts/next_inbox.py` | 71.1s | correct, incl. the parser-tripwire behavior |
+| `classify` for a claims/+code branch in `pr_efficiency.py` | 175.0s | correct: `"mixed"`, right line, right consequence |
+
+Both respected "change nothing" (no files touched, no git ops) and closed the
+card via the lifecycle contract. This corroborates the synthetic conformance
+tie (flash-next 0.42 vs 120b 0.40): flash-next is not disqualified on protocol.
+
+⚠ The worker's card summary is truncated from the FRONT (a tail slice), so a
+summary starting mid-word is a display artifact, not a model defect.
