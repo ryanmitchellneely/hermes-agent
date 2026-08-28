@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
-# dsh_probe.sh — run the BENCH dsh worker against a chosen model, once, safely.
+# dsh_probe.sh — run the PRODUCTION dsh worker against a chosen model, once, safely.
 #
-# ⚠️ NAMING (corrected 2026-08-28): dsh_kanban_worker.py is the BENCH harness,
-# not the production DevBot path. Production is `hermes -p dsh chat` on the dsh
-# PROFILE (model qwen3.8:27b) — the profile and the DeepSeek CLI merely share a
-# name. This probe measures a model under a full agentic harness; it does NOT
-# measure the production lane. See K2 harness-and-model-lane-findings.md §14.
-#
-# THE PROBLEM
-# dsh_kanban_worker.py needs its card in RUNNING: the wrapper owns the terminal
-# kanban call from a `finally` block and block/complete refuse other statuses.
-# But a hand-made probe card sitting in `ready` is exactly what the dispatcher
-# claims — on 2026-08-27 it grabbed a probe within seconds and ran it on
-# gpt-oss:120b instead of the model under test, which is a silent wrong answer:
-# the run LOOKS like a successful bench of flash-next.
+# ⚠️⚠️ NAMING, corrected TWICE (2026-08-28) — the first correction below was
+# itself wrong. dsh_kanban_worker.py IS the production DevBot dispatch
+# harness: the dsh Hermes profile's kanban.worker_command replaces the
+# dispatcher's assembled argv with it. The qwen3.8:27b pin is the profile's
+# CHAT identity only; dispatch resolves gpt-oss:120b from dsh-k2-local.yml —
+# the model that leaked 3/5 credentials on the live config (K2
+# harness-and-model-lane-findings.md §14 retraction, §15 finding).
 #
 # THE EXEMPTION — a supported mechanism, not a workaround
 # kanban_db.dispatch skips any ready task whose assignee is not a real Hermes

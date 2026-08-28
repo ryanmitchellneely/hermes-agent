@@ -112,22 +112,23 @@ Three things to know:
   100% failure rates); every one was caught by reading a conversation, none by
   staring at the summary.
 
-## Running the bench dsh worker against a bench model (`dsh_probe.sh`)
-> **⚠️ Corrected 2026-08-28:** everything below calling `dsh_kanban_worker.py`
-> "the REAL worker" is wrong. It is the BENCH harness (K2 `harness-bench/`,
-> zero production invocations). The production DevBot path is
-> `hermes -p dsh chat -q "work kanban task <id>"` — the Hermes agent on the
-> `dsh` PROFILE's pinned model **qwen3.8:27b**. The profile and the DeepSeek
-> CLI share the name "dsh"; they are unrelated. Canonical write-up: K2
-> `docs/knowledge-base/harness-and-model-lane-findings.md` §14. The bench
-> mechanics below (exemption, traps, scripts) all remain valid AS A BENCH.
-
-
-The synthetic conformance bench replays card bodies at a raw endpoint. It cannot
-tell you whether a model can drive the ACTUAL harness — real tools, real
-worktree, real lifecycle. `dsh_probe.sh` does that, one card at a time.
-
-    ./dsh_probe.sh /opt/t1000/home/bin/dsh-flashnext.yml "<task text>"
+## Running the production dsh worker against a bench model (`dsh_probe.sh`)
+> **⚠️⚠️ SUPERSEDED (2026-08-28): the 2026-08-28 banner above this line was
+> ALSO wrong, and is itself retracted.** It claimed `dsh_kanban_worker.py`
+> was a bench artifact shipping nowhere. It is not — it IS the production
+> DevBot dispatch harness. The `dsh` HERMES PROFILE sets
+> `kanban.worker_command: [python3, .../dsh_kanban_worker.py]`, and the
+> dispatcher's `_default_spawn` replaces the assembled hermes argv with it.
+> Verified: deployed script sha-identical to canonical (`cc96533d19a6dbe0`);
+> a real production devbot log opens with this script's own
+> `[dsh-worker] workspace=...` signature line; the profile's own config
+> comment says so outright. The `model.default: qwen3.8:27b` pin is DevBot's
+> **chat identity** (`hermes -p dsh chat`), NOT the dispatch model — dispatch
+> resolves **gpt-oss:120b** from `dsh-k2-local.yml`, and that is the model
+> that leaked 3/5 credential probes on the LIVE config. Canonical write-up:
+> K2 `docs/knowledge-base/harness-and-model-lane-findings.md` §14
+> (retraction) and §15 (the live finding). Both prior banners are kept below
+> for the record of how the error compounded, not because either is correct.
 
 ### The dispatcher exemption (why this is safe to run on a live board)
 
