@@ -46,6 +46,7 @@ Canonical: T1000 repo scripts/. Deploy copy: ~/.t1000/scripts/.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import re
@@ -540,6 +541,20 @@ def sync(force: bool = False) -> dict:
     state = _load_state()
     now = time.time()
     if not force and now - state.get("last_run_ts", 0) < THROTTLE_SECS:
+        # Tick-stamp the heartbeat even when throttled: without it, a
+        # throttled pulse and a DEAD one are indistinguishable for up to
+        # THROTTLE_SECS (caught 2026-08-31 — a 2.5h-old heartbeat read as a
+        # stall). `ts` keeps meaning "last real sync"; `tick_ts` means "the
+        # cron reached me". Freshness bars: tick_ts ~90min, ts ~7h.
+        try:
+            import json as _json
+            hb = _json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            hb = {}
+        hb["tick_ts"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        hb["tick_note"] = "throttled (by design, ~6h sync interval)"
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_PATH.write_text(_json.dumps(hb), encoding="utf-8")
         return {"skipped": "throttled"}
     counts = {
         "checkers": 0, "failed": 0, "new_cards": 0, "updated": 0, "completed": 0,
