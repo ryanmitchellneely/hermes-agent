@@ -198,6 +198,19 @@ CHECKERS = [
         "line_re": r"warning:",
     },
     {
+        # Expansion pick 1 (Ryan, 2026-08-31, harness t_eb28a382): the wiring
+        # graph's evidence cites drift under every merge and the standing tax
+        # was 2,463 DRIFT findings blocking innocent PRs (#5797). The repair
+        # is fully deterministic (wiring_check.py --fix-all: unique nearest
+        # match repins; ties freeze for a human), so this checker is the FEED
+        # half only — visibility with a count; the repair command is in the
+        # title so the bucket card carries its own runbook.
+        "key": "wiring-drift",
+        "title": "drifted wiring-graph evidence cells (deterministic repair: python3 scripts/wiring_check.py --fix-all, commit only docs/sovereign/wiring/*.tsv; TIE/COLLAPSE leftovers need a human)",
+        "argv": ["python3", "scripts/wiring_check.py", "--check"],
+        "line_re": r"^DRIFT \[evidence-drift\]",
+    },
+    {
         "key": "deferred-followups",
         "title": "deferred follow-ups past due",
         "argv": ["python3", "scripts/deferred_followups_check.py"],
