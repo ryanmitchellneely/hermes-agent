@@ -478,6 +478,157 @@ def _card_status(card_id: str) -> str | None:
         return None
 
 
+_PR_URL_RE = re.compile(r"pull/(\d+)")
+
+
+def _card_pr_number(card_id: str) -> int | None:
+    """PR number this card produced, or None if it never named one.
+
+    Same read-only peek as `_card_status`. The wrapper records its PR in the
+    card's terminal result ("... git/PR: https://.../pull/5857"); a
+    reviewer-mediated or hand-finished card can leave it only in a comment,
+    so both are read, newest comment first. None on ANY failure — the caller
+    then behaves exactly as it did before this helper existed.
+    """
+    try:
+        import sqlite3
+        db = DESK / "kanban" / "boards" / BOARD / "kanban.db"
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "select result from tasks where id = ?", (card_id,)
+            ).fetchone()
+            m = _PR_URL_RE.search(row[0]) if row and row[0] else None
+            if m:
+                return int(m.group(1))
+            for (body,) in conn.execute(
+                "select body from task_comments where task_id = ? "
+                "order by created_at desc",
+                (card_id,),
+            ):
+                m = _PR_URL_RE.search(body or "")
+                if m:
+                    return int(m.group(1))
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    return None
+
+
+def _bot_env(path: Path) -> dict[str, str]:
+    """Parse a KEY=VALUE desk env file (lines may carry a `export ` prefix).
+
+    Values are credentials and are never printed by anything here.
+    """
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        ln = raw.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if ln.startswith("export "):
+            ln = ln[len("export "):].lstrip()
+        key, sep, val = ln.partition("=")
+        if not sep:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out[key.strip()] = val
+    return out
+
+
+def _mint_bot_token() -> tuple[object, str]:
+    """(wrapper module, installation token) from the dsh lane's own App identity.
+
+    Borrowed rather than provisioned: the token that opened the PR we are
+    about to read is minted by the deployed wrapper from
+    ~/secrets/dsh-bot.env, so reading the PR back needs no second credential
+    to rotate or leak. Raises on anything missing — the caller fails closed.
+    """
+    import importlib.util
+
+    env_path = Path(
+        os.environ.get("K2_INTAKE_BOT_ENV") or (HOME / "secrets" / "dsh-bot.env")
+    ).expanduser()
+    env = _bot_env(env_path)
+    app_id = (env.get("DSH_BOT_APP_ID") or "").strip()
+    installation_id = (env.get("DSH_BOT_INSTALLATION_ID") or "").strip()
+    key_path = Path((env.get("DSH_BOT_APP_KEY_PATH") or "").strip()).expanduser()
+    if not app_id or not installation_id or not key_path.is_file():
+        raise RuntimeError("bot identity incomplete")
+    wrapper_path = Path(
+        os.environ.get("K2_INTAKE_WRAPPER_PATH") or (HOME / "bin" / "dsh_kanban_worker.py")
+    ).expanduser()
+    spec = importlib.util.spec_from_file_location(
+        "dsh_kanban_worker_for_intake", wrapper_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("wrapper not importable")
+    wrapper = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: the wrapper declares @dataclass classes, and the
+    # dataclass machinery looks the class's module up in sys.modules — an
+    # unregistered module raises AttributeError on NoneType (measured on the
+    # first production run, 2026-09-01 21:25Z, held as dedup_unverified).
+    sys.modules[spec.name] = wrapper
+    spec.loader.exec_module(wrapper)
+    return wrapper, wrapper._mint_installation_token(app_id, installation_id, key_path)
+
+
+def _pr_state(number: int) -> str | None:
+    """"open" | "closed" | "merged" for a K2 PR; None when unreadable.
+
+    Fail closed in the same direction as `_card_status`: a missing token, an
+    unreadable env file, an HTTP error or an unexpected payload all read as
+    None, and the caller HOLDS the slot rather than acting on a guess. Never
+    logs the token; an error names only its exception type and the PR number.
+    """
+    import urllib.request
+
+    token = (os.environ.get("K2_INTAKE_GH_TOKEN") or "").strip()
+    wrapper = None
+    minted = False
+    if not token:
+        try:
+            wrapper, token = _mint_bot_token()
+            minted = True
+        except Exception as exc:
+            print(
+                f"WARN k2-intake could not mint a token to read PR #{number}: "
+                f"{type(exc).__name__}"
+            )
+            return None
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/joinsov/kevin-real-estate-tools/"
+            f"pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "k2-intake-sync",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:  # fixed github.com host
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("merged_at"):
+            return "merged"
+        state = data.get("state")
+        return state if isinstance(state, str) and state else None
+    except Exception as exc:
+        print(f"WARN k2-intake PR #{number} state unreadable: {type(exc).__name__}")
+        return None
+    finally:
+        if minted and wrapper is not None:
+            try:
+                wrapper._revoke_installation_token(token)
+            except Exception:
+                pass
+
+
 def _board_has_workdir() -> bool:
     """True when this board binds tasks to a repo checkout.
 
@@ -587,6 +738,7 @@ def sync(force: bool = False) -> dict:
         "checkers": 0, "failed": 0, "new_cards": 0, "updated": 0, "completed": 0,
         "routed_new": 0, "routed_cleared": 0, "routed_denied": 0,
         "slots_refreed": 0, "held_blocked": 0, "parked_failing": 0, "parked_skipped": 0,
+        "dedup_inflight": 0, "dedup_unverified": 0, "dedup_merged": 0,
     }
     cards = state.setdefault("cards", {})
     routed = state.setdefault("routed", {})
@@ -695,6 +847,41 @@ def sync(force: bool = False) -> dict:
                 counts["held_blocked"] += 1
                 continue
             if status in ("done", "archived"):
+                # A done card whose PR is still OPEN is IN FLIGHT, not failed.
+                # Measured 2026-09-01: this loop refreed the slot for card
+                # t_4588f937 whose PR (#5857) had simply not merged yet — the
+                # artifact still read stale BECAUSE the fix was unmerged — and
+                # the next pass minted a second card for the same page. Two
+                # agents editing one file, and the second PR (#5860) fabricated
+                # its citations. A terminal card is only a zombie once its PR
+                # is closed unmerged, or if it never opened one at all.
+                pr = _card_pr_number(zcard)
+                if pr is not None:
+                    st = _pr_state(pr)
+                    if st == "open":
+                        counts["dedup_inflight"] += 1
+                        print(
+                            f"K2 INTAKE in-flight (card {zcard} done, PR #{pr} "
+                            f"open): {rkey}"
+                        )
+                        continue
+                    if st is None:
+                        counts["dedup_unverified"] += 1
+                        print(
+                            f"WARN k2-intake holding slot for {rkey}: card "
+                            f"{zcard} {status} but PR #{pr} state was unreadable"
+                        )
+                        continue
+                    if st == "merged":
+                        del routed[rkey]
+                        counts["dedup_merged"] += 1
+                        counts["slots_refreed"] += 1
+                        print(
+                            f"K2 INTAKE freed slot (card {zcard} {status}, PR "
+                            f"#{pr} merged) but {rkey} still reads live — it "
+                            f"may re-mint"
+                        )
+                        continue
                 tries = attempts.get(rkey, 0) + 1
                 attempts[rkey] = tries
                 del routed[rkey]
