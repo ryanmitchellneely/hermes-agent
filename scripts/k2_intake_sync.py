@@ -219,6 +219,20 @@ CHECKERS = [
         # match repins; ties freeze for a human), so this checker is the FEED
         # half only — visibility with a count; the repair command is in the
         # title so the bucket card carries its own runbook.
+        # Added 2026-09-01 after a peer session (PR #4279) lost a CI round to
+        # it: a wiring-graph FATAL — an evidence-token whose cited line was
+        # rewritten (a module docstring, say) — surfaces only as ROOT-TESTS red
+        # via k2-hub/tests -> test_wiring_check.py, never through any check
+        # named for the wiring graph, and the drift checker below watches
+        # DRIFT lines only. A FATAL is the graph being INVALID, not stale, and
+        # it blocks every PR's root-tests until repaired — so it gets its own
+        # key, minted ahead of drift, with the repair in the title.
+        "key": "wiring-fatal",
+        "title": "wiring-graph FATAL evidence-token(s): the graph is INVALID and root-tests is red for everyone until repaired (repair: on a branch, python3 scripts/wiring_check.py --fix for the cited rows, or repoint the token by hand when the cited text was rewritten; commit only docs/sovereign/wiring/*.tsv)",
+        "argv": ["python3", "scripts/wiring_check.py", "--check"],
+        "line_re": r"^FATAL \[",
+    },
+    {
         "key": "wiring-drift",
         "title": "drifted wiring-graph evidence cells (deterministic repair: python3 scripts/wiring_check.py --fix-all, commit only docs/sovereign/wiring/*.tsv; TIE/COLLAPSE leftovers need a human)",
         "argv": ["python3", "scripts/wiring_check.py", "--check"],
