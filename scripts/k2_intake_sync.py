@@ -180,7 +180,7 @@ CHECKERS = [
                 "model refuses to invent a citation 5 times out of 5; asked for a "
                 "line number WITHOUT being made to read it, it invented five in a "
                 "single PR (#5860, cited pr-gate.yml:103 which is actually "
-                "`uses: actions/setup-python@v5`). The quote closes that gap. Quote a SPAN, not the whole line: on 2026-09-02 a 300-character table row was quoted with `...` in the middle (#5900) and refused — an elided quote is a summary, not evidence the line was read. A claim of ABSENCE (\"markers resolved\", \"no longer present\") cannot be quoted at all: write NOT FOUND + `human`, or cite the commit that removed the thing.\n"
+                "`uses: actions/setup-python@v5`). The quote closes that gap. Quote a SPAN, not the whole line: on 2026-09-02 a 300-character table row was quoted with `...` in the middle (#5900) and refused — an elided quote is a summary, not evidence the line was read. A claim of ABSENCE (\"markers resolved\", \"no longer present\") cannot be quoted at all: write NOT FOUND + `human`, or cite the commit that removed the thing. EVERY ROW CARRIES ITS OWN CLAIM TEXT — a second source for the same claim repeats the claim in its own row; a blank claim cell (seen 2026-09-02, #5902) is a row that verifies nothing.\n"
                 "     If you cannot find a supporting line, write NOT FOUND in "
                 "the quote cell and `human` in the verdict cell. That is a "
                 "CORRECT and expected answer — it is never a reason to invent "
