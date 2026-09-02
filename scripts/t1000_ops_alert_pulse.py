@@ -376,6 +376,13 @@ def _night_dequeue_heartbeat() -> list[str]:
         # "healthy", and rc=0 says nothing either way.
         why = "never wrote its code.json" if af == -1 else "wrote an unparseable code.json"
         return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but {why} (apply_fail={af}) — no countable outcome; read night.log on kevin-spark")
+    ao = hb.get("apply_ok")
+    if hb.get("job") and af == 0 and ao == 0:
+        # Grok residual risk on #5923: an empty results list counts 0/0 and
+        # looked healthy. A job that ran, exited rc=0, and applied NOTHING is
+        # not a delivered job — the model returned no fences, or every fence
+        # was dropped before the apply loop. Warn.
+        return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but applied nothing (apply_ok=0, apply_fail=0) — no deliverable; read night.log on kevin-spark")
     if isinstance(af, int) and af > 0:
         return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but apply_fail={af} (apply_ok={hb.get('apply_ok')}): the deliverable did not land — read night.log on kevin-spark")
     if rc not in (0, -1):
