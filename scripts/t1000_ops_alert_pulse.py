@@ -301,6 +301,55 @@ def _fleet_liveness() -> list[str]:
     return warns
 
 
+
+def _night_dequeue_heartbeat() -> list[str]:
+    """DevBot night-dequeue heartbeat, read over the spark reverse tunnel.
+
+    Closes the atlas R3 owed item (Ryan-approved 2026-08-31): the nightly
+    unattended executor on kevin-spark had zero off-box heartbeat rows, so a
+    dead crontab and a healthy quiet night were indistinguishable from here.
+    kevin-spark serves ~/devbot/logs on 127.0.0.1:8899, reverse-tunneled to
+    local :11440 (moved off 11439 on 2026-09-01: that port is
+    allocated to deepseek-v4-flash per dsh-flashnext.yml) via the pre-authorized permitlisten key (no new creds).
+
+    Rule 4 wording: an unreachable channel is told as CHANNEL (spark down,
+    tunnel dead, or server stopped), never as "the cron did not run" — and a
+    stale receipt is told as the cron's silence. Thresholds ~2.5x cadence:
+    the job fires daily 06:30Z, so stale > 60h pages; unreachable pages
+    immediately (the tunnel is supervised by a 10-min keeper, so a dead
+    channel is itself a real fault, and the fp dedup means one page per
+    distinct state, not one per pulse).
+    """
+    import urllib.request
+    warns: list[str] = []
+    max_age_h = float(os.environ.get("T1000_NIGHT_HB_MAX_AGE_H", "60"))
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11440/night-last.json", timeout=6) as r:
+            hb = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:
+        return [
+            "WARN night-dequeue heartbeat UNREACHABLE via :11440 tunnel "
+            f"({type(exc).__name__}) — spark down, tunnel dead, or the logs "
+            "server stopped; the cron's own state is UNKNOWN, not bad"
+        ]
+    try:
+        ts = datetime.strptime(hb.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    except Exception:
+        return [f"WARN night-dequeue receipt unparseable: {str(hb)[:120]}"]
+    if age_h > max_age_h:
+        warns.append(
+            f"WARN night-dequeue receipt STALE: last ran {hb.get('ts')} "
+            f"({age_h:.0f}h ago; expected daily ~06:30Z) — the cron on "
+            "kevin-spark has gone quiet"
+        )
+    rc = hb.get("rc")
+    if rc not in (0, -1):
+        warns.append(
+            f"WARN night-dequeue last run FAILED rc={rc} note={str(hb.get('note'))[:100]}"
+        )
+    return warns
+
 def main() -> int:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     prev: dict = {}
@@ -333,6 +382,16 @@ def main() -> int:
     old_pb_fp = (prev.get("fps") or {}).get("playbook_sweep")
     if pb_fp and pb_fp != old_pb_fp:
         lines.append(pb_blob)
+
+    # Night-dequeue heartbeat (atlas R3, 2026-08-31): fp dedup — one page
+    # per distinct state (unreachable / stale / failed), not one per pulse.
+    nh_warns = _night_dequeue_heartbeat()
+    nh_blob = "\n".join(nh_warns).strip()
+    nh_fp = hashlib.sha256(nh_blob.encode()).hexdigest()[:16] if nh_blob else None
+    new_state["fps"]["night_dequeue"] = nh_fp
+    old_nh_fp = (prev.get("fps") or {}).get("night_dequeue")
+    if nh_fp and nh_fp != old_nh_fp:
+        lines.append(nh_blob)
 
     # K2 intake bridge (t_f3dd22e3): same fp dedup; the script also
     # self-throttles internally so most pulses are a no-op.
