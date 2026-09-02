@@ -370,6 +370,12 @@ def _night_dequeue_heartbeat() -> list[str]:
     # stayed silent. The receipt now carries apply_ok/apply_fail (night_dequeue.sh);
     # a failed apply is a warning even when rc is 0.
     af = hb.get("apply_fail")
+    if af in (-1, -2):
+        # No countable outcome is itself a warning: -1 the run wrote no
+        # code.json at all, -2 it wrote one that cannot be parsed. Neither is
+        # "healthy", and rc=0 says nothing either way.
+        why = "never wrote its code.json" if af == -1 else "wrote an unparseable code.json"
+        return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but {why} (apply_fail={af}) — no countable outcome; read night.log on kevin-spark")
     if isinstance(af, int) and af > 0:
         return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but apply_fail={af} (apply_ok={hb.get('apply_ok')}): the deliverable did not land — read night.log on kevin-spark")
     if rc not in (0, -1):
