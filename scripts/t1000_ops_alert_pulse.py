@@ -369,9 +369,9 @@ def _night_dequeue_heartbeat() -> list[str]:
     # with its only deliverable refused by the path fence, and this checker
     # stayed silent. The receipt now carries apply_ok/apply_fail (night_dequeue.sh);
     # a failed apply is a warning even when rc is 0.
-    af = d.get("apply_fail")
+    af = hb.get("apply_fail")
     if isinstance(af, int) and af > 0:
-        return ("warn", f"night dequeue ran {d.get('job')} rc={d.get('rc')} but apply_fail={af} (apply_ok={d.get('apply_ok')}): the deliverable did not land — read night.log on kevin-spark")
+        return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but apply_fail={af} (apply_ok={hb.get('apply_ok')}): the deliverable did not land — read night.log on kevin-spark")
     if rc not in (0, -1):
         warns.append(
             f"WARN night-dequeue last run FAILED rc={rc} note={str(hb.get('note'))[:100]}"
