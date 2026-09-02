@@ -301,5 +301,36 @@ class ThrottleDefaultTests(unittest.TestCase):
         self.assertEqual(mod.THROTTLE_SECS, 42)
 
 
+class RoutedCapDefaultTests(unittest.TestCase):
+    """Raised 2026-09-02 (Ryan): the lane cleared its queue in under an hour
+    at the old 6/3 caps, so the cap itself was the binding constraint."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        (self.home / "cache").mkdir()
+        (self.home / "clone").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _load(self):
+        os.environ["HERMES_HOME"] = str(self.home)
+        os.environ["K2_INTAKE_CLONE"] = str(self.home / "clone")
+        os.environ.pop("K2_INTAKE_GH_TOKEN", None)
+        spec = importlib.util.spec_from_file_location(
+            "k2_intake_sync_routed_cap_uut", MODULE_PATH
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_default_routed_caps_are_ten_in_flight_five_per_run(self):
+        os.environ.pop("K2_INTAKE_MAX_ROUTED_IN_FLIGHT", None)
+        os.environ.pop("K2_INTAKE_MAX_ROUTED_PER_RUN", None)
+        mod = self._load()
+        self.assertEqual(mod.MAX_ROUTED_IN_FLIGHT, 10)
+        self.assertEqual(mod.MAX_NEW_ROUTED_PER_RUN, 5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

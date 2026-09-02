@@ -82,8 +82,10 @@ MAX_NEW_CARDS_PER_RUN = 5
 # produces from it: one card per artifact, each naming its receipt. A checker
 # without a "split" block is bucket-only and can never mint a routed card.
 ROUTED_ASSIGNEE = os.environ.get("K2_INTAKE_ROUTED_ASSIGNEE", "dsh")
-MAX_NEW_ROUTED_PER_RUN = int(os.environ.get("K2_INTAKE_MAX_ROUTED_PER_RUN") or 3)
-MAX_ROUTED_IN_FLIGHT = int(os.environ.get("K2_INTAKE_MAX_ROUTED_IN_FLIGHT") or 6)
+# Raised 2026-09-02 (Ryan): the lane cleared its queue in under an hour at
+# 6/3 and the cap itself was the binding constraint, not available work.
+MAX_NEW_ROUTED_PER_RUN = int(os.environ.get("K2_INTAKE_MAX_ROUTED_PER_RUN") or 5)
+MAX_ROUTED_IN_FLIGHT = int(os.environ.get("K2_INTAKE_MAX_ROUTED_IN_FLIGHT") or 10)
 # After this many terminal-but-artifact-still-live outcomes, an artifact is
 # parked VISIBLY instead of re-carded forever (t_9de2917f).
 MAX_ROUTE_ATTEMPTS = int(os.environ.get("K2_INTAKE_MAX_ROUTE_ATTEMPTS") or 2)
