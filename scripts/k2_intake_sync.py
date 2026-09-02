@@ -13,7 +13,7 @@ pr-kanban-sync proved:
     a notification, and notifications never auto-dispatch (PB-006:
     create-then-block sticky; same rule as playbook repair drafting).
   - Count changes get a comment; a clean checker completes its card.
-  - Max 5 new cards per run; internal ~6h throttle (findings move daily,
+  - Max 5 new cards per run; internal ~3h throttle (findings move daily,
     the pulse fires half-hourly).
 
 Since ADR-087 a checker may ALSO carry a "split" block, and then it does two
@@ -70,7 +70,10 @@ HEARTBEAT_PATH = DESK / "cache" / "k2-intake-heartbeat.json"
 # and nothing reports it. K2_INTAKE_BOARD still overrides for a one-off.
 BOARD = os.environ.get("K2_INTAKE_BOARD", "devbot")
 HERMES = os.environ.get("K2_INTAKE_HERMES_BIN", str(Path.home() / ".local" / "bin" / "hermes"))
-THROTTLE_SECS = int(os.environ.get("K2_INTAKE_THROTTLE_SECS") or 6 * 3600)
+# 3h not 6h (Ryan, 2026-09-01): the dsh lane clears its queue in under an hour,
+# so a 6h sync left freed slots idle for most of a day; 3h costs one extra
+# read-only clone refresh per day.
+THROTTLE_SECS = int(os.environ.get("K2_INTAKE_THROTTLE_SECS") or 3 * 3600)
 MAX_NEW_CARDS_PER_RUN = 5
 
 # --- Auto-route (ADR-087, harness t_89dc4076) ------------------------------
@@ -744,7 +747,7 @@ def sync(force: bool = False) -> dict:
         except Exception:
             hb = {}
         hb["tick_ts"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        hb["tick_note"] = "throttled (by design, ~6h sync interval)"
+        hb["tick_note"] = "throttled (by design, ~3h sync interval)"
         HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
         HEARTBEAT_PATH.write_text(_json.dumps(hb), encoding="utf-8")
         return {"skipped": "throttled"}

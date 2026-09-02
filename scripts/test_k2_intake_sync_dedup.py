@@ -266,5 +266,40 @@ class MintImportsTheWrapperLikeAModule(unittest.TestCase):
             self.assertTrue(hasattr(w, "_revoke_installation_token"))
 
 
+class ThrottleDefaultTests(unittest.TestCase):
+    """`_load_module` always pins K2_INTAKE_THROTTLE_SECS=0 for the other
+    tests' isolation, so it can't be reused here — load a second copy the
+    same way but leave the throttle env var alone."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        (self.home / "cache").mkdir()
+        (self.home / "clone").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _load(self):
+        os.environ["HERMES_HOME"] = str(self.home)
+        os.environ["K2_INTAKE_CLONE"] = str(self.home / "clone")
+        os.environ.pop("K2_INTAKE_GH_TOKEN", None)
+        spec = importlib.util.spec_from_file_location(
+            "k2_intake_sync_throttle_uut", MODULE_PATH
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_default_throttle_is_three_hours(self):
+        os.environ.pop("K2_INTAKE_THROTTLE_SECS", None)
+        mod = self._load()
+        self.assertEqual(mod.THROTTLE_SECS, 3 * 3600)
+
+    def test_env_var_still_overrides_the_default(self):
+        os.environ["K2_INTAKE_THROTTLE_SECS"] = "42"
+        mod = self._load()
+        self.assertEqual(mod.THROTTLE_SECS, 42)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
