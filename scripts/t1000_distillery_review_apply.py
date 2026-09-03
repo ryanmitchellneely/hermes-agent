@@ -138,6 +138,11 @@ def parse_decision(text: str) -> dict | None:
     upper = first_line.upper()
     if any(upper.startswith(p) for p in _NON_DECISION_PREFIXES):
         return None
+    # A trailing note after a spaced dash, colon or parenthesis is Ryan's
+    # rationale, not grammar (same shape as the k2 poller's `APPROVE — why`).
+    # A bare hyphen inside `2-5` has no surrounding spaces and survives.
+    first_line = re.split(r"\s+[—–-]\s+|\s*\(|\s*:\s", first_line, maxsplit=1)[0].strip()
+    upper = first_line.upper()
 
     if upper == "DEFER":
         return {"file": set(), "skip": set(), "defer": True}

@@ -264,3 +264,15 @@ def test_apply_decision_missing_review_file_raises(tmp_path):
         assert False, "expected SystemExit"
     except SystemExit as e:
         assert "no review file" in str(e)
+
+
+def test_trailing_note_after_dash_colon_or_paren_is_ignored():
+    from t1000_distillery_review_apply import parse_decision
+
+    assert parse_decision("DEFER — applier smoke test (ryan-claude); still owed")["defer"] is True
+    assert parse_decision("FILE ALL: these are all keepers")["file"] == "ALL"
+    assert parse_decision("SKIP ALL (nothing durable here)")["skip"] == "ALL"
+    d = parse_decision("FILE 1,4 / SKIP rest — the rest are bookkeeping")
+    assert d["file"] == {1, 4} and d["skip"] == "rest"
+    d = parse_decision("FILE 2-5 - keep the plans")
+    assert d["file"] == {2, 3, 4, 5}
