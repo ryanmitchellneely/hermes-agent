@@ -75,15 +75,22 @@ class DedupBase(unittest.TestCase):
         self.mod = _load_module(self.home)
         self.addCleanup(self._tmp.cleanup)
 
-    def arrange(self, pr_state):
-        """The 2026-09-01 board state: one routed card, done, artifact still live."""
+    def arrange(self, pr_state, routed=None):
+        """The 2026-09-01 board state: one routed card, done, artifact still live.
+
+        `routed` overrides the default single-card state — an empty dict lets
+        outage-hold tests exercise the mint loop with no pre-existing card.
+        """
         mod = self.mod
         mod.STATE_PATH.write_text(
             json.dumps(
                 {
                     "last_run_ts": 0,
                     "cards": {},
-                    "routed": {RKEY: {"card": CARD, "artifact": ARTIFACT}},
+                    "routed": (
+                        {RKEY: {"card": CARD, "artifact": ARTIFACT}}
+                        if routed is None else routed
+                    ),
                     "route_attempts": {},
                     "parked_artifacts": {},
                 }
@@ -106,6 +113,9 @@ class DedupBase(unittest.TestCase):
         mod._pr_state = lambda number: pr_state
         mod._board_has_workdir = lambda: True
         mod.is_denied = lambda artifact: False
+        # Real network probe would fail in a sandbox with no relay to reach;
+        # tests that care about outage-hold override this explicitly.
+        mod._model_relay_reachable = lambda: True
         self.mint = MintRecorder()
         mod._create_routed_card = self.mint
         return mod
@@ -234,6 +244,97 @@ class TestBlockedSlotRelease(DedupBase):
         self.assertEqual(counts["parked_failing"], 1)
         self.assertEqual(counts["blocked_released"], 1)
         self.assertEqual(counts["parked_skipped"], 1)
+
+
+class TestOutageHold(DedupBase):
+    """Harness incident 2026-09-03 ~19:30Z: the model host behind the dsh
+    sandbox relay (kevin-spark, 100.125.80.66:11435) went unreachable and
+    every routed card the dispatcher then claimed refused at attestation
+    within seconds, ending `blocked`. The blocked-release rule
+    (TestBlockedSlotRelease) must not book that as artifact failure: no
+    attempt charged, no park — and no NEW card minted while the relay is
+    down, so an outage cannot mint a doomed replacement in the same pulse
+    it just freed."""
+
+    OUTAGE_SUMMARY = (
+        "sandbox refused: attestation failed for the dsh container: the "
+        "model endpoint is NOT reachable from the container"
+    )
+    TRANSPORT_SUMMARY = "dsh: TRANSPORT: Connection error: dial tcp timeout"
+
+    def arrange_blocked_outage(self, summary):
+        mod = self.arrange(None)
+        mod._card_status = lambda card_id: "blocked"
+        mod._card_pr_number = lambda card_id: None
+        mod._card_last_run_summary = lambda card_id: summary
+        mod._model_relay_reachable = lambda: True
+        return mod
+
+    def test_outage_summary_frees_slot_without_charging_attempt(self):
+        """(a) blocked + outage summary -> freed, no attempt, not parked."""
+        mod = self.arrange_blocked_outage(self.OUTAGE_SUMMARY)
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["outage_released"], 1)
+        self.assertEqual(counts["blocked_released"], 0)
+        st = self.state()
+        self.assertNotIn(RKEY, st["routed"])
+        self.assertEqual(st["route_attempts"], {})
+        self.assertNotIn(RKEY, st["parked_artifacts"])
+
+    def test_transport_error_also_matches(self):
+        mod = self.arrange_blocked_outage(self.TRANSPORT_SUMMARY)
+        counts = mod.sync(force=True)
+        self.assertEqual(counts["outage_released"], 1)
+        st = self.state()
+        self.assertEqual(st["route_attempts"], {})
+
+    def test_ordinary_gate_refusal_counts_an_attempt(self):
+        """(b) blocked + ordinary gate refusal -> existing behaviour."""
+        mod = self.arrange_blocked_outage(
+            "dsh headless refused: gate wiring-check failed"
+        )
+        counts = mod.sync(force=True)
+        self.assertEqual(counts["outage_released"], 0)
+        self.assertEqual(len(self.mint.calls), 1)
+        st = self.state()
+        self.assertEqual(st["route_attempts"][RKEY], 1)
+        self.assertEqual(counts["blocked_released"], 1)
+        self.assertEqual(counts["outage_hold"], 0)
+
+    def test_outage_seen_holds_new_minting_this_pulse(self):
+        """(c) outage seen this pulse -> no new card minted."""
+        mod = self.arrange_blocked_outage(self.OUTAGE_SUMMARY)
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["outage_hold"], 1)
+        self.assertGreaterEqual(counts["outage_deferred"], 1)
+
+    def test_probe_failing_with_no_outage_cards_holds(self):
+        """(d) relay probe failing with no outage cards -> hold."""
+        mod = self.arrange(None, routed={})
+        mod._model_relay_reachable = lambda: False
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["outage_hold"], 1)
+        self.assertGreaterEqual(counts["outage_deferred"], 1)
+        self.assertEqual(counts["outage_released"], 0)
+
+    def test_probe_ok_no_outage_mints_as_before(self):
+        """(e) relay probe ok, no outage -> mints as before."""
+        mod = self.arrange(None, routed={})
+        mod._model_relay_reachable = lambda: True
+        counts = mod.sync(force=True)
+        self.assertEqual(len(self.mint.calls), 1)
+        self.assertEqual(counts["outage_hold"], 0)
+        self.assertEqual(counts["outage_deferred"], 0)
+
+    def test_heartbeat_always_carries_the_outage_keys(self):
+        mod = self.arrange_blocked_outage(self.OUTAGE_SUMMARY)
+        mod.sync(force=True)
+        hb = json.loads(mod.HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        for key in ("outage_hold", "outage_released", "outage_deferred"):
+            self.assertIn(key, hb)
 
 
 class TestCardPrNumber(DedupBase):
@@ -400,6 +501,52 @@ class RoutedCapDefaultTests(unittest.TestCase):
         mod = self._load()
         self.assertEqual(mod.MAX_ROUTED_IN_FLIGHT, 10)
         self.assertEqual(mod.MAX_NEW_ROUTED_PER_RUN, 5)
+
+
+class ModelProbeEnvTests(unittest.TestCase):
+    """MODEL_HOST/MODEL_PORT and the off-switch are resolved at import time
+    from K2_INTAKE_MODEL_PROBE, so — same pattern as ThrottleDefaultTests —
+    the env var must be set before the module is loaded."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        (self.home / "cache").mkdir()
+        (self.home / "clone").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(os.environ.pop, "K2_INTAKE_MODEL_PROBE", None)
+
+    def _load(self):
+        os.environ["HERMES_HOME"] = str(self.home)
+        os.environ["K2_INTAKE_CLONE"] = str(self.home / "clone")
+        os.environ.pop("K2_INTAKE_GH_TOKEN", None)
+        spec = importlib.util.spec_from_file_location(
+            "k2_intake_sync_probe_uut", MODULE_PATH
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_default_target_is_the_kevin_spark_relay(self):
+        os.environ.pop("K2_INTAKE_MODEL_PROBE", None)
+        mod = self._load()
+        self.assertEqual(mod.MODEL_HOST, "100.125.80.66")
+        self.assertEqual(mod.MODEL_PORT, 11435)
+        self.assertFalse(mod.MODEL_PROBE_DISABLED)
+
+    def test_off_disables_the_probe_and_reads_as_reachable(self):
+        os.environ["K2_INTAKE_MODEL_PROBE"] = "off"
+        mod = self._load()
+        self.assertTrue(mod.MODEL_PROBE_DISABLED)
+        self.assertTrue(mod._model_relay_reachable())
+
+    def test_host_port_override(self):
+        os.environ["K2_INTAKE_MODEL_PROBE"] = "127.0.0.1:9"
+        mod = self._load()
+        self.assertEqual(mod.MODEL_HOST, "127.0.0.1")
+        self.assertEqual(mod.MODEL_PORT, 9)
+        self.assertFalse(mod.MODEL_PROBE_DISABLED)
 
 
 if __name__ == "__main__":

@@ -90,6 +90,61 @@ MAX_ROUTED_IN_FLIGHT = int(os.environ.get("K2_INTAKE_MAX_ROUTED_IN_FLIGHT") or 1
 # parked VISIBLY instead of re-carded forever (t_9de2917f).
 MAX_ROUTE_ATTEMPTS = int(os.environ.get("K2_INTAKE_MAX_ROUTE_ATTEMPTS") or 2)
 
+# --- Outage hold (2026-09-03) ------------------------------------------------
+# Measured 2026-09-03 ~19:30Z: the model host behind the dsh sandbox relay
+# went unreachable, and every routed card the dispatcher then claimed refused
+# at attestation within seconds — a model outage, not artifact failure. Left
+# alone, the blocked-release rule above burns an attempt per artifact for an
+# outage and can park an artifact that never got a real run. MODEL_HOST/
+# MODEL_PORT are the relay's model endpoint; K2_INTAKE_MODEL_PROBE overrides
+# them as "host:port", or disables the probe entirely with "off" (tests).
+MODEL_HOST = "100.125.80.66"
+MODEL_PORT = 11435
+_model_probe_env = (os.environ.get("K2_INTAKE_MODEL_PROBE") or "").strip()
+MODEL_PROBE_DISABLED = _model_probe_env.lower() == "off"
+if _model_probe_env and not MODEL_PROBE_DISABLED:
+    _probe_host, _, _probe_port = _model_probe_env.partition(":")
+    if _probe_host:
+        MODEL_HOST = _probe_host
+    if _probe_port:
+        MODEL_PORT = int(_probe_port)
+
+# The two refusal shapes measured on the incident (attestation refusal and a
+# bare transport error); matched as a substring against the card's latest
+# run summary so either a prefix or an embedded occurrence counts.
+OUTAGE_REFUSAL_PATTERNS = (
+    "sandbox refused: attestation failed for the dsh container: the model "
+    "endpoint is NOT reachable from the container",
+    "dsh: TRANSPORT: Connection error",
+)
+
+
+def _outage_refusal_match(summary: str | None) -> str | None:
+    """The matched pattern when `summary` reads as a model-outage refusal."""
+    if not summary:
+        return None
+    for pat in OUTAGE_REFUSAL_PATTERNS:
+        if pat in summary:
+            return pat
+    return None
+
+
+def _model_relay_reachable() -> bool:
+    """True when the dsh relay's model host is reachable right now.
+
+    K2_INTAKE_MODEL_PROBE=off disables the probe (tests) and reads as
+    reachable, so a disabled probe can never itself trigger an outage hold.
+    """
+    if MODEL_PROBE_DISABLED:
+        return True
+    import socket
+    try:
+        socket.create_connection((MODEL_HOST, MODEL_PORT), timeout=3).close()
+        return True
+    except OSError:
+        return False
+
+
 # Human-gated regardless of class (ADR-087 decision 3). Checked against the
 # repo-relative artifact path; prefix match, so a directory covers its subtree.
 DENIED_PREFIXES = (
@@ -498,6 +553,32 @@ def _card_status(card_id: str) -> str | None:
         return None
 
 
+def _card_last_run_summary(card_id: str) -> str | None:
+    """Latest non-null task_runs.summary for a card; None on any failure.
+
+    Same read-only peek as `_card_status`, same ordering the kanban engine's
+    own `latest_summary()` uses (hermes_cli/kanban_db.py): most recent run by
+    `ended_at`, falling back to `started_at`/`id` for ties or unfinished
+    rows. None on any failure so a caller that cannot read it behaves
+    exactly as if no summary existed — no outage match, no special-cased
+    slot release.
+    """
+    try:
+        import sqlite3
+        db = DESK / "kanban" / "boards" / BOARD / "kanban.db"
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = conn.execute(
+            "select summary from task_runs where task_id = ? "
+            "and summary is not null and summary != '' "
+            "order by coalesce(ended_at, started_at) desc, id desc limit 1",
+            (card_id,),
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 _PR_URL_RE = re.compile(r"pull/(\d+)")
 
 
@@ -760,6 +841,7 @@ def sync(force: bool = False) -> dict:
         "slots_refreed": 0, "held_blocked": 0, "parked_failing": 0, "parked_skipped": 0,
         "dedup_inflight": 0, "dedup_unverified": 0, "dedup_merged": 0,
         "blocked_released": 0,
+        "outage_hold": 0, "outage_released": 0, "outage_deferred": 0,
     }
     cards = state.setdefault("cards", {})
     routed = state.setdefault("routed", {})
@@ -767,6 +849,18 @@ def sync(force: bool = False) -> dict:
     routed_this_run = 0
     attempts = state.setdefault("route_attempts", {})
     parked = state.setdefault("parked_artifacts", {})
+    # Probed at most once per pulse, and only if a split checker actually has
+    # a live artifact that could mint — a checker with nothing to mint has no
+    # reason to pay for a network round trip, and most pulses (and every
+    # bucket-only checker) never touch it at all.
+    outage_seen_this_pulse = False
+    _probe_memo: dict[str, bool] = {}
+
+    def _relay_probe_ok_once() -> bool:
+        if "ok" not in _probe_memo:
+            _probe_memo["ok"] = _model_relay_reachable()
+        return _probe_memo["ok"]
+
     for spec in CHECKERS:
         counts["checkers"] += 1
         finding = run_checker(spec, CLONE)
@@ -871,6 +965,20 @@ def sync(force: bool = False) -> dict:
             zcard = routed[rkey]["card"]
             status = _card_status(zcard)
             if status == "blocked":
+                outage_pat = _outage_refusal_match(_card_last_run_summary(zcard))
+                if outage_pat:
+                    # A model outage, not artifact failure: free the slot
+                    # without charging an attempt or parking — the artifact
+                    # never got a real run.
+                    del routed[rkey]
+                    counts["slots_refreed"] += 1
+                    counts["outage_released"] += 1
+                    outage_seen_this_pulse = True
+                    print(
+                        f"WARN k2-intake outage-released (card {zcard} "
+                        f"blocked, matched {outage_pat!r}): {rkey}"
+                    )
+                    continue
                 pr = _card_pr_number(zcard)
                 if pr is not None:
                     st = _pr_state(pr)
@@ -963,42 +1071,62 @@ def sync(force: bool = False) -> dict:
                 else:
                     print(f"K2 INTAKE refreed zombie slot (card {zcard} {status}): {rkey}")
         in_flight = sum(1 for k in routed if k.startswith(f"{spec['key']}::"))
-        for artifact in live:
-            rkey = _routed_key(spec["key"], artifact)
-            if rkey in routed:
-                continue
-            if rkey in parked:
-                counts["parked_skipped"] += 1
-                continue
-            if is_denied(artifact):
-                counts["routed_denied"] += 1
-                continue
-            if routed_this_run >= MAX_NEW_ROUTED_PER_RUN:
+        if outage_seen_this_pulse or (live and not _relay_probe_ok_once()):
+            # An outage this pulse (a refusal seen, or the relay probe
+            # itself failing) means minting a new routed card would just
+            # hand a worker the same dead relay. Bucket/clear/dedup logic
+            # above is untouched — only new-card minting is held.
+            counts["outage_hold"] = 1
+            deferred = [
+                a for a in live
+                if _routed_key(spec["key"], a) not in routed
+                and _routed_key(spec["key"], a) not in parked
+                and not is_denied(a)
+            ]
+            if deferred:
+                counts["outage_deferred"] += len(deferred)
                 print(
-                    f"WARN k2-intake routed per-run cap reached; deferring "
-                    f"{spec['key']} ({len(live)} artifacts live)"
+                    f"WARN k2-intake outage hold "
+                    f"({'refusal seen' if outage_seen_this_pulse else 'relay probe failed'}); "
+                    f"deferring {len(deferred)} new routed card(s) for {spec['key']}"
                 )
-                break
-            if in_flight >= MAX_ROUTED_IN_FLIGHT:
+        else:
+            for artifact in live:
+                rkey = _routed_key(spec["key"], artifact)
+                if rkey in routed:
+                    continue
+                if rkey in parked:
+                    counts["parked_skipped"] += 1
+                    continue
+                if is_denied(artifact):
+                    counts["routed_denied"] += 1
+                    continue
+                if routed_this_run >= MAX_NEW_ROUTED_PER_RUN:
+                    print(
+                        f"WARN k2-intake routed per-run cap reached; deferring "
+                        f"{spec['key']} ({len(live)} artifacts live)"
+                    )
+                    break
+                if in_flight >= MAX_ROUTED_IN_FLIGHT:
+                    print(
+                        f"WARN k2-intake routed in-flight cap reached for "
+                        f"{spec['key']} ({in_flight}); deferring the rest"
+                    )
+                    break
+                card_id = _create_routed_card(
+                    spec, artifact, (finding.get("sources_by_artifact") or {}).get(artifact)
+                )
+                if not card_id:
+                    print(f"WARN k2-intake could not mint routed card for {artifact}")
+                    continue
+                routed[rkey] = {"card": card_id, "artifact": artifact}
+                routed_this_run += 1
+                in_flight += 1
+                counts["routed_new"] += 1
                 print(
-                    f"WARN k2-intake routed in-flight cap reached for "
-                    f"{spec['key']} ({in_flight}); deferring the rest"
+                    f"K2 INTAKE routed {BOARD}/{card_id} -> {ROUTED_ASSIGNEE}: "
+                    f"{artifact} (class {spec['split']['cls']})"
                 )
-                break
-            card_id = _create_routed_card(
-                spec, artifact, (finding.get("sources_by_artifact") or {}).get(artifact)
-            )
-            if not card_id:
-                print(f"WARN k2-intake could not mint routed card for {artifact}")
-                continue
-            routed[rkey] = {"card": card_id, "artifact": artifact}
-            routed_this_run += 1
-            in_flight += 1
-            counts["routed_new"] += 1
-            print(
-                f"K2 INTAKE routed {BOARD}/{card_id} -> {ROUTED_ASSIGNEE}: "
-                f"{artifact} (class {spec['split']['cls']})"
-            )
     state["last_run_ts"] = now
     _save_state(state)
     HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
