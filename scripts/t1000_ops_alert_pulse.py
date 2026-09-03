@@ -77,6 +77,24 @@ ALERTS = [
     ("model_failover", DESK / "failover" / "sustained-failover-alert.json"),
     ("reconciler", DESK / "reconciler" / "last-alert.json"),
 ]
+# DS4 (deepseek-v4-flash) liveness pulse (models-board t_c765b8f4, 2026-09-02):
+# the on-box kevin-spark watchdog only ever sees the container from its own
+# loopback, so a dead tailnet path or a dead model-proxy would be invisible
+# from here without a second, independent leg. From k2vps, DS4 is reachable
+# ONLY as http://100.125.80.66:11435 with Host: model.local:11435 and a
+# bearer token — the tailnet ACL admits no other port. MEASURED live
+# 2026-09-02: a real completion against this exact URL/header/model returns
+# choices with no error key; an unauthenticated request returns 401.
+DS4_LIVENESS_URL = os.environ.get(
+    "DS4_LIVENESS_URL", "http://100.125.80.66:11435/v1/chat/completions"
+)
+DS4_LIVENESS_HOST_HEADER = os.environ.get("DS4_LIVENESS_HOST_HEADER", "model.local:11435")
+DS4_LIVENESS_MODEL = os.environ.get("DS4_LIVENESS_MODEL", "deepseek-v4-flash")
+DS4_LIVENESS_TIMEOUT_S = float(os.environ.get("DS4_LIVENESS_TIMEOUT_S", "25"))
+DS4_LIVENESS_TOKEN_ENV = Path(
+    os.environ.get("DS4_LIVENESS_TOKEN_ENV") or (DESK / "secrets" / "model-proxy.env")
+)
+DS4_LIVENESS_TOKEN_KEY = "K2_LOCAL_API_KEY"
 
 
 def _iso() -> str:
@@ -415,6 +433,93 @@ def _gh_get(path: str, token: str) -> list | dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _read_env_value(path: Path, key: str) -> str | None:
+    """Parse one KEY=VALUE line from a simple .env file. Never logs the value."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip().strip('"').strip("'")
+    return None
+
+
+def _ds4_completion_request(token: str) -> dict:
+    """The single network seam for the DS4 liveness check — kept module-level
+    and parameterised so tests stub exactly one thing (same pattern as
+    `_gh_get`). Raises on connection failure, timeout, or any non-2xx
+    (urllib raises HTTPError for those natively).
+    """
+    import urllib.request
+
+    req = urllib.request.Request(
+        DS4_LIVENESS_URL,
+        data=json.dumps(
+            {
+                "model": DS4_LIVENESS_MODEL,
+                "messages": [{"role": "user", "content": "reply with OK"}],
+                "max_tokens": 16,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Host": DS4_LIVENESS_HOST_HEADER,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=DS4_LIVENESS_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _ds4_liveness() -> list[str]:
+    """DS4 flash liveness, read from k2vps through the model-proxy tailnet
+    leg (t_c765b8f4). Success is silent; failure is a WARN with the failure
+    told honestly rather than folded into a generic message (rule 4: an
+    unreachable channel is told as CHANNEL, not confused with "down").
+    """
+    import urllib.error
+
+    token = _read_env_value(DS4_LIVENESS_TOKEN_ENV, DS4_LIVENESS_TOKEN_KEY)
+    if not token:
+        return [
+            f"WARN ds4 flash: token unreadable from {DS4_LIVENESS_TOKEN_ENV} "
+            f"(missing {DS4_LIVENESS_TOKEN_KEY}) — liveness check cannot run"
+        ]
+
+    try:
+        body = _ds4_completion_request(token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return [
+                "WARN ds4 flash: auth rejected (401) against the model-proxy — "
+                "the K2_LOCAL_API_KEY token is wrong or rotated"
+            ]
+        return [f"WARN ds4 flash: model-proxy returned HTTP {exc.code}"]
+    except Exception as exc:  # noqa: BLE001 — connection refused/timeout/DNS/etc.
+        return [
+            "WARN ds4 flash: CHANNEL unreachable via the k2vps model-proxy "
+            f"({type(exc).__name__}) — tailnet path down, proxy down, or the "
+            "DS4 container itself down; state is UNKNOWN, not bad"
+        ]
+
+    if "error" in body:
+        return [
+            f"WARN ds4 flash: completion returned an error: {str(body.get('error'))[:160]}"
+        ]
+    if not body.get("choices"):
+        return [
+            "WARN ds4 flash: completion returned no choices — real inference "
+            "path is not working"
+        ]
+    return []
+
+
 def _dsh_verdict_waste() -> list[str]:
     """Page when N+ dsh-lane PRs have sat unverdicted for longer than the age.
 
@@ -633,6 +738,20 @@ def main() -> int:
     old_dw_fp = (prev.get("fps") or {}).get("dsh_waste")
     if dw_fp and dw_fp != old_dw_fp:
         lines.append(dw_blob)
+
+    # DS4 flash liveness (t_c765b8f4, 2026-09-02): a second, independent read
+    # of the flash lane through the k2vps model-proxy leg — same fp dedup so
+    # a sustained outage pages once per distinct state, not every 30m. The
+    # timestamp is written every run regardless (register + heartbeat), even
+    # on the silent/clean path.
+    ds4_warns = _ds4_liveness()
+    ds4_blob = "\n".join(ds4_warns).strip()
+    ds4_fp = hashlib.sha256(ds4_blob.encode()).hexdigest()[:16] if ds4_blob else None
+    new_state["fps"]["ds4_liveness"] = ds4_fp
+    new_state["ds4_liveness_checked_at"] = _iso()
+    old_ds4_fp = (prev.get("fps") or {}).get("ds4_liveness")
+    if ds4_fp and ds4_fp != old_ds4_fp:
+        lines.append(ds4_blob)
 
     for kind, path in ALERTS:
         fp = _fp(path)
