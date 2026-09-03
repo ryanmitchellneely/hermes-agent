@@ -6,11 +6,57 @@ artifacts actually land, fingerprints each one, and drafts a review row.
 `PATTERN-LEDGER`, or Buzz, and never auto-files anything.
 
 - **Design:** `../distillery-intake-sweep-design.md` (mesh card `t_216ac84b`)
-- **Script:** `scripts/distillery_intake_sweep.py` (repo SoT)
-  · dual-written to `~/.t1000/scripts/distillery_intake_sweep.py` for cron
+- **Script:** `scripts/distillery_intake_sweep.py` (repo SoT — no dual-write copy any more)
 - **Tests:** `tests/scripts/test_distillery_intake_sweep.py`
 
-## Layout
+## Where it runs (since 2026-09-03 — mesh `t_a4d3ea5b`, `t_d3afec09`)
+
+**The VPS is the only writer.** `k2vps:/opt/t1000/src` is the canonical T1000
+checkout; hermes cron `534f64030bae` runs `scripts/distillery_sweep_cron.sh`
+every 6 h and `ca85cff14fa1` runs `distillery_review_cron.sh` 3×/day, both as
+user `t1000`. Queue state is **not in git**:
+
+```
+/opt/t1000/home/distillery-intake/      # HERMES_HOME state, gitignored in the repo
+├── config.yaml     # mirror of the repo copy below — the repo copy is the SoT
+├── index.json      # sweep-owned ledger (idempotency + status). Do not hand-edit.
+├── drafts/<id>.md  # one file per row
+└── reviews/<date>.md
+docs/research/distillery-intake/        # repo — tracked
+├── config.yaml     # sources, boards, filters, staleness_days — the whole scope surface
+├── FILED-LOG.md    # append-only pointer per `file` verdict applied
+└── LESSONS-LEDGER.md   # one line per filed done-card: board:id | title — lesson
+```
+
+Every configured source path must exist: a missing path is `exit 2` with the
+path on stderr (delivered by the cron), never a silent zero. The state file
+`/opt/t1000/home/cache/distillery-intake-sweep-state.json` carries per-source
+counts; the 30-min T1000 ops alert pulse pages when it is stale (>13 h) or a
+source reports zero artifacts on two consecutive sweeps. Why: from 2026-08-11
+to 2026-09-03 every source path resolved to a nonexistent directory and the
+cron reported "silent (empty output)" — indistinguishable from clean.
+
+## Deciding a batch (the loop that closes)
+
+`distillery_review_agent.py --card-board distillery` writes `reviews/<date>.md`
+and creates ONE card on the `distillery` kanban board, `HUMAN review:
+distillery batch <date>`, born `blocked/needs_input`, whose body is the
+numbered row list. Reply with a **comment** whose first line is one of:
+
+```
+FILE 1,4 / SKIP rest      # file rows 1 and 4, skip every other row
+FILE 2-5                  # ranges work; unnamed rows stay pending
+FILE ALL · SKIP ALL · DEFER
+```
+
+`t1000_distillery_review_apply.py` (no-agent cron, every 2 min, cloned from the
+k2 HUMAN-PR poller `92ea65df969b`) turns the comment into
+`distillery_intake_sweep.py --mark`, appends `FILED-LOG.md` (and
+`LESSONS-LEDGER.md` for done cards), comments a receipt, and archives the card
+when nothing is left pending. Your FILE overrides the judge's verdict. Rows you
+do not name stay pending and reappear in a later batch.
+
+## Layout (dev clone / tests)
 
 ```
 docs/research/distillery-intake/
@@ -19,7 +65,16 @@ docs/research/distillery-intake/
 └── drafts/<id>.md   # one file per row — this is what you review
 ```
 
-## Run it
+## Run it by hand
+
+On the VPS, use the wrappers (they pass every path):
+
+```bash
+ssh k2vps 'sudo -u t1000 env HERMES_HOME=/opt/t1000/home bash /opt/t1000/home/scripts/distillery_sweep_cron.sh --dry-run --json'
+ssh k2vps 'sudo -u t1000 env HERMES_HOME=/opt/t1000/home bash /opt/t1000/home/scripts/distillery_review_cron.sh --dry-run'
+```
+
+From a dev clone (tests, dry runs against a temp store):
 
 ```bash
 cd ~/Documents/T1000

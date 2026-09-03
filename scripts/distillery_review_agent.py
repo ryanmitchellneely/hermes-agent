@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -82,9 +83,11 @@ JUDGE_TIMEOUT_S = 300.0
 JUDGE_NUM_CTX = 65536
 
 CANDIDATE_STATUSES = ("stale", "draft")  # sort priority order, not a filter set
-DEFAULT_BATCH_SIZE = 8
+DEFAULT_BATCH_SIZE = 24  # t_76d4e3bd: 8/day could never outrun ~35-55/day intake
 VERDICTS = ("file", "skip", "supersede")
-DEFAULT_PENDING_CACHE = "~/.t1000/cache/distillery-review-pending.json"
+DEFAULT_PENDING_CACHE = os.path.join(
+    os.environ.get("HERMES_HOME", "~/.t1000"), "cache", "distillery-review-pending.json"
+)
 
 # Must match distillery_intake_sweep.py's NOTES_HEADING exactly — that's the
 # human-edit-round-trip contract read_human_edits()/fold_human_edits() parse
@@ -312,9 +315,11 @@ def render_review_markdown(
         "proposed verdict on the next `--apply` run. Leave blank (or "
         "anything else) to defer — the row reappears in a later batch.",
     ]
+    row_num = 0
     for cluster in clusters:
         lines += ["", f"## {cluster['label']}"]
         for rid in cluster["row_ids"]:
+            row_num += 1
             row = by_id[rid]
             v = verdicts[rid]
             lines += [
@@ -323,6 +328,7 @@ def render_review_markdown(
                 "",
                 "```yaml",
                 f"id: {rid}",
+                f"row: {row_num}",
                 f"cluster: {cluster['label']}",
                 f"verdict: {v['verdict']}",
                 f"rationale: {v['rationale']}",
@@ -352,11 +358,126 @@ def render_dry_run_report(rows: list[dict], clusters: list[dict], verdicts: dict
     return "\n".join(lines) + "\n"
 
 
-def render_cron_summary(date_str: str, rows: list[dict], clusters: list[dict], review_path: Path) -> str:
+def render_cron_summary(
+    date_str: str,
+    rows: list[dict],
+    clusters: list[dict],
+    review_path: Path,
+    card_id: str | None = None,
+) -> str:
+    suffix = f" card={card_id}" if card_id else ""
     return (
         f"Distillery review batch {date_str}: {len(rows)} row(s), "
-        f"{len(clusters)} cluster(s). Review: {review_path}\n"
+        f"{len(clusters)} cluster(s). Review: {review_path}{suffix}\n"
     )
+
+
+def render_review_card_body(date_str: str, rows_in_order: list[dict], review_path: Path) -> str:
+    """Kanban card body for a review batch: a numbered list matching
+    parse_review_rows()'s document order exactly, plus the human reply
+    grammar footer. FILE/SKIP replies name these numbers, not row ids —
+    Ryan never has to type an id."""
+    lines = [f"Distillery review batch {date_str} — {len(rows_in_order)} row(s)."]
+    for n, row in enumerate(rows_in_order, start=1):
+        sup = f" (dup of {row['supersede_of']})" if row.get("supersede_of") else ""
+        lines.append(f"{n}. [{row['verdict']}] {row['title']} — {row['rationale']}{sup}")
+    lines += [
+        "",
+        "Reply as a comment: FILE 1,4 / SKIP rest · FILE ALL · SKIP ALL · DEFER. "
+        "FILE overrides the judge's verdict; rows not named are left pending "
+        "unless you say SKIP rest / SKIP ALL.",
+        f"Review file: {review_path}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def create_review_card(
+    hermes_bin: str,
+    hermes_home: str,
+    board: str,
+    date_str: str,
+    body: str,
+    run=subprocess.run,
+) -> str:
+    """Create the HUMAN review card, immediately block it (a freshly created
+    card is `ready` and will be claimed by a dispatcher otherwise), and
+    verify the block actually landed. Raises SystemExit on any failure —
+    never leaves a review batch with an unblocked or missing card."""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    title = f"HUMAN review: distillery batch {date_str}"
+
+    create_result = run(
+        [
+            hermes_bin,
+            "kanban",
+            "--board",
+            board,
+            "create",
+            title,
+            "--body",
+            body,
+            "--created-by",
+            "distillery-review",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if create_result.returncode != 0:
+        raise SystemExit(
+            "distillery-review: card create failed (exit "
+            f"{create_result.returncode}): "
+            f"{(create_result.stderr or create_result.stdout or '').strip()}"
+        )
+    m = re.search(r"t_[0-9a-f]{8}", create_result.stdout or "")
+    if not m:
+        raise SystemExit(
+            "distillery-review: card create produced no task id in output: "
+            f"{(create_result.stdout or '').strip()!r}"
+        )
+    card_id = m.group(0)
+
+    block_reason = "Ryan: FILE n,n / SKIP rest / FILE ALL / SKIP ALL / DEFER as a comment"
+    block_result = run(
+        [
+            hermes_bin,
+            "kanban",
+            "--board",
+            board,
+            "block",
+            card_id,
+            "--kind",
+            "needs_input",
+            block_reason,
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if block_result.returncode != 0:
+        raise SystemExit(
+            f"distillery-review: card {card_id} created but block failed (exit "
+            f"{block_result.returncode}): "
+            f"{(block_result.stderr or block_result.stdout or '').strip()} — "
+            "card left in default (ready) status, a dispatcher will claim it"
+        )
+
+    show_result = run(
+        [hermes_bin, "kanban", "--board", board, "show", card_id],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if show_result.returncode != 0 or not re.search(
+        r"status:\s*blocked", show_result.stdout or ""
+    ):
+        raise SystemExit(
+            f"distillery-review: card {card_id} block could not be verified — "
+            f"show output: {(show_result.stdout or '').strip()!r}"
+        )
+
+    return card_id
 
 
 def parse_review_rows(text: str) -> list[dict]:
@@ -373,9 +494,11 @@ def parse_review_rows(text: str) -> list[dict]:
         row_id = fields.get("id")
         if not row_id:
             continue
+        row_field = fields.get("row", "")
         rows.append(
             {
                 "id": row_id,
+                "row": int(row_field) if row_field.strip().isdigit() else None,
                 "title": m.group("title").strip(),
                 "verdict": fields.get("verdict", ""),
                 "rationale": fields.get("rationale", ""),
@@ -567,6 +690,26 @@ def main(argv: list[str] | None = None) -> int:
             "(approved or not) so a deferred row reappears in a later batch."
         ),
     )
+    ap.add_argument(
+        "--card-board",
+        default=None,
+        help=(
+            "If set, create a blocked HUMAN review kanban card on this board "
+            "after writing the review file (non-dry-run only) so Ryan "
+            "decides via a card comment instead of hand-editing decision: "
+            "fields."
+        ),
+    )
+    ap.add_argument(
+        "--hermes-bin",
+        default=os.environ.get("HERMES_BIN", "hermes"),
+        help="hermes binary used for --card-board (default: $HERMES_BIN or 'hermes')",
+    )
+    ap.add_argument(
+        "--hermes-home",
+        default=os.environ.get("HERMES_HOME", "~/.t1000"),
+        help="HERMES_HOME used for --card-board (default: $HERMES_HOME or ~/.t1000)",
+    )
     args = ap.parse_args(argv)
 
     if args.intake_dir is None:
@@ -607,6 +750,7 @@ def main(argv: list[str] | None = None) -> int:
     review_rel = Path("reviews") / f"{date_str}.md"
     review_path = intake_dir / review_rel
 
+    card_id = None
     if not args.dry_run:
         review_path.parent.mkdir(parents=True, exist_ok=True)
         review_path.write_text(
@@ -615,6 +759,17 @@ def main(argv: list[str] | None = None) -> int:
         for r in candidates:
             pending[r["id"]] = {"review_date": date_str, "review_file": str(review_rel)}
         save_pending(pending_cache, pending)
+
+        if args.card_board:
+            rows_in_order = parse_review_rows(review_path.read_text(encoding="utf-8"))
+            card_body = render_review_card_body(date_str, rows_in_order, review_path)
+            card_id = create_review_card(
+                args.hermes_bin,
+                str(Path(args.hermes_home).expanduser()),
+                args.card_board,
+                date_str,
+                card_body,
+            )
 
     if args.json:
         sys.stdout.write(
@@ -634,7 +789,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.dry_run:
         sys.stdout.write(render_dry_run_report(candidates, clusters, verdicts))
     else:
-        sys.stdout.write(render_cron_summary(date_str, candidates, clusters, review_path))
+        sys.stdout.write(render_cron_summary(date_str, candidates, clusters, review_path, card_id))
 
     return 0
 

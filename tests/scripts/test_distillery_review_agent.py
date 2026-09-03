@@ -202,6 +202,127 @@ def test_review_markdown_includes_supersede_of_only_when_set():
     assert "supersede_of: b" in md
 
 
+def test_review_markdown_row_numbers_are_1_based_document_order():
+    rows = [_row("a", title="Row A"), _row("b", title="Row B"), _row("c", title="Row C")]
+    clusters = [
+        {"label": "First", "row_ids": ["a", "b"]},
+        {"label": "Second", "row_ids": ["c"]},
+    ]
+    verdicts = {
+        rid: {"cluster": "x", "verdict": "file", "rationale": "r", "supersede_of": None}
+        for rid in ("a", "b", "c")
+    }
+    md = dra.render_review_markdown("2026-08-10", rows, clusters, verdicts)
+    parsed = dra.parse_review_rows(md)
+    by_id = {r["id"]: r for r in parsed}
+    assert by_id["a"]["row"] == 1
+    assert by_id["b"]["row"] == 2
+    assert by_id["c"]["row"] == 3
+
+
+def test_parse_review_rows_row_field_missing_yields_none():
+    # Hand-written yaml block from before the `row:` field existed — must not crash.
+    text = (
+        "### Row A\n\n```yaml\nid: a\ncluster: C\nverdict: file\n"
+        "rationale: r\ndecision:\n```\n"
+    )
+    parsed = dra.parse_review_rows(text)
+    assert parsed[0]["row"] is None
+
+
+# ── render_review_card_body: numbering + grammar footer ────────────────
+
+
+def test_review_card_body_numbers_rows_in_order_and_includes_grammar_footer():
+    rows_in_order = [
+        {"id": "a", "row": 1, "title": "Row A", "verdict": "file", "rationale": "keep it", "supersede_of": None},
+        {"id": "b", "row": 2, "title": "Row B", "verdict": "skip", "rationale": "too narrow", "supersede_of": None},
+    ]
+    review_path = Path("/tmp/reviews/2026-08-10.md")
+    body = dra.render_review_card_body("2026-08-10", rows_in_order, review_path)
+    lines = body.splitlines()
+    assert "1. [file] Row A — keep it" in lines
+    assert "2. [skip] Row B — too narrow" in lines
+    assert (
+        "Reply as a comment: FILE 1,4 / SKIP rest · FILE ALL · SKIP ALL · DEFER. "
+        "FILE overrides the judge's verdict; rows not named are left pending "
+        "unless you say SKIP rest / SKIP ALL." in body
+    )
+    assert str(review_path) in body
+
+
+def test_review_card_body_marks_supersede_rows_as_dup_of():
+    rows_in_order = [
+        {"id": "b", "row": 1, "title": "Row B", "verdict": "supersede", "rationale": "dup", "supersede_of": "a"},
+    ]
+    body = dra.render_review_card_body("2026-08-10", rows_in_order, Path("x.md"))
+    assert "1. [supersede] Row B — dup (dup of a)" in body
+
+
+# ── create_review_card: create -> block -> verify sequence ─────────────
+
+
+class _FakeResult:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_create_review_card_runs_create_block_show_and_returns_id():
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[4] == "create":
+            return _FakeResult(0, stdout="Created t_abcdef01 (ready, assignee=-)\n")
+        if cmd[4] == "block":
+            return _FakeResult(0, stdout="Blocked t_abcdef01\n")
+        if cmd[4] == "show":
+            return _FakeResult(0, stdout="Task t_abcdef01: x\n  status:    blocked\n")
+        raise AssertionError(f"unexpected subcommand: {cmd}")
+
+    card_id = dra.create_review_card(
+        "hermes", "~/.t1000", "distillery", "2026-08-10", "body text", run=fake_run
+    )
+    assert card_id == "t_abcdef01"
+    subcommands = [c[4] for c in calls]
+    assert subcommands == ["create", "block", "show"]
+    # block must be a needs_input block naming the reply grammar
+    block_cmd = calls[1]
+    assert "--kind" in block_cmd and "needs_input" in block_cmd
+    assert any("FILE" in arg and "DEFER" in arg for arg in block_cmd)
+
+
+def test_create_review_card_raises_when_create_fails():
+    def fake_run(cmd, **kwargs):
+        return _FakeResult(1, stderr="boom")
+
+    try:
+        dra.create_review_card("hermes", "~/.t1000", "distillery", "2026-08-10", "body", run=fake_run)
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert "create failed" in str(e)
+
+
+def test_create_review_card_raises_when_block_verification_fails():
+    def fake_run(cmd, **kwargs):
+        if cmd[4] == "create":
+            return _FakeResult(0, stdout="Created t_abcdef01 (ready, assignee=-)\n")
+        if cmd[4] == "block":
+            return _FakeResult(0, stdout="Blocked t_abcdef01\n")
+        if cmd[4] == "show":
+            # block never landed — status still ready
+            return _FakeResult(0, stdout="Task t_abcdef01: x\n  status:    ready\n")
+        raise AssertionError(f"unexpected subcommand: {cmd}")
+
+    try:
+        dra.create_review_card("hermes", "~/.t1000", "distillery", "2026-08-10", "body", run=fake_run)
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        assert "could not be verified" in str(e)
+
+
 # ── pending cache round trip ────────────────────────────────────────────
 
 
@@ -355,8 +476,10 @@ def test_parse_review_rows_round_trips_the_real_renderer(tmp_path):
     md = dra.render_review_markdown("2026-08-10", rows, clusters, verdicts)
     # decision: is always rendered blank; approve exactly one row by editing
     # the substring in place, the way a human would in an editor.
-    md = md.replace("id: a\ncluster: C\nverdict: file\nrationale: keep it\ndecision:",
-                     "id: a\ncluster: C\nverdict: file\nrationale: keep it\ndecision: approve")
+    md = md.replace(
+        "id: a\nrow: 1\ncluster: C\nverdict: file\nrationale: keep it\ndecision:",
+        "id: a\nrow: 1\ncluster: C\nverdict: file\nrationale: keep it\ndecision: approve",
+    )
 
     parsed = dra.parse_review_rows(md)
     assert len(parsed) == 2

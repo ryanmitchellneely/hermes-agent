@@ -2,20 +2,31 @@
 #
 # Design: docs/research/distillery-intake-sweep-design.md (mesh t_216ac84b)
 # Script: scripts/distillery_intake_sweep.py
+# Repaired 2026-09-03 (mesh t_a4d3ea5b): the VPS is the ONLY sweep writer.
+# Queue state (index.json, drafts/, reviews/) lives in
+# /opt/t1000/home/distillery-intake/ — NOT in this repo. This file is the
+# repo SoT; the copy beside the state dir must match it.
 #
-# Nothing in the sweep hardcodes `mesh`, a repo path, or a skill name — every
-# one of those is a value read from this file. Multi-board v2 is "add a slug to
-# `boards:`" and nothing else.
+# Every path here is either repo-relative (resolved against --repo-root,
+# which the cron wrapper passes as /opt/t1000/src) or an absolute VPS path.
+# A configured path that does not exist is a HARD error (exit 2), never a
+# silent zero — that silent zero is what hid a three-week outage.
 
-# Board source list — mesh-only for v1. Adding a board here is the *entire*
-# mechanism for scope expansion.
+# Board source list. Adding a board here is the *entire* mechanism for
+# scope expansion. NEVER add `distillery` (the HUMAN review-batch board) or
+# `devbot` (the dsh run queue, not research).
 boards:
   - mesh
+  - steals
+  - harness
+  - models
+  - infra
 
 sources:
   plans:
     enabled: true
-    path: "~/.hermes/plans"
+    # repo-relative, git-tracked — ~/.hermes/plans is empty on the VPS
+    path: "docs/plans"
 
   signal_log:
     enabled: true
@@ -24,16 +35,22 @@ sources:
 
   mesh_done_cards:
     enabled: true
-    # {board} is substituted per entry in `boards:` above
-    db_template: "~/.t1000/kanban/boards/{board}/kanban.db"
+    # {board} is substituted per entry in `boards:` above (VPS layout)
+    db_template: "/opt/t1000/home/kanban/boards/{board}/kanban.db"
     title_exclude_patterns:
       # pr-kanban-sync wrapper cards — process bookkeeping, not artifacts
       - "^HUMAN review: PR #"
+      - "^HUMAN review: distillery batch "
+    # Only done cards that carry a non-empty `result` draft a row on these
+    # boards: an orchestrator's "decomposed" done or a worker's empty
+    # completion is bookkeeping, not a durable artifact (mesh: 367 done,
+    # 150 with a result).
+    require_result_boards: [mesh, steals, harness, models, infra]
 
   skill_references:
     enabled: true
     trees:
-      - "~/.t1000/profiles/worker/skills/software-development/local-inference-fleet/references"
+      - "/opt/t1000/home/profiles/worker/skills/software-development/local-inference-fleet/references"
       # additional references/ trees are added here, never in the script
 
 filters:

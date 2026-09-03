@@ -197,3 +197,10 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# Distillery intake queue state lives in <HERMES_HOME>/distillery-intake/ on the
+# VPS (the sole sweep writer since 2026-09-03, mesh t_a4d3ea5b). Only
+# config.yaml, README.md, FILED-LOG.md and LESSONS-LEDGER.md are tracked.
+docs/research/distillery-intake/index.json
+docs/research/distillery-intake/drafts/
+docs/research/distillery-intake/reviews/

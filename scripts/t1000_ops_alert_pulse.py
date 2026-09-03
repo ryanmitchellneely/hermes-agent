@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,9 @@ READONLY_CLONE_SCRIPT = DESK / "scripts" / "refresh_readonly_clones.py"
 READONLY_CLONE_HB = DESK / "cache" / "readonly-clones-heartbeat.json"
 # If the clone heartbeat is older than this after a refresh attempt, WARN.
 READONLY_CLONE_STALE_SECS = int(os.environ.get("READONLY_CLONE_STALE_SECS") or 2 * 3600)
+# Distillery intake sweep runs every 6h (hermes cron 534f64030bae); two missed
+# ticks is the page threshold.
+DISTILLERY_INTAKE_STALE_SECS = int(os.environ.get("DISTILLERY_INTAKE_STALE_SECS") or 13 * 3600)
 # Failure-playbook retrieval sweep (t_c3a4b01d) — same Track C piggyback:
 # comments known-failure diagnoses onto blocked/crashed cards; its stdout
 # (hits + stale-entry warns) is a Telegram-worthy surface.
@@ -52,10 +56,48 @@ T1000_CHECKOUT = Path(
 T1000_EXPECTED_BRANCH = os.environ.get("T1000_EXPECTED_BRANCH", "ryan/herald-0.20-cutover")
 T1000_SEAM_FILE = "hermes_cli/kanban_db.py"
 T1000_SEAM_MARKER = "_profile_worker_command"
+# dsh verdict-waste threshold (harness t_70595c66). DEVBOT-2-PLAN §5's rule —
+# keep iterating while PRs clear; producing unstampable PRs is the waste — was
+# a memory until now: 8 dsh-lane PRs sat unverdicted >72h before the 09-01
+# routing ruling and zero instruments said so.
+DSH_WASTE_CACHE = DESK / "cache" / "k2-dsh-waste.json"
+# How GitHub REST spells the lane's App identity. `gh` prints the PR author as
+# `app/k2-dsh-lane`; the REST API returns `k2-dsh-lane[bot]` with
+# user.type == "Bot" — MEASURED 2026-09-01 with one read-only GET on
+# /repos/joinsov/kevin-real-estate-tools/pulls/5878, run on k2vps as t1000
+# against the lane's own installation token. Both spellings are matched so a
+# future REST change does not silently empty the lane.
+DSH_LANE_LOGINS = ("k2-dsh-lane[bot]", "app/k2-dsh-lane")
+# A verdict only counts when a NON-author, non-automation login stamped it.
+# github-actions[bot] is excluded on purpose: the automated lane posts
+# INCONCLUSIVE notices, and on #5834 it posted a fabricated objection — an
+# unreviewed PR must not look reviewed because CI talked to itself.
+DSH_VERDICT_RE = re.compile(
+    r"Verdict:\s*\**\s*(APPROVE-WITH-NITS|APPROVE|REQUEST-CHANGES|BLOCK)"
+)
+DSH_VERDICT_IGNORE_LOGINS = ("github-actions[bot]",)
 ALERTS = [
     ("model_failover", DESK / "failover" / "sustained-failover-alert.json"),
     ("reconciler", DESK / "reconciler" / "last-alert.json"),
 ]
+# DS4 (deepseek-v4-flash) liveness pulse (models-board t_c765b8f4, 2026-09-02):
+# the on-box kevin-spark watchdog only ever sees the container from its own
+# loopback, so a dead tailnet path or a dead model-proxy would be invisible
+# from here without a second, independent leg. From k2vps, DS4 is reachable
+# ONLY as http://100.125.80.66:11435 with Host: model.local:11435 and a
+# bearer token — the tailnet ACL admits no other port. MEASURED live
+# 2026-09-02: a real completion against this exact URL/header/model returns
+# choices with no error key; an unauthenticated request returns 401.
+DS4_LIVENESS_URL = os.environ.get(
+    "DS4_LIVENESS_URL", "http://100.125.80.66:11435/v1/chat/completions"
+)
+DS4_LIVENESS_HOST_HEADER = os.environ.get("DS4_LIVENESS_HOST_HEADER", "model.local:11435")
+DS4_LIVENESS_MODEL = os.environ.get("DS4_LIVENESS_MODEL", "deepseek-v4-flash")
+DS4_LIVENESS_TIMEOUT_S = float(os.environ.get("DS4_LIVENESS_TIMEOUT_S", "25"))
+DS4_LIVENESS_TOKEN_ENV = Path(
+    os.environ.get("DS4_LIVENESS_TOKEN_ENV") or (DESK / "secrets" / "model-proxy.env")
+)
+DS4_LIVENESS_TOKEN_KEY = "K2_LOCAL_API_KEY"
 
 
 def _iso() -> str:
@@ -222,6 +264,61 @@ def _k2_intake() -> list[str]:
     return warns
 
 
+def _distillery_intake() -> list[str]:
+    """Distillery intake sweep heartbeat (mesh t_a4d3ea5b, 2026-09-03).
+
+    The sweep ran for three weeks with every source path resolving to a
+    nonexistent directory and reported "silent (empty output)" — indistinguishable
+    from a clean tick. The sweep now writes per-source counts into its state
+    file; this leg pages when the file is stale (sweep not running) or when an
+    enabled source has reported zero artifacts on two consecutive sweeps.
+    """
+    warns: list[str] = []
+    state_path = DESK / "cache" / "distillery-intake-sweep-state.json"
+    if not state_path.is_file():
+        return [f"WARN distillery-intake state missing at {state_path} — sweep never ran here"]
+    try:
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return [f"WARN distillery-intake state unreadable: {type(exc).__name__}: {exc}"]
+    ts = st.get("ts")
+    try:
+        age = time.time() - datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except Exception:  # noqa: BLE001
+        return [f"WARN distillery-intake state has no parseable ts ({ts!r})"]
+    if age > DISTILLERY_INTAKE_STALE_SECS:
+        warns.append(
+            f"WARN distillery-intake sweep STALE age={int(age // 3600)}h "
+            f"(threshold {DISTILLERY_INTAKE_STALE_SECS // 3600}h) — cron 534f64030bae not landing"
+        )
+    sources = st.get("sources") or {}
+    if not sources:
+        warns.append(
+            "WARN distillery-intake state carries no per-source counts — "
+            "pre-2026-09-03 sweep build still running"
+        )
+        return warns
+    zero_now = sorted(k for k, v in sources.items() if isinstance(v, dict) and not v.get("count"))
+    missing = sorted(k for k, v in sources.items() if isinstance(v, dict) and v.get("exists") is False)
+    if missing:
+        warns.append(f"WARN distillery-intake source path MISSING: {', '.join(missing)}")
+    prev_zero = set((st.get("prev_zero_sources") or []))
+    persistent = [k for k in zero_now if k in prev_zero and k not in missing]
+    if persistent:
+        warns.append(
+            f"WARN distillery-intake source reported 0 artifacts on two consecutive sweeps: "
+            f"{', '.join(persistent)}"
+        )
+    try:
+        st["prev_zero_sources"] = zero_now
+        state_path.write_text(json.dumps(st, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return warns
+
+
 def _checkout_guard() -> list[str]:
     """Detect the still-unidentified checkout-flipper mechanically (PB-003)."""
     warns: list[str] = []
@@ -301,6 +398,318 @@ def _fleet_liveness() -> list[str]:
     return warns
 
 
+
+def _night_dequeue_heartbeat() -> list[str]:
+    """DevBot night-dequeue heartbeat, read over the spark reverse tunnel.
+
+    Closes the atlas R3 owed item (Ryan-approved 2026-08-31): the nightly
+    unattended executor on kevin-spark had zero off-box heartbeat rows, so a
+    dead crontab and a healthy quiet night were indistinguishable from here.
+    kevin-spark serves ~/devbot/logs on 127.0.0.1:8899, reverse-tunneled to
+    local :11440 (moved off 11439 on 2026-09-01: that port is
+    allocated to deepseek-v4-flash per dsh-flashnext.yml) via the pre-authorized permitlisten key (no new creds).
+
+    Rule 4 wording: an unreachable channel is told as CHANNEL (spark down,
+    tunnel dead, or server stopped), never as "the cron did not run" — and a
+    stale receipt is told as the cron's silence. Thresholds ~2.5x cadence:
+    the job fires daily 06:30Z, so stale > 60h pages; unreachable pages
+    immediately (the tunnel is supervised by a 10-min keeper, so a dead
+    channel is itself a real fault, and the fp dedup means one page per
+    distinct state, not one per pulse).
+    """
+    import urllib.request
+    warns: list[str] = []
+    max_age_h = float(os.environ.get("T1000_NIGHT_HB_MAX_AGE_H", "60"))
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11440/night-last.json", timeout=6) as r:
+            hb = json.loads(r.read().decode("utf-8"))
+    except Exception as exc:
+        return [
+            "WARN night-dequeue heartbeat UNREACHABLE via :11440 tunnel "
+            f"({type(exc).__name__}) — spark down, tunnel dead, or the logs "
+            "server stopped; the cron's own state is UNKNOWN, not bad"
+        ]
+    try:
+        ts = datetime.strptime(hb.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+    except Exception:
+        return [f"WARN night-dequeue receipt unparseable: {str(hb)[:120]}"]
+    if age_h > max_age_h:
+        warns.append(
+            f"WARN night-dequeue receipt STALE: last ran {hb.get('ts')} "
+            f"({age_h:.0f}h ago; expected daily ~06:30Z) — the cron on "
+            "kevin-spark has gone quiet"
+        )
+    rc = hb.get("rc")
+    # rc is the PROCESS exit, not the outcome: on 2026-09-02 db-0020 exited rc=0
+    # with its only deliverable refused by the path fence, and this checker
+    # stayed silent. The receipt now carries apply_ok/apply_fail (night_dequeue.sh);
+    # a failed apply is a warning even when rc is 0.
+    af = hb.get("apply_fail")
+    if af in (-1, -2):
+        # No countable outcome is itself a warning: -1 the run wrote no
+        # code.json at all, -2 it wrote one that cannot be parsed. Neither is
+        # "healthy", and rc=0 says nothing either way.
+        why = "never wrote its code.json" if af == -1 else "wrote an unparseable code.json"
+        return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but {why} (apply_fail={af}) — no countable outcome; read night.log on kevin-spark")
+    ao = hb.get("apply_ok")
+    if hb.get("job") and af == 0 and ao == 0:
+        # Grok residual risk on #5923: an empty results list counts 0/0 and
+        # looked healthy. A job that ran, exited rc=0, and applied NOTHING is
+        # not a delivered job — the model returned no fences, or every fence
+        # was dropped before the apply loop. Warn.
+        return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but applied nothing (apply_ok=0, apply_fail=0) — no deliverable; read night.log on kevin-spark")
+    if isinstance(af, int) and af > 0:
+        return ("warn", f"night dequeue ran {hb.get('job')} rc={hb.get('rc')} but apply_fail={af} (apply_ok={hb.get('apply_ok')}): the deliverable did not land — read night.log on kevin-spark")
+    if rc not in (0, -1):
+        warns.append(
+            f"WARN night-dequeue last run FAILED rc={rc} note={str(hb.get('note'))[:100]}"
+        )
+    return warns
+
+
+def _gh_get(path: str, token: str) -> list | dict:
+    """One read-only GitHub REST GET. The single network seam in this module.
+
+    Kept module-level and parameterised so the tests stub exactly one thing;
+    raises on anything that is not a clean 200 so the caller reports
+    UNMEASURED rather than a short count.
+    """
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://api.github.com" + path,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "t1000-ops-alert-pulse",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:  # fixed github.com host
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status}")
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _read_env_value(path: Path, key: str) -> str | None:
+    """Parse one KEY=VALUE line from a simple .env file. Never logs the value."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        if k.strip() == key:
+            return v.strip().strip('"').strip("'")
+    return None
+
+
+def _ds4_completion_request(token: str) -> dict:
+    """The single network seam for the DS4 liveness check — kept module-level
+    and parameterised so tests stub exactly one thing (same pattern as
+    `_gh_get`). Raises on connection failure, timeout, or any non-2xx
+    (urllib raises HTTPError for those natively).
+    """
+    import urllib.request
+
+    req = urllib.request.Request(
+        DS4_LIVENESS_URL,
+        data=json.dumps(
+            {
+                "model": DS4_LIVENESS_MODEL,
+                "messages": [{"role": "user", "content": "reply with OK"}],
+                "max_tokens": 16,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Host": DS4_LIVENESS_HOST_HEADER,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=DS4_LIVENESS_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _ds4_liveness() -> list[str]:
+    """DS4 flash liveness, read from k2vps through the model-proxy tailnet
+    leg (t_c765b8f4). Success is silent; failure is a WARN with the failure
+    told honestly rather than folded into a generic message (rule 4: an
+    unreachable channel is told as CHANNEL, not confused with "down").
+    """
+    import urllib.error
+
+    token = _read_env_value(DS4_LIVENESS_TOKEN_ENV, DS4_LIVENESS_TOKEN_KEY)
+    if not token:
+        return [
+            f"WARN ds4 flash: token unreadable from {DS4_LIVENESS_TOKEN_ENV} "
+            f"(missing {DS4_LIVENESS_TOKEN_KEY}) — liveness check cannot run"
+        ]
+
+    try:
+        body = _ds4_completion_request(token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return [
+                "WARN ds4 flash: auth rejected (401) against the model-proxy — "
+                "the K2_LOCAL_API_KEY token is wrong or rotated"
+            ]
+        return [f"WARN ds4 flash: model-proxy returned HTTP {exc.code}"]
+    except Exception as exc:  # noqa: BLE001 — connection refused/timeout/DNS/etc.
+        return [
+            "WARN ds4 flash: CHANNEL unreachable via the k2vps model-proxy "
+            f"({type(exc).__name__}) — tailnet path down, proxy down, or the "
+            "DS4 container itself down; state is UNKNOWN, not bad"
+        ]
+
+    if "error" in body:
+        return [
+            f"WARN ds4 flash: completion returned an error: {str(body.get('error'))[:160]}"
+        ]
+    if not body.get("choices"):
+        return [
+            "WARN ds4 flash: completion returned no choices — real inference "
+            "path is not working"
+        ]
+    return []
+
+
+def _dsh_verdict_waste() -> list[str]:
+    """Page when N+ dsh-lane PRs have sat unverdicted for longer than the age.
+
+    The waste this measures is not a slow review — it is the loop producing
+    PRs nobody can stamp. Read with the lane's OWN App identity via
+    `k2_intake_sync._mint_bot_token()` (no second credential to rotate), and
+    revoked in `finally`.
+
+    Observability rule 4: a checker that cannot measure SAYS so. Every failure
+    path — missing sibling module, unmintable token, any failed GET — returns
+    one UNMEASURED warn and writes `measured: false`. Reporting 0 when the API
+    was unreachable would be the exact lie this instrument exists to prevent.
+    """
+    threshold = int(os.environ.get("T1000_DSH_WASTE_MIN") or 5)
+    age_h = float(os.environ.get("T1000_DSH_WASTE_AGE_H") or 72)
+    repo = os.environ.get("T1000_DSH_WASTE_REPO") or "joinsov/kevin-real-estate-tools"
+
+    def _write(measured: bool, open_lane_prs: int, stale: list[dict], error) -> None:
+        # Written on EVERY path (clean, warn, unmeasured) so the Pulse artifact
+        # can show the number even when the checker is silent.
+        payload = {
+            "ts": _iso(),
+            "measured": measured,
+            "open_lane_prs": open_lane_prs,
+            "unverdicted_over_age": stale,
+            "threshold": threshold,
+            "age_h": age_h,
+            "error": error,
+        }
+        try:
+            DSH_WASTE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            DSH_WASTE_CACHE.write_text(
+                json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def _unmeasured(why: str) -> list[str]:
+        _write(False, 0, [], why)
+        return [
+            f"WARN dsh waste threshold UNMEASURED ({why}) — count unknown, not zero"
+        ]
+
+    try:
+        import k2_intake_sync as KI  # sibling in <desk>/scripts/
+    except Exception as exc:  # noqa: BLE001 — the pulse must still run
+        return _unmeasured(f"k2_intake_sync unimportable: {type(exc).__name__}")
+
+    try:
+        wrapper, token = KI._mint_bot_token()
+    except Exception as exc:  # noqa: BLE001
+        return _unmeasured(f"token mint failed: {type(exc).__name__}")
+
+    now = datetime.now(timezone.utc)
+    try:
+        lane: list[dict] = []
+        page = 1
+        while True:
+            batch = _gh_get(
+                f"/repos/{repo}/pulls?state=open&per_page=100&page={page}", token
+            )
+            if not isinstance(batch, list):
+                raise RuntimeError("pulls payload not a list")
+            for pr in batch:
+                login = ((pr.get("user") or {}).get("login")) or ""
+                if login in DSH_LANE_LOGINS:
+                    lane.append(pr)
+            if len(batch) < 100:
+                break
+            page += 1
+
+        stale: list[dict] = []
+        for pr in lane:
+            try:
+                created = datetime.strptime(
+                    pr.get("created_at") or "", "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                raise RuntimeError(f"PR #{pr.get('number')} created_at unparseable")
+            pr_age_h = (now - created).total_seconds() / 3600
+            if pr_age_h <= age_h:
+                continue
+            author = ((pr.get("user") or {}).get("login")) or ""
+            number = pr.get("number")
+            verdicted = False
+            cpage = 1
+            while not verdicted:
+                comments = _gh_get(
+                    f"/repos/{repo}/issues/{number}/comments?per_page=100&page={cpage}",
+                    token,
+                )
+                if not isinstance(comments, list):
+                    raise RuntimeError(f"comments payload for #{number} not a list")
+                for c in comments:
+                    clogin = ((c.get("user") or {}).get("login")) or ""
+                    if clogin == author or clogin in DSH_VERDICT_IGNORE_LOGINS:
+                        continue
+                    if DSH_VERDICT_RE.search(c.get("body") or ""):
+                        verdicted = True
+                        break
+                if verdicted or len(comments) < 100:
+                    break
+                cpage += 1
+            if not verdicted:
+                stale.append(
+                    {
+                        "number": number,
+                        "age_h": round(pr_age_h, 1),
+                        "title": (pr.get("title") or "")[:120],
+                    }
+                )
+    except Exception as exc:  # noqa: BLE001
+        return _unmeasured(f"{type(exc).__name__}: {str(exc)[:120]}")
+    finally:
+        try:
+            wrapper._revoke_installation_token(token)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _write(True, len(lane), stale, None)
+    if len(stale) < threshold:
+        return []
+    named = "\n".join(
+        f"  #{s['number']} age={s['age_h']:.0f}h {s['title']}" for s in stale
+    )
+    return [
+        f"WARN dsh verdict waste: {len(stale)} lane PRs open >{age_h:.0f}h with no "
+        f"non-author verdict (threshold {threshold}) — the loop is producing "
+        f"PRs nobody is stamping:\n{named}"
+    ]
+
+
 def main() -> int:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     prev: dict = {}
@@ -334,6 +743,16 @@ def main() -> int:
     if pb_fp and pb_fp != old_pb_fp:
         lines.append(pb_blob)
 
+    # Night-dequeue heartbeat (atlas R3, 2026-08-31): fp dedup — one page
+    # per distinct state (unreachable / stale / failed), not one per pulse.
+    nh_warns = _night_dequeue_heartbeat()
+    nh_blob = "\n".join(nh_warns).strip()
+    nh_fp = hashlib.sha256(nh_blob.encode()).hexdigest()[:16] if nh_blob else None
+    new_state["fps"]["night_dequeue"] = nh_fp
+    old_nh_fp = (prev.get("fps") or {}).get("night_dequeue")
+    if nh_fp and nh_fp != old_nh_fp:
+        lines.append(nh_blob)
+
     # K2 intake bridge (t_f3dd22e3): same fp dedup; the script also
     # self-throttles internally so most pulses are a no-op.
     ki_warns = _k2_intake()
@@ -343,6 +762,16 @@ def main() -> int:
     old_ki_fp = (prev.get("fps") or {}).get("k2_intake")
     if ki_fp and ki_fp != old_ki_fp:
         lines.append(ki_blob)
+
+    # Distillery intake sweep heartbeat (t_a4d3ea5b): same fp dedup — a
+    # sustained stale/zero-source state pages once per distinct content.
+    di_warns = _distillery_intake()
+    di_blob = "\n".join(di_warns).strip()
+    di_fp = hashlib.sha256(di_blob.encode()).hexdigest()[:16] if di_blob else None
+    new_state["fps"]["distillery_intake"] = di_fp
+    old_di_fp = (prev.get("fps") or {}).get("distillery_intake")
+    if di_fp and di_fp != old_di_fp:
+        lines.append(di_blob)
 
     # Checkout-flipper guard (PB-003): a flip is urgent — same fp dedup so a
     # sustained flip notifies once per content, not every 30m.
@@ -366,6 +795,31 @@ def main() -> int:
     old_fl_fp = (prev.get("fps") or {}).get("fleet_liveness")
     if fl_fp and fl_fp != old_fl_fp:
         lines.append(fl_blob)
+
+    # dsh verdict-waste threshold (t_70595c66): same fp dedup — one page per
+    # distinct set of stalled PRs, not one per pulse. Silent when clean; the
+    # count is always readable in cache/k2-dsh-waste.json.
+    dw_warns = _dsh_verdict_waste()
+    dw_blob = "\n".join(dw_warns).strip()
+    dw_fp = hashlib.sha256(dw_blob.encode()).hexdigest()[:16] if dw_blob else None
+    new_state["fps"]["dsh_waste"] = dw_fp
+    old_dw_fp = (prev.get("fps") or {}).get("dsh_waste")
+    if dw_fp and dw_fp != old_dw_fp:
+        lines.append(dw_blob)
+
+    # DS4 flash liveness (t_c765b8f4, 2026-09-02): a second, independent read
+    # of the flash lane through the k2vps model-proxy leg — same fp dedup so
+    # a sustained outage pages once per distinct state, not every 30m. The
+    # timestamp is written every run regardless (register + heartbeat), even
+    # on the silent/clean path.
+    ds4_warns = _ds4_liveness()
+    ds4_blob = "\n".join(ds4_warns).strip()
+    ds4_fp = hashlib.sha256(ds4_blob.encode()).hexdigest()[:16] if ds4_blob else None
+    new_state["fps"]["ds4_liveness"] = ds4_fp
+    new_state["ds4_liveness_checked_at"] = _iso()
+    old_ds4_fp = (prev.get("fps") or {}).get("ds4_liveness")
+    if ds4_fp and ds4_fp != old_ds4_fp:
+        lines.append(ds4_blob)
 
     for kind, path in ALERTS:
         fp = _fp(path)
