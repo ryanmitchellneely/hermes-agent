@@ -759,6 +759,7 @@ def sync(force: bool = False) -> dict:
         "routed_new": 0, "routed_cleared": 0, "routed_denied": 0,
         "slots_refreed": 0, "held_blocked": 0, "parked_failing": 0, "parked_skipped": 0,
         "dedup_inflight": 0, "dedup_unverified": 0, "dedup_merged": 0,
+        "blocked_released": 0,
     }
     cards = state.setdefault("cards", {})
     routed = state.setdefault("routed", {})
@@ -858,13 +859,61 @@ def sync(force: bool = False) -> dict:
         # neither clear nor re-mint. A terminal card + live artifact is a
         # zombie slot: free it, count the attempt, and after
         # MAX_ROUTE_ATTEMPTS park the artifact VISIBLY rather than re-carding
-        # a failure forever. Blocked cards keep their slot (a human owes them
-        # an unblock) but are counted in the heartbeat, never silent.
+        # a failure forever. A blocked card only keeps its slot while a PR is
+        # actually open awaiting a human (a fix-round mid-review); measured
+        # 2026-09-03 (t_5c1dbcd7): all ten MAX_ROUTED_IN_FLIGHT slots were
+        # held by blocked cards that had ended in an honest wrapper gate
+        # refusal and never opened a PR at all — the router stalled with
+        # nothing to show for it. A blocked card with no PR, or a PR closed
+        # unmerged, is a finished attempt exactly like a failed done/archived
+        # card, so it is released the same way.
         for rkey in [k for k in routed if k.startswith(f"{spec['key']}::")]:
             zcard = routed[rkey]["card"]
             status = _card_status(zcard)
             if status == "blocked":
-                counts["held_blocked"] += 1
+                pr = _card_pr_number(zcard)
+                if pr is not None:
+                    st = _pr_state(pr)
+                    if st == "open":
+                        counts["held_blocked"] += 1
+                        continue
+                    if st is None:
+                        counts["dedup_unverified"] += 1
+                        print(
+                            f"WARN k2-intake holding slot for {rkey}: card "
+                            f"{zcard} blocked but PR #{pr} state was "
+                            f"unreadable"
+                        )
+                        continue
+                    if st == "merged":
+                        del routed[rkey]
+                        counts["dedup_merged"] += 1
+                        counts["slots_refreed"] += 1
+                        print(
+                            f"K2 INTAKE freed slot (card {zcard} blocked, PR "
+                            f"#{pr} merged) but {rkey} still reads live — it "
+                            f"may re-mint"
+                        )
+                        continue
+                    # st == "closed" (unmerged): falls through — a finished
+                    # attempt, same as no PR at all.
+                tries = attempts.get(rkey, 0) + 1
+                attempts[rkey] = tries
+                del routed[rkey]
+                counts["slots_refreed"] += 1
+                counts["blocked_released"] += 1
+                if tries >= MAX_ROUTE_ATTEMPTS:
+                    parked[rkey] = {
+                        "card": zcard, "tries": tries,
+                        "why": f"card blocked x{tries} without an open PR",
+                    }
+                    counts["parked_failing"] += 1
+                    print(f"WARN k2-intake PARKED after {tries} attempts: {rkey}")
+                else:
+                    print(
+                        f"K2 INTAKE refreed zombie slot (card {zcard} "
+                        f"blocked, no open PR): {rkey}"
+                    )
                 continue
             if status in ("done", "archived"):
                 # A done card whose PR is still OPEN is IN FLIGHT, not failed.

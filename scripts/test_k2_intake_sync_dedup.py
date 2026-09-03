@@ -166,6 +166,76 @@ class TestZombieSlotDedup(DedupBase):
             self.assertIn(key, hb)
 
 
+class TestBlockedSlotRelease(DedupBase):
+    """Harness card t_5c1dbcd7, 2026-09-03: all ten MAX_ROUTED_IN_FLIGHT slots
+    were held by blocked cards that had ended in an honest wrapper gate
+    refusal and never opened a PR — the old blocked branch held the slot
+    forever with no PR check. A blocked card is only really awaiting a human
+    while a PR is open on it; otherwise it is a finished attempt, freed the
+    same way a failed done/archived card is."""
+
+    def arrange_blocked(self, pr_number, pr_state=None):
+        mod = self.arrange(pr_state)
+        mod._card_status = lambda card_id: "blocked"
+        mod._card_pr_number = lambda card_id: pr_number
+        return mod
+
+    def test_no_pr_frees_the_slot_and_counts_an_attempt(self):
+        mod = self.arrange_blocked(None)
+        counts = mod.sync(force=True)
+        self.assertEqual(len(self.mint.calls), 1)
+        st = self.state()
+        self.assertEqual(st["route_attempts"][RKEY], 1)
+        self.assertEqual(counts["blocked_released"], 1)
+        self.assertEqual(counts["held_blocked"], 0)
+        self.assertEqual(counts["slots_refreed"], 1)
+
+    def test_open_pr_holds_the_slot(self):
+        mod = self.arrange_blocked(5857, "open")
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["held_blocked"], 1)
+        self.assertEqual(counts["blocked_released"], 0)
+        st = self.state()
+        self.assertIn(RKEY, st["routed"])
+        self.assertEqual(st["route_attempts"], {})
+
+    def test_closed_pr_frees_the_slot_and_counts_an_attempt(self):
+        mod = self.arrange_blocked(5857, "closed")
+        counts = mod.sync(force=True)
+        self.assertEqual(len(self.mint.calls), 1)
+        st = self.state()
+        self.assertEqual(st["route_attempts"][RKEY], 1)
+        self.assertEqual(counts["blocked_released"], 1)
+        self.assertEqual(counts["held_blocked"], 0)
+
+    def test_unreadable_pr_holds_the_slot(self):
+        mod = self.arrange_blocked(5857, None)
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["dedup_unverified"], 1)
+        self.assertEqual(counts["blocked_released"], 0)
+        st = self.state()
+        self.assertIn(RKEY, st["routed"])
+        self.assertEqual(st["route_attempts"], {})
+
+    def test_second_blocked_no_pr_outcome_parks_the_artifact(self):
+        """The card already failed once with no PR; a second blocked-no-PR
+        outcome hits MAX_ROUTE_ATTEMPTS and parks instead of re-minting."""
+        mod = self.arrange_blocked(None)
+        st = self.state()
+        st["route_attempts"][RKEY] = 1
+        mod.STATE_PATH.write_text(json.dumps(st), encoding="utf-8")
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        st = self.state()
+        self.assertEqual(st["route_attempts"][RKEY], 2)
+        self.assertIn(RKEY, st["parked_artifacts"])
+        self.assertEqual(counts["parked_failing"], 1)
+        self.assertEqual(counts["blocked_released"], 1)
+        self.assertEqual(counts["parked_skipped"], 1)
+
+
 class TestCardPrNumber(DedupBase):
     def _db(self, rows_tasks, rows_comments=()):
         mod = self.mod
