@@ -182,7 +182,13 @@ class TestBlockedSlotRelease(DedupBase):
     refusal and never opened a PR — the old blocked branch held the slot
     forever with no PR check. A blocked card is only really awaiting a human
     while a PR is open on it; otherwise it is a finished attempt, freed the
-    same way a failed done/archived card is."""
+    same way a failed done/archived card is.
+
+    That free is about IN-FLIGHT BUDGET only (t_1817dcad): it lets OTHER
+    artifacts route, but it must not make THIS page look brand new. The card
+    that just froze is still `blocked` — not done/archived — so the page
+    itself stays gated (`skipped_open_page`) until that card resolves or is
+    archived; see TestPageLevelDedup for the gate in isolation."""
 
     def arrange_blocked(self, pr_number, pr_state=None):
         mod = self.arrange(pr_state)
@@ -190,15 +196,16 @@ class TestBlockedSlotRelease(DedupBase):
         mod._card_pr_number = lambda card_id: pr_number
         return mod
 
-    def test_no_pr_frees_the_slot_and_counts_an_attempt(self):
+    def test_no_pr_frees_the_slot_but_the_page_stays_gated(self):
         mod = self.arrange_blocked(None)
         counts = mod.sync(force=True)
-        self.assertEqual(len(self.mint.calls), 1)
+        self.assertEqual(self.mint.calls, [])
         st = self.state()
         self.assertEqual(st["route_attempts"][RKEY], 1)
         self.assertEqual(counts["blocked_released"], 1)
         self.assertEqual(counts["held_blocked"], 0)
         self.assertEqual(counts["slots_refreed"], 1)
+        self.assertEqual(counts["skipped_open_page"], 1)
 
     def test_open_pr_holds_the_slot(self):
         mod = self.arrange_blocked(5857, "open")
@@ -210,14 +217,15 @@ class TestBlockedSlotRelease(DedupBase):
         self.assertIn(RKEY, st["routed"])
         self.assertEqual(st["route_attempts"], {})
 
-    def test_closed_pr_frees_the_slot_and_counts_an_attempt(self):
+    def test_closed_pr_frees_the_slot_but_the_page_stays_gated(self):
         mod = self.arrange_blocked(5857, "closed")
         counts = mod.sync(force=True)
-        self.assertEqual(len(self.mint.calls), 1)
+        self.assertEqual(self.mint.calls, [])
         st = self.state()
         self.assertEqual(st["route_attempts"][RKEY], 1)
         self.assertEqual(counts["blocked_released"], 1)
         self.assertEqual(counts["held_blocked"], 0)
+        self.assertEqual(counts["skipped_open_page"], 1)
 
     def test_unreadable_pr_holds_the_slot(self):
         mod = self.arrange_blocked(5857, None)
@@ -244,6 +252,107 @@ class TestBlockedSlotRelease(DedupBase):
         self.assertEqual(counts["parked_failing"], 1)
         self.assertEqual(counts["blocked_released"], 1)
         self.assertEqual(counts["parked_skipped"], 1)
+
+
+class TestPageLevelDedup(DedupBase):
+    """Harness card t_1817dcad, measured 2026-09-04/05: k2-intake-sync minted
+    two "KB verify" cards three hours apart for the SAME page — t_d876036f
+    (11:43) and t_80567e48 (14:47), both targeting
+    docs/knowledge-base/llm-context-windows-and-prompt-caps.md, both opening
+    PRs (#6156, #6170) that stamped the same file with different
+    verification tables. The zombie-release scan (TestBlockedSlotRelease)
+    freed `routed[rkey]` — an IN-FLIGHT BUDGET decision — the instant the
+    first card read blocked-with-no-PR, and the very next mint pass then
+    treated the page as brand new. `_page_has_open_card` closes that gap by
+    checking the LAST card minted for the page directly, off `last_card`,
+    which — unlike `routed[rkey]` — is never cleared by a capacity free.
+
+    These tests seed `last_routed_card` directly with `routed={}`, so the
+    gate is exercised in isolation, with no zombie-release scan in the loop
+    at all (that mechanic is TestBlockedSlotRelease/TestZombieSlotDedup)."""
+
+    def seed_last_card(self, mod, card=CARD):
+        st = self.state()
+        st["last_routed_card"] = {RKEY: card}
+        mod.STATE_PATH.write_text(json.dumps(st), encoding="utf-8")
+
+    def test_any_non_terminal_status_blocks_a_new_mint(self):
+        """(1) same page, prior card open (any non-terminal status:
+        ready/running/blocked/todo) -> not minted, counter +1."""
+        for status in ("ready", "running", "blocked", "todo"):
+            with self.subTest(status=status):
+                mod = self.arrange(None, routed={})
+                self.seed_last_card(mod)
+                mod._card_status = lambda card_id, s=status: s
+                counts = mod.sync(force=True)
+                self.assertEqual(self.mint.calls, [])
+                self.assertEqual(counts["skipped_open_page"], 1)
+
+    def test_done_with_merged_or_closed_pr_mints(self):
+        """(2) prior card done and its PR merged/closed -> minted."""
+        for pr_state in ("merged", "closed"):
+            with self.subTest(pr_state=pr_state):
+                mod = self.arrange(pr_state, routed={})
+                self.seed_last_card(mod)
+                mod._card_status = lambda card_id: "done"
+                mod._card_pr_number = lambda card_id: 5857
+                counts = mod.sync(force=True)
+                self.assertEqual(len(self.mint.calls), 1)
+                self.assertEqual(counts["skipped_open_page"], 0)
+                self.assertEqual(counts["skipped_unreadable"], 0)
+
+    def test_done_with_open_pr_does_not_mint(self):
+        """(3) prior card done but its PR is still open -> not minted."""
+        mod = self.arrange("open", routed={})
+        self.seed_last_card(mod)
+        mod._card_status = lambda card_id: "done"
+        mod._card_pr_number = lambda card_id: 5857
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["skipped_open_page"], 1)
+
+    def test_archived_with_no_pr_mints(self):
+        """(4) prior card archived, no PR -> minted."""
+        mod = self.arrange(None, routed={})
+        self.seed_last_card(mod)
+        mod._card_status = lambda card_id: "archived"
+        mod._card_pr_number = lambda card_id: None
+        counts = mod.sync(force=True)
+        self.assertEqual(len(self.mint.calls), 1)
+        self.assertEqual(counts["skipped_open_page"], 0)
+        self.assertEqual(counts["skipped_unreadable"], 0)
+
+    def test_unreadable_status_does_not_mint(self):
+        """(5a) the prior card's status cannot be read -> not minted,
+        counted (fails closed, same direction as `_card_status` itself)."""
+        mod = self.arrange(None, routed={})
+        self.seed_last_card(mod)
+        mod._card_status = lambda card_id: None
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["skipped_unreadable"], 1)
+        self.assertEqual(counts["skipped_open_page"], 0)
+
+    def test_unreadable_pr_state_does_not_mint(self):
+        """(5b) the prior card is done/archived but its PR state cannot be
+        read -> not minted, counted (fails closed, same direction as
+        `_pr_state` itself)."""
+        mod = self.arrange(None, routed={})  # arrange(None) => _pr_state -> None
+        self.seed_last_card(mod)
+        mod._card_status = lambda card_id: "done"
+        mod._card_pr_number = lambda card_id: 5857
+        counts = mod.sync(force=True)
+        self.assertEqual(self.mint.calls, [])
+        self.assertEqual(counts["skipped_unreadable"], 1)
+
+    def test_no_prior_card_at_all_mints(self):
+        """A page with no last-known card at all is unaffected by the gate
+        (the ordinary new-artifact path)."""
+        mod = self.arrange(None, routed={})
+        counts = mod.sync(force=True)
+        self.assertEqual(len(self.mint.calls), 1)
+        self.assertEqual(counts["skipped_open_page"], 0)
+        self.assertEqual(counts["skipped_unreadable"], 0)
 
 
 class TestOutageHold(DedupBase):
@@ -290,17 +399,20 @@ class TestOutageHold(DedupBase):
         self.assertEqual(st["route_attempts"], {})
 
     def test_ordinary_gate_refusal_counts_an_attempt(self):
-        """(b) blocked + ordinary gate refusal -> existing behaviour."""
+        """(b) blocked + ordinary gate refusal -> slot frees for capacity,
+        route_attempts still counts it, but the page itself stays gated
+        (t_1817dcad) since the card is still `blocked`, not done/archived."""
         mod = self.arrange_blocked_outage(
             "dsh headless refused: gate wiring-check failed"
         )
         counts = mod.sync(force=True)
         self.assertEqual(counts["outage_released"], 0)
-        self.assertEqual(len(self.mint.calls), 1)
+        self.assertEqual(self.mint.calls, [])
         st = self.state()
         self.assertEqual(st["route_attempts"][RKEY], 1)
         self.assertEqual(counts["blocked_released"], 1)
         self.assertEqual(counts["outage_hold"], 0)
+        self.assertEqual(counts["skipped_open_page"], 1)
 
     def test_outage_seen_holds_new_minting_this_pulse(self):
         """(c) outage seen this pulse -> no new card minted."""

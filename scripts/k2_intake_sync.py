@@ -816,6 +816,47 @@ def _create_routed_card(spec: dict, artifact: str, sources: list[str] | None = N
     return m.group(1)
 
 
+def _page_has_open_card(rkey: str, last_card: dict) -> str | None:
+    """None when `rkey` is clear to mint; otherwise why the mint is refused.
+
+    Measured 2026-09-04/05 (t_1817dcad): the zombie-release scan in `sync()`
+    frees `routed[rkey]` the moment a card reads blocked-with-no-PR, or
+    done/archived-with-no-open-PR — a decision about IN-FLIGHT BUDGET
+    (freeing capacity for OTHER artifacts), not a claim that the PAGE is
+    finished. Freeing that slot let the very next mint pass treat the page
+    as brand new: cards t_d876036f (11:43) and t_80567e48 (14:47) both
+    targeted docs/knowledge-base/llm-context-windows-and-prompt-caps.md and
+    both opened PRs (#6156, #6170) stamping the same file with different
+    verification tables. `last_card` mirrors `routed[rkey]["card"]` but is
+    NEVER cleared by a free — only ever overwritten by the next mint for
+    that rkey — so this check can re-read the PRIOR card's live status/PR
+    directly instead of trusting a slot flag that capacity-freeing already
+    invalidated. One page keeps at most one open card regardless of how many
+    times its slot has been freed for capacity: the prior card must reach
+    done/archived with its PR merged/closed (or never opened one), or be
+    archived outright, before the page is eligible again. Fails closed like
+    `_card_status`/`_pr_state` themselves: an unreadable board or PR read
+    refuses the mint too, rather than guessing the page is clear.
+    """
+    prev = last_card.get(rkey)
+    if not prev:
+        return None
+    status = _card_status(prev)
+    if status is None:
+        return "unreadable"
+    if status not in ("done", "archived"):
+        return "open"
+    pr = _card_pr_number(prev)
+    if pr is None:
+        return None
+    st = _pr_state(pr)
+    if st is None:
+        return "unreadable"
+    if st == "open":
+        return "open"
+    return None
+
+
 def sync(force: bool = False) -> dict:
     state = _load_state()
     now = time.time()
@@ -842,6 +883,7 @@ def sync(force: bool = False) -> dict:
         "dedup_inflight": 0, "dedup_unverified": 0, "dedup_merged": 0,
         "blocked_released": 0,
         "outage_hold": 0, "outage_released": 0, "outage_deferred": 0,
+        "skipped_open_page": 0, "skipped_unreadable": 0,
     }
     cards = state.setdefault("cards", {})
     routed = state.setdefault("routed", {})
@@ -849,6 +891,14 @@ def sync(force: bool = False) -> dict:
     routed_this_run = 0
     attempts = state.setdefault("route_attempts", {})
     parked = state.setdefault("parked_artifacts", {})
+    # rkey -> card_id for the LAST card minted per page, kept even after
+    # `routed[rkey]` is freed (see `_page_has_open_card`, t_1817dcad).
+    # Backfilled from `routed` every run so a state file from before this
+    # field existed — or a slot this same pulse is about to free — still
+    # has a pointer to check.
+    last_card = state.setdefault("last_routed_card", {})
+    for _rk, _info in routed.items():
+        last_card[_rk] = _info.get("card")
     # Probed at most once per pulse, and only if a split checker actually has
     # a live artifact that could mint — a checker with nothing to mint has no
     # reason to pay for a network round trip, and most pulses (and every
@@ -1098,6 +1148,13 @@ def sync(force: bool = False) -> dict:
                 if rkey in parked:
                     counts["parked_skipped"] += 1
                     continue
+                skip_reason = _page_has_open_card(rkey, last_card)
+                if skip_reason == "open":
+                    counts["skipped_open_page"] += 1
+                    continue
+                if skip_reason == "unreadable":
+                    counts["skipped_unreadable"] += 1
+                    continue
                 if is_denied(artifact):
                     counts["routed_denied"] += 1
                     continue
@@ -1120,6 +1177,7 @@ def sync(force: bool = False) -> dict:
                     print(f"WARN k2-intake could not mint routed card for {artifact}")
                     continue
                 routed[rkey] = {"card": card_id, "artifact": artifact}
+                last_card[rkey] = card_id
                 routed_this_run += 1
                 in_flight += 1
                 counts["routed_new"] += 1
