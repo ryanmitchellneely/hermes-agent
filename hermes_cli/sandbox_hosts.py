@@ -22,6 +22,27 @@ special-case it by name; the file's own bits are the only gate.
 k2vps (the local host) is never an entry in this file -- it is the
 dispatcher's existing local-execution fallback when no pool host has
 capacity, exactly as today; see :func:`select_pool_host`'s ``None`` return.
+
+Round 3 (2026-09-05, captain's decision from the executed K2-transport-side
+critic that fed one sample ``sandbox_hosts.yaml`` to both this loader and
+the K2 wrapper's own): the two repos must agree on the file, and the K2
+wrapper's loader never read a per-row capacity figure -- so requiring one
+here silently DROPPED an otherwise-valid host on this side only (a bare
+``int(raw.get("max_in_progress"))`` raised on the missing key and the
+``except`` swallowed it as "drop this entry"). A ``sandbox_hosts.yaml`` row
+is host identity and transport ONLY, nothing more: ``name, address,
+account, identity_file, host_key, enabled, arch``. ``host_key`` and
+``identity_file`` are opaque strings on this side -- stored unchanged,
+never parsed, never validated, never logged (see
+``gateway.kanban_watchers._pool_hosts_log_payload``). The per-host cap now
+lives EXCLUSIVELY in config.yaml's
+``kanban.max_in_progress_per_profile.<profile>.per_host`` mapping, resolved
+via ``kanban_db._resolve_profile_host_cap`` (round 2's unified, fail-closed
+resolution rule -- reused verbatim here, not reimplemented):
+:func:`select_pool_host`'s ``host_cap`` argument is that resolved figure,
+and a host absent from it (or resolving to ``None`` -- "no per_host entry
+and no default" for that profile) is REFUSED outright, never treated as
+uncapped, since there is no row-level figure left to fall back on.
 """
 from __future__ import annotations
 
@@ -47,19 +68,26 @@ _POOL_ARCH = "amd64"
 
 @dataclass(frozen=True)
 class SandboxHost:
-    """One reviewed pool-host entry.
+    """One reviewed pool-host entry -- host identity and transport ONLY
+    (round 3, 2026-09-05: the per-host capacity figure moved to config.yaml
+    and is no longer part of this row at all -- see module docstring).
 
     Every ``SandboxHost`` :func:`load_sandbox_hosts` hands back has already
     been filtered to ``enabled: true`` and ``arch: amd64`` -- by
     construction, every instance of this class is eligible.
+
+    ``identity_file`` and ``host_key`` are opaque strings: passed through
+    unchanged from the reviewed file, never validated (no path existence
+    check, no key-format check) and never logged -- see
+    ``gateway.kanban_watchers._pool_hosts_log_payload``.
     """
 
     name: str
     address: str
     account: str
     identity_file: str
+    host_key: str
     arch: str
-    max_in_progress: int
 
 
 def sandbox_hosts_path(hermes_home) -> Path:
@@ -81,9 +109,9 @@ def load_sandbox_hosts(path) -> List[SandboxHost]:
     - two entries sharing the same ``name`` -> ``[]`` for the WHOLE file
       (a reviewed list must be unambiguous; silently keeping "the first
       one" would hide a reviewer's mistake instead of surfacing it);
-    - one entry missing a usable ``name`` or a usable positive-int
-      ``max_in_progress`` -> that ONE entry is dropped, not the file (a
-      typo on one host must not take the rest of the pool down).
+    - one entry missing a usable ``name`` -> that ONE entry is dropped,
+      not the file (a typo on one host must not take the rest of the pool
+      down).
 
     Only entries with ``enabled: true`` (the literal YAML boolean -- a
     string or any other truthy value does NOT count, fail closed) AND
@@ -91,6 +119,15 @@ def load_sandbox_hosts(path) -> List[SandboxHost]:
     host present in the file but disabled, or present with any other
     ``arch``, is still parsed (so a repeated name still trips the
     duplicate-name refusal) but never returned.
+
+    Round 3 (2026-09-05): a row carries host identity and transport ONLY --
+    ``name, address, account, identity_file, host_key, enabled, arch``.
+    There is no per-row capacity figure any more (see module docstring);
+    the K2 wrapper's own loader never read one, so requiring one here let a
+    host that is valid on that side silently vanish on this side -- a row
+    without ``max_in_progress`` (or with any other key this loader doesn't
+    recognize) now loads exactly like any other row. This loader never
+    validates or logs ``identity_file``/``host_key``; it only stores them.
 
     No network call, no DNS lookup, no subprocess, no tailscale probe --
     this function only ever reads the one local file at ``path``.
@@ -128,14 +165,6 @@ def load_sandbox_hosts(path) -> List[SandboxHost]:
             return []
         seen_names.add(name)
 
-        try:
-            cap = int(raw.get("max_in_progress"))
-            if cap <= 0:
-                raise ValueError("max_in_progress must be positive")
-        except (TypeError, ValueError):
-            # Unusable capacity figure -- drop this one entry, not the file.
-            continue
-
         enabled = raw.get("enabled") is True  # strict: only the literal `true`
         arch = raw.get("arch") if isinstance(raw.get("arch"), str) else ""
         if not (enabled and arch == _POOL_ARCH):
@@ -146,14 +175,15 @@ def load_sandbox_hosts(path) -> List[SandboxHost]:
         identity_file = (
             raw.get("identity_file") if isinstance(raw.get("identity_file"), str) else ""
         )
+        host_key = raw.get("host_key") if isinstance(raw.get("host_key"), str) else ""
         parsed.append(
             SandboxHost(
                 name=name,
                 address=address,
                 account=account,
                 identity_file=identity_file,
+                host_key=host_key,
                 arch=arch,
-                max_in_progress=cap,
             )
         )
     return parsed
@@ -181,14 +211,20 @@ def select_pool_host(
     function never queries a database or a daemon to produce it -- no
     counting, no discovery, happens in here.
 
-    ``host_cap`` -- optional ``{host_name: cap_or_None}``, e.g. built from
-    ``kanban_db._resolve_profile_host_cap`` per host, narrowing a host's
-    own ``max_in_progress`` for this specific profile. Composed as a
-    MINIMUM with the host's own figure, per the phase2 order's cap-
-    composition rule ("a host key narrows the global cap for that host, it
-    never replaces the global cap or raises the effective ceiling above
-    it"). A host absent from ``host_cap`` (or ``host_cap`` itself omitted)
-    is unconstrained by this and uses only its own ``max_in_progress``.
+    ``host_cap`` -- ``{host_name: cap_or_None}``, the ONLY source of
+    capacity as of round 3 (2026-09-05): the reviewed row itself no longer
+    carries a ``max_in_progress`` of its own (see module docstring), so
+    there is nothing left here for this to narrow -- it simply IS the
+    effective cap. Expected to be built by calling
+    ``kanban_db._resolve_profile_host_cap(cap, profile, host.name)`` per
+    host for the profile being dispatched (round 2's unified resolution
+    rule, reused as-is, not reimplemented here). A host absent from
+    ``host_cap``, or present with a value of ``None`` -- "no per_host entry
+    and no default" for that profile, in
+    ``_resolve_profile_host_cap``'s own words -- is REFUSED outright, never
+    treated as uncapped: fail closed, since there is no per-row figure left
+    to fall back on. Omitting ``host_cap`` entirely refuses every host,
+    exactly like passing ``{}``.
 
     A host not present in ``hosts`` is never selected -- by construction,
     since this function only ever iterates ``hosts`` itself.
@@ -196,10 +232,11 @@ def select_pool_host(
     running_counts = running_counts or {}
     host_cap = host_cap or {}
     for host in hosts:
-        effective = host.max_in_progress
-        narrow = host_cap.get(host.name)
-        if narrow is not None and narrow < effective:
-            effective = narrow
+        effective = host_cap.get(host.name)
+        if effective is None:
+            # No per_host entry and no default for this profile -- fail
+            # closed, never fall back to "unconstrained".
+            continue
         if running_counts.get(host.name, 0) >= effective:
             continue
         return host.name

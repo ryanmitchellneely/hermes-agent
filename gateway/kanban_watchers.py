@@ -99,6 +99,18 @@ def _resolve_pool_hosts(kanban_home) -> list:
         return []
 
 
+def _pool_hosts_log_payload(hosts) -> "list[str]":
+    """The exact value logged for ``pool hosts enabled=...`` at dispatcher
+    startup -- names only (round 3, 2026-09-05). ``SandboxHost.
+    identity_file`` and ``.host_key`` are opaque, secret-adjacent strings
+    (an SSH key path and a host's public key material) that must never
+    reach a log line; this is the one seam both the real startup log call
+    and this module's own tests go through, so a future edit to that log
+    line can't reintroduce them by accident.
+    """
+    return [h.name for h in hosts]
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1402,15 +1414,17 @@ class GatewayKanbanWatchersMixin:
         # side"): read once at dispatcher start, same point as every other
         # config knob above, and logged so an operator can see what the
         # running dispatcher believes without guessing from config.yaml.
-        # Names only — never identity_file/address/account; those are the
-        # transport leg's business (R1-R4), not this log line's.
+        # Names only — never identity_file/host_key/address/account; those
+        # are the transport leg's business (R1-R4), not this log line's,
+        # and are opaque/secret-adjacent on the row (round 3, 2026-09-05 —
+        # see hermes_cli.sandbox_hosts module docstring).
         _host_caps_preview = _per_host_caps_preview(max_in_progress_per_profile)
         if _host_caps_preview:
             logger.info("kanban dispatcher: per-host caps=%s", _host_caps_preview)
         _pool_hosts = _resolve_pool_hosts(_kb.kanban_home())
         logger.info(
             "kanban dispatcher: pool hosts enabled=%s",
-            [h.name for h in _pool_hosts],
+            _pool_hosts_log_payload(_pool_hosts),
         )
 
         # Initial delay so the gateway finishes wiring adapters before the
