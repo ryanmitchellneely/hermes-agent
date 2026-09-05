@@ -1,0 +1,214 @@
+{
+  "as_of": "2026-09-05T13:57:28+00:00",
+  "label": "pr28243-mtp4",
+  "base": "http://127.0.0.1:11439/v1",
+  "model": "qwen3.8-flash-next",
+  "summary": {
+    "edit_shaped": {
+      "decode_tok_s": {
+        "n": 3,
+        "mean": 65.9,
+        "p50": 65.81,
+        "min": 65.68,
+        "max": 66.2
+      },
+      "wall_tok_s": {
+        "n": 3,
+        "mean": 61.06,
+        "p50": 60.98,
+        "min": 60.7,
+        "max": 61.51
+      },
+      "completion_tokens": {
+        "n": 3,
+        "mean": 235.0,
+        "p50": 235.0,
+        "min": 235.0,
+        "max": 235.0
+      },
+      "valid": 3,
+      "n": 3
+    },
+    "prose_control": {
+      "decode_tok_s": {
+        "n": 3,
+        "mean": 29.55,
+        "p50": 29.6,
+        "min": 29.34,
+        "max": 29.72
+      },
+      "wall_tok_s": {
+        "n": 3,
+        "mean": 28.35,
+        "p50": 28.4,
+        "min": 28.2,
+        "max": 28.45
+      },
+      "completion_tokens": {
+        "n": 3,
+        "mean": 218.0,
+        "p50": 218.0,
+        "min": 218.0,
+        "max": 218.0
+      },
+      "valid": 3,
+      "n": 3
+    },
+    "copyability_speedup": 2.22,
+    "reading": "ratio ~1.0 = build does NOT exploit output copyability (no context-copy speculation); ratio >>1.0 = it does, and the headline number is a copy artifact rather than a decode rate."
+  },
+  "rows": [
+    {
+      "ttft_ms": 796.0,
+      "total_s": 4.389,
+      "prompt_tokens": 310,
+      "completion_tokens": 235,
+      "decode_tok_s": 65.41,
+      "wall_tok_s": 53.55,
+      "finish_reason": "stop",
+      "case": "edit_shaped",
+      "phase": "cold",
+      "valid": {
+        "has_change": true,
+        "removed_old_value": true,
+        "has_class": true,
+        "has_all_methods": true,
+        "no_ellipsis": true
+      },
+      "content_chars": 903,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 293.6,
+      "total_s": 3.872,
+      "prompt_tokens": 310,
+      "completion_tokens": 235,
+      "decode_tok_s": 65.68,
+      "wall_tok_s": 60.7,
+      "finish_reason": "stop",
+      "case": "edit_shaped",
+      "phase": "warm1",
+      "valid": {
+        "has_change": true,
+        "removed_old_value": true,
+        "has_class": true,
+        "has_all_methods": true,
+        "no_ellipsis": true
+      },
+      "content_chars": 903,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 303.7,
+      "total_s": 3.854,
+      "prompt_tokens": 310,
+      "completion_tokens": 235,
+      "decode_tok_s": 66.2,
+      "wall_tok_s": 60.98,
+      "finish_reason": "stop",
+      "case": "edit_shaped",
+      "phase": "warm2",
+      "valid": {
+        "has_change": true,
+        "removed_old_value": true,
+        "has_class": true,
+        "has_all_methods": true,
+        "no_ellipsis": true
+      },
+      "content_chars": 903,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 249.8,
+      "total_s": 3.821,
+      "prompt_tokens": 310,
+      "completion_tokens": 235,
+      "decode_tok_s": 65.81,
+      "wall_tok_s": 61.51,
+      "finish_reason": "stop",
+      "case": "edit_shaped",
+      "phase": "warm3",
+      "valid": {
+        "has_change": true,
+        "removed_old_value": true,
+        "has_class": true,
+        "has_all_methods": true,
+        "no_ellipsis": true
+      },
+      "content_chars": 903,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 980.8,
+      "total_s": 9.822,
+      "prompt_tokens": 327,
+      "completion_tokens": 218,
+      "decode_tok_s": 24.66,
+      "wall_tok_s": 22.2,
+      "finish_reason": "stop",
+      "case": "prose_control",
+      "phase": "cold",
+      "valid": {
+        "no_code_fence": true,
+        "no_class_name": true,
+        "no_identifiers": true
+      },
+      "content_chars": 1426,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 300.5,
+      "total_s": 7.73,
+      "prompt_tokens": 327,
+      "completion_tokens": 218,
+      "decode_tok_s": 29.34,
+      "wall_tok_s": 28.2,
+      "finish_reason": "stop",
+      "case": "prose_control",
+      "phase": "warm1",
+      "valid": {
+        "no_code_fence": true,
+        "no_class_name": true,
+        "no_identifiers": true
+      },
+      "content_chars": 1426,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 311.9,
+      "total_s": 7.676,
+      "prompt_tokens": 327,
+      "completion_tokens": 218,
+      "decode_tok_s": 29.6,
+      "wall_tok_s": 28.4,
+      "finish_reason": "stop",
+      "case": "prose_control",
+      "phase": "warm2",
+      "valid": {
+        "no_code_fence": true,
+        "no_class_name": true,
+        "no_identifiers": true
+      },
+      "content_chars": 1426,
+      "valid_all": true
+    },
+    {
+      "ttft_ms": 326.8,
+      "total_s": 7.663,
+      "prompt_tokens": 327,
+      "completion_tokens": 218,
+      "decode_tok_s": 29.72,
+      "wall_tok_s": 28.45,
+      "finish_reason": "stop",
+      "case": "prose_control",
+      "phase": "warm3",
+      "valid": {
+        "no_code_fence": true,
+        "no_class_name": true,
+        "no_identifiers": true
+      },
+      "content_chars": 1426,
+      "valid_all": true
+    }
+  ]
+}

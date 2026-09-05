@@ -1,0 +1,40 @@
+0.00.291.775 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.292.027 W srv  llama_server: -----------------
+0.00.292.028 W srv  llama_server: CORS is set to allow all origins ('*') and no API key is set
+0.00.292.028 W srv  llama_server: this can be a security risk (cross-origin attacks)
+0.00.292.028 W srv  llama_server: more info: https://github.com/ggml-org/llama.cpp/pull/25655
+0.00.292.028 W srv  llama_server: -----------------
+0.00.293.292 I srv    load_model: loading model '/home/ryanneely1000/models/flash-next-udq3/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf'
+0.12.474.563 I cmn          init: llama threadpool init, n_threads = 20
+0.12.689.851 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 16384, kv_unified = 'true'
+0.12.693.315 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.12.693.342 I srv  llama_server: model loaded
+0.12.693.346 I srv  llama_server: listening on http://0.0.0.0:8898
+0.43.796.908 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+0.43.796.971 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+0.48.569.560 I slot print_timing: id  3 | task 0 | n_gen =    100, tg =  25.55 t/s, tg_3s =  25.81 t/s
+0.51.575.987 I slot print_timing: id  3 | task 0 | n_gen =    177, tg =  25.58 t/s, tg_3s =  25.61 t/s
+0.54.595.016 I slot print_timing: id  3 | task 0 | n_gen =    250, tg =  25.15 t/s, tg_3s =  24.18 t/s
+0.57.615.518 I slot print_timing: id  3 | task 0 | n_gen =    324, tg =  25.00 t/s, tg_3s =  24.50 t/s
+1.00.629.331 I slot print_timing: id  3 | task 0 | n_gen =    402, tg =  25.17 t/s, tg_3s =  25.88 t/s
+1.03.667.862 I slot print_timing: id  3 | task 0 | n_gen =    480, tg =  25.25 t/s, tg_3s =  25.67 t/s
+1.06.684.550 I slot print_timing: id  3 | task 0 | n_gen =    554, tg =  25.15 t/s, tg_3s =  24.53 t/s
+1.08.472.755 I slot print_timing: id  3 | task 0 | prompt eval time =     898.25 ms /    78 tokens (   11.52 ms per token,    86.84 tokens per second)
+1.08.472.759 I slot print_timing: id  3 | task 0 |        eval time =   23777.47 ms /   600 tokens (   39.70 ms per token,    25.19 tokens per second)
+1.08.472.760 I slot print_timing: id  3 | task 0 |       total time =   24675.72 ms /   678 tokens
+1.08.472.763 I slot print_timing: id  3 | task 0 |    graphs reused =        597
+1.08.472.798 I slot      release: id  3 | task 0 | stop processing: n_tokens = 677, truncated = 0
+1.08.708.446 I slot get_availabl: id  3 | task -1 | selected slot by LCP similarity, f_sim_best = 1.000 (> 0.100 thold), f_keep = 0.115
+1.08.778.093 I slot launch_slot_: id  3 | task 602 | processing task, is_child = 0
+1.12.194.217 I slot print_timing: id  3 | task 602 | n_gen =    100, tg =  29.72 t/s, tg_3s =  30.02 t/s
+1.15.194.834 I slot print_timing: id  3 | task 602 | n_gen =    189, tg =  29.69 t/s, tg_3s =  29.66 t/s
+1.18.226.315 I slot print_timing: id  3 | task 602 | n_gen =    279, tg =  29.69 t/s, tg_3s =  29.69 t/s
+1.21.257.275 I slot print_timing: id  3 | task 602 | n_gen =    369, tg =  29.69 t/s, tg_3s =  29.69 t/s
+1.24.282.491 I slot print_timing: id  3 | task 602 | n_gen =    458, tg =  29.64 t/s, tg_3s =  29.42 t/s
+1.27.295.452 I slot print_timing: id  3 | task 602 | n_gen =    547, tg =  29.62 t/s, tg_3s =  29.54 t/s
+1.29.095.155 I slot print_timing: id  3 | task 602 | prompt eval time =      84.94 ms /     4 tokens (   21.23 ms per token,    47.09 tokens per second)
+1.29.095.158 I slot print_timing: id  3 | task 602 |        eval time =   20232.06 ms /   600 tokens (   33.78 ms per token,    29.61 tokens per second)
+1.29.095.159 I slot print_timing: id  3 | task 602 |       total time =   20317.00 ms /   604 tokens
+1.29.095.160 I slot print_timing: id  3 | task 602 |    graphs reused =       1193
+1.29.095.177 I slot      release: id  3 | task 602 | stop processing: n_tokens = 677, truncated = 0
+1.55.031.076 I srv    operator(): operator(): cleaning up before exit...

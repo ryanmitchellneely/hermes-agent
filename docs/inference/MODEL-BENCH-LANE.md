@@ -10,12 +10,29 @@ that sequence made mechanical; this page is the part a script cannot carry.
 ## The one-liner
 
 ```bash
-./bench_window.sh open ngram-mod   # preflight, evict, serve, tunnel, verify
+./bench_window.sh open ngram-mod                 # gptoss (default): preflight, evict, STOP ollama, serve, tunnel, verify
+./bench_window.sh open --model flash mtp3        # flash-next UD-Q3_K_XL on the PR-28243 build; modes: none|mtp2|mtp3|mtp4|mtp{2,3,4}-standalone
 #   ... run your bench against http://127.0.0.1:11439/v1 FROM THE VPS ...
-./bench_window.sh close            # restore + verify (fails loudly if not clean)
+#   e.g.  sudo -u t1000 env HOME=/opt/t1000/home ~/scripts/run_arm.sh pr28243-mtp3   (all three instruments + /metrics acceptance)
+./bench_window.sh switch mtp4                    # swap spec mode inside the open window (~1 min reload; tunnel stays up)
+./bench_window.sh close                          # kill, START ollama, reload residents one at a time, verify (fails loudly)
 ```
 
-`status` shows lane, residency, and both endpoints without changing anything.
+`status` shows lane, residency, service state, and both endpoints without
+changing anything. The `--model` choice is remembered in `~/.bench_window.model`
+so `switch`/`close` need no repeat. `--model` picks the serve script, the memory
+bar (64 vs 93 GB) and the readiness match.
+
+## ⚠️ No `pkill -f` / `pgrep -f` in this script — ever (2026-09-05)
+
+Three flash windows in a row aborted at the tunnel step with no tunnel log and no
+tunnel process. Cause: `ssh spark "pkill -f 'R 127.0.0.1:11439'; ssh -N -R …"`
+— the remote `bash -c` shell's own command line contains the pattern, so pkill
+killed the shell before the tunnel command ran; the ERR trap then restored the
+box (correctly, all three times). The `[b]racket` idiom does not save you when
+the pattern is elsewhere in the same command string. The script now records
+pids (`/tmp/bench-server.pid`, `/tmp/bench-tunnel.pid`) and checks ports with
+`ss -ltn`. If you add a kill, add a pidfile.
 
 ## Topology (the thing that surprises everyone)
 
@@ -63,10 +80,13 @@ Rules:
 - **Lane-quiet preflight.** Evicting mid-card kills a running DevBot job. The
   script refuses to open if any devbot card is `ready`/`running`, and treats an
   unknown count as busy (fail safe).
-- **Evict everything.** A 60–120 GB model needs the box. `OLLAMA_KEEP_ALIVE=-1`
-  prevents *expiry*, not fresh loads — a client request silently re-pins an
-  evicted model, which caused two OOM kills. Check residency immediately before
-  a memory-critical step, not once at the start.
+- **Evict everything, then STOP the service.** A 60–120 GB model needs the box.
+  `OLLAMA_KEEP_ALIVE=-1` prevents *expiry*, not fresh loads — a client request
+  silently re-pins an evicted model, which caused two OOM kills. Only a stopped
+  service prevents that; the NOPASSWD grant for `systemctl stop/start ollama`
+  exists on ryan-spark and the script uses it (before 2026-09-05 it only
+  *checked* the grant). Check residency immediately before a memory-critical
+  step, not once at the start.
 - **Reload one model at a time** on close. Parallel loads OOM a 121 GB box.
 - **Verify restoration, never assume.** `close` asserts three residents, zero
   stray `llama-server`, and lane endpoint HTTP 200 — and fails loudly otherwise.

@@ -1,14 +1,20 @@
 # Bakeoff: DS4-Flash vs Qwen3.8-Flash-Next (2026-08-26)
 
-**Status:** complete for this runtime generation. Re-run trigger named below.
-**Board:** models card `t_3c3569cd` (full session trail in comments).
+**Status:** re-run DONE 2026-09-05 with MTP engaged (section below). Next trigger named at the end.
+**Board:** models card `t_3c3569cd` (08-26 trail, archived) · `t_d9e99989` (09-05 MTP re-run).
 **Hardware:** ryan-spark (GB10, 121 GB unified) for the challenger; kevin-spark
 vLLM for the incumbent. All numbers same-day, same instruments.
 
 ## Verdict
 
-**DS4 stays the flash lane today.** But its advantage is *entirely* speculation
-on copyable output, not raw model speed — and that reframes what a re-run means.
+**2026-08-26:** DS4 stays the flash lane. Its advantage was *entirely* speculation
+on copyable output, not raw model speed.
+
+**2026-09-05 (MTP re-run, below):** that advantage is gone. With the NextN/MTP
+head engaged, flash-next at n-max 3 does **60.2 tok/s edit-shaped / 35.5 prose**
+against DS4's 69.8 / 29.8 — within 14 % on copyable work and **19 % faster on
+novel generation**, from a 90 GB 3-bit build. The lane question is now open;
+it is decided on models card `t_37efebbb`, not here.
 
 ## The measurement that changed the reading
 
@@ -80,21 +86,90 @@ This also explains why the "1-bit" IQ1_S is 72.5 GB rather than ~35 GB.
 **Serving reality:** any ≥3-bit flash-next build needs ollama fully evicted on
 the 121 GB Spark. It cannot coexist with the 120b lane.
 
-## Re-run trigger
+## MTP re-run — 2026-09-05 (llama.cpp PR 28243)
 
-**Re-run this bakeoff the day MTP or lookup decoding lands for flash-next** —
-in llama.cpp PR #27742 (danielhanchen: "adding MTP — still WIP"; closed PR
-#27739 already had MTP + PLE offload) or via ollama support, where MTP engages
-for `qwen3.8:27b` today. Nothing else plausibly flips the verdict.
+**Trigger fired:** MTP for flash-next landed as ggml-org/llama.cpp **#28243**
+(danielhanchen / unsloth, on top of #27836; head `d1a92352c`, mergeable, draft-
+decode regression fixed the same morning). unsloth ships the head as sidecar
+GGUFs: `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.79 GB, borrows the
+target's embeddings) and a standalone `Q8_0` (4.14 GB). Built as a worktree at
+`~/llama.cpp-mtp` on ryan-spark (CUDA, GB10); `build-qwen4exp` untouched.
 
-Why it matters: flash-next currently loses *while carrying no speculation*, from
-an equal-or-higher base. With speculation it starts from ~33, not ~30 — the
-direction Bakeer's edit-shaped numbers point, and above DS4's 70.
+**This is the first GB10 / DGX Spark data point for the head anywhere** — the
+PR thread had 5090 (+25–40 %, acc 0.77), A6000 (no win, acc 0.37), Metal
+(dn=2 −2 %) and nothing for unified-memory NVIDIA.
 
-⚠️ **llama.cpp does not run MTP for *any* Qwen model** — our own prior finding:
-`qwen3.8:27b` runs MTP under ollama (`blk.64.nextn.*`) but side-door llama.cpp
-leaves those tensors unused (12.9 vs 42.8 decode). There is no reference
-implementation to port from.
+Same target (UD-Q3_K_XL 90 GB), same three instruments, same 16k ctx, thinking
+off, served one arm after another inside one window (`bench_window.sh switch`).
+Decode tok/s p50; every arm 9/9 content-ok and 6/6 validity guards.
+
+| arm (shared Q8_0 head) | code_c1 | devbot_fence | ping | edit | prose | copyability | acceptance | accepted / verify step |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `none` (control, this build) | 29.8 | 30.2 | 55.3 | 29.9 | 29.2 | 1.02× | — | — |
+| `draft-mtp` n-max 2 | 53.0 | 39.7 | 29.4 | 52.9 | 36.5 | 1.45× | 0.715 | 1.43 |
+| `draft-mtp` n-max 3 | **60.2** | 38.4 | 27.6 | **60.2** | **35.5** | 1.70× | 0.658 | 1.97 |
+| `draft-mtp` n-max 4 | 65.7 | 37.5 | 21.6 | 65.8 | 29.6 | 2.22× | 0.542 | 2.17 |
+| DS4 EXL3-K2 (08-26 reference) | 70.1 | 32.7 | — | 69.8 | 29.8 | 2.34× | — | — |
+
+Reading, against the bar written down before the window opened:
+
+1. **MTP works on GB10.** Acceptance ≥ 0.6 at n-max ≤ 3 and edit-shaped decode
+   1.77–2.2× the control. The control on the new build (29.8) is +5 % over the
+   08-26 build (28.4) — master moved; that is why the control was re-run.
+2. **The lane question flips open.** n-max 3 clears both halves of the bar:
+   edit ≥ 60 **and** prose above control (35.5 vs 29.2, +22 %). n-max 2/3 are
+   the sweet spots. n-max 4 buys edit speed but prose falls back to control and
+   `ping` (one-word answers) halves — the draft overhead dominates tiny outputs.
+3. **Greedy output is NOT identical under MTP on this backend.** temp 0, top_k 1,
+   seed 7, n = 600: three control runs are **bit-identical** (same sha256), and
+   **every MTP arm diverges from them** — first difference at character 21
+   (n-max 2), 267 (n-max 3), 21 (n-max 4). Same class as the Metal
+   batch-invariance report on the PR thread (MUL_MAT batch width changes
+   accumulated rounding), and it is the reason a "which n-max is safe"
+   recommendation must carry the length it was measured at. Quality probes
+   still pass on every arm (tool calls parse structurally, Fibonacci executed).
+   Treat MTP output as *equivalent in quality*, not *identical*.
+4. Standalone-head arm skipped: the shared head loaded and accepted ≥ 0.5, the
+   plan's only reasons to run it.
+
+**Serving reality is unchanged:** 90 GB target + 2.8 GB head needs ollama fully
+evicted on the 121 GB Spark. It cannot co-reside with the 120b lane.
+
+### Operational lessons (this run)
+
+- **`pkill -f` self-kill aborted three windows in a row.** The remote `bash -c`
+  command line that runs `pkill -f 'R 127.0.0.1:11439'` contains that pattern,
+  so pkill killed its own shell before the tunnel launched; the ERR trap then
+  restored the box (correctly) each time. The bracket idiom did not save it.
+  `bench_window.sh` now uses **pidfiles and port checks** and no `pkill -f` /
+  `pgrep -f` at all. The trap did its job: the lane came back clean all three
+  times, verified.
+- The script *checked* the NOPASSWD `systemctl stop ollama` grant and never
+  *called* it. It now stops the service after eviction and starts it on close.
+- Acceptance comes from `/metrics` (`llamacpp:spec_decode_num_{draft_tokens,
+  accepted_tokens,drafts}_total`, cumulative) — snapshot before and after each
+  battery; `run_arm.sh` does this.
+- A one-word `ping` is the wrong probe for a speculative arm: it measures draft
+  overhead, not decode. Keep it (it is a regression tripwire) but do not rank
+  on it.
+
+### Receipts (this repo, `docs/inference/experiments/`)
+
+`flash-sidedoor-qwen38fn-pr28243-{none,mtp2,mtp3,mtp4}-20260905T*.json`,
+`edit-vs-prose-qwen38fn-pr28243-{none,mtp2,mtp3,mtp4}-20260905T*.json`,
+`metrics-qwen38fn-pr28243-mtp{2,3,4}-*.prom`, `temp0-identity-pr28243.jsonl`
+(six rows: none ×3, mtp2, mtp3, mtp4), `serverlog-pr28243-*.log`. Instruments:
+`flash_sidedoor_bakeoff.py` (VPS `~/scripts`), `edit_vs_prose_bench.py`,
+`temp0_identity_check.py`, `run_arm.sh` (this dir).
+
+## Re-run trigger (updated 2026-09-05)
+
+1. **PR 28243 merges** → rebuild from master (the worktree pin is a PR head, not
+   a release) and re-run `none` + n-max 3 only, to confirm nothing regressed.
+2. **PR 28136** (direct PLE reads, author measured prefill 300 → 750–800 tok/s
+   on a DGX Spark) → card `t_ec2af07b`; prefill-heavy prompts, combine with MTP.
+3. The lane decision itself lives on `t_37efebbb` (Ryan, 2026-09-05: thorough
+   eval of replacing what runs on Ryan's box and on Kevin's box).
 
 ## Operational lessons (cost real time today)
 
@@ -125,6 +200,8 @@ implementation to port from.
   experiments/`, which became sandbox-unreadable mid-session. Their numbers are
   preserved in this doc and in card `t_3c3569cd`; the raw files still need
   moving here from a session with Mac access.
-- Assets on ryan-spark: `~/models/flash-next-gguf/` (our mints),
+- Assets on ryan-spark: `~/llama.cpp-mtp/` (PR 28243 worktree + CUDA build),
+  `~/models/flash-next-udq3/mtp-*.gguf` (both heads), `~/models/flash-next/serve-udq3-mtp.sh`,
+  `~/models/flash-next-gguf/` (our mints),
   `~/models/flash-next-udq3/` (unsloth), `~/llama.cpp/build-qwen4exp/` (PR build,
   pinned `bea3b12` + local F32 converter patch), `~/models/flash-next/serve-*.sh`
