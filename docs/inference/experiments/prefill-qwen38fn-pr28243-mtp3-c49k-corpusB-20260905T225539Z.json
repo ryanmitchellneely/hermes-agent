@@ -1,0 +1,29 @@
+{
+  "label": "pr28243-mtp3-c49k-corpusB",
+  "model": "qwen3.8-flash-next",
+  "base": "http://127.0.0.1:11439/v1",
+  "corpus_chars": 77561,
+  "prompt_tokens": 19811,
+  "cold": {
+    "prompt_tokens": 19811,
+    "ttft_s": 83.22,
+    "total_s": 83.42,
+    "prompt_tok_s": 238.1
+  },
+  "warm_prompt_tok_s_p50": 621.2,
+  "warm_ttft_s_p50": 31.89,
+  "rows": [
+    {
+      "prompt_tokens": 19811,
+      "ttft_s": 31.88,
+      "total_s": 31.96,
+      "prompt_tok_s": 621.4
+    },
+    {
+      "prompt_tokens": 19811,
+      "ttft_s": 31.9,
+      "total_s": 31.99,
+      "prompt_tok_s": 621.0
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "label": "pr28136-plemmap-c49k-corpusC",
+  "model": "qwen3.8-flash-next",
+  "base": "http://127.0.0.1:11439/v1",
+  "corpus_chars": 77679,
+  "prompt_tokens": 21576,
+  "cold": {
+    "prompt_tokens": 21576,
+    "ttft_s": 88.4,
+    "total_s": 88.44,
+    "prompt_tok_s": 244.1
+  },
+  "warm_prompt_tok_s_p50": 626.05,
+  "warm_ttft_s_p50": 34.465,
+  "rows": [
+    {
+      "prompt_tokens": 21576,
+      "ttft_s": 34.29,
+      "total_s": 34.33,
+      "prompt_tok_s": 629.2
+    },
+    {
+      "prompt_tokens": 21576,
+      "ttft_s": 34.64,
+      "total_s": 34.69,
+      "prompt_tok_s": 622.9
+    }
+  ]
+}

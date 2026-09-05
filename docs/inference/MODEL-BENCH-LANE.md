@@ -21,7 +21,14 @@ that sequence made mechanical; this page is the part a script cannot carry.
 `status` shows lane, residency, service state, and both endpoints without
 changing anything. The `--model` choice is remembered in `~/.bench_window.model`
 so `switch`/`close` need no repeat. `--model` picks the serve script, the memory
-bar (64 vs 93 GB) and the readiness match.
+bar (64 vs 93 GB) and the readiness match. `CTX=49152 NP=1` in the environment reach the
+flash serve script (per-slot context, slot count); the 08-26/09-05 decode numbers are at 16k×4
+slots, the prefill and pilot numbers at 49k×1 — say which when you quote them.
+
+**Residents are three, not four.** ollama on ryan-spark evicts gpt-oss:120b the moment a fourth
+model of any size loads (measured 2026-09-05 with a 1.8 GB model), and loading 120b *last* evicts
+the other two. `close` reloads 120b first for that reason. Do not add a fourth resident to
+`RESIDENTS` without re-measuring.
 
 ## ⚠️ No `pkill -f` / `pgrep -f` in this script — ever (2026-09-05)
 

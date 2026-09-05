@@ -1,0 +1,29 @@
+{
+  "label": "pr28136-pledirect-c49k-corpusD",
+  "model": "qwen3.8-flash-next",
+  "base": "http://127.0.0.1:11439/v1",
+  "corpus_chars": 77788,
+  "prompt_tokens": 20905,
+  "cold": {
+    "prompt_tokens": 20905,
+    "ttft_s": 35.21,
+    "total_s": 35.25,
+    "prompt_tok_s": 593.8
+  },
+  "warm_prompt_tok_s_p50": 627.7,
+  "warm_ttft_s_p50": 33.305,
+  "rows": [
+    {
+      "prompt_tokens": 20905,
+      "ttft_s": 33.45,
+      "total_s": 33.49,
+      "prompt_tok_s": 625.0
+    },
+    {
+      "prompt_tokens": 20905,
+      "ttft_s": 33.16,
+      "total_s": 33.22,
+      "prompt_tok_s": 630.4
+    }
+  ]
+}

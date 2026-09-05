@@ -1,0 +1,7 @@
+[Unit]
+Description=flash-next pilot heartbeat (writes health.json; failing = alert)
+
+[Service]
+Type=oneshot
+User=ryanneely1000
+ExecStart=/home/ryanneely1000/models/flash-next/flash-next-health.sh

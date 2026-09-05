@@ -162,6 +162,27 @@ evicted on the 121 GB Spark. It cannot co-reside with the 120b lane.
 `flash_sidedoor_bakeoff.py` (VPS `~/scripts`), `edit_vs_prose_bench.py`,
 `temp0_identity_check.py`, `run_arm.sh` (this dir).
 
+### Same-day follow-through (Ryan: "let's do that") — pilot staged, 2026-09-05 evening
+
+- **Baselines over the live lane (ollama, same instruments, no window):** gpt-oss:120b code 57.1 /
+  edit 51.6 / **prose 66.0** (ping + fence rows came back empty under `reasoning_effort: none`
+  via ollama — a harmony-channel quirk, not a speed fact); qwen3.8:27b 37.5 / 41.2 / 18.4. So
+  flash-next beats 120b on edit-shaped work and 27b everywhere, and **120b stays ~1.9× faster on
+  novel prose.** That trade is now on the record (`t_37efebbb`).
+- **Prefill on real ~20k-token cards, cold on unseen text:** PR 28243 234–244 tok/s (≈85–90 s to
+  first token) regardless of MTP; **PR 28136 `--lazy-mode on-direct` 594 tok/s (35 s)**, cold ≈
+  warm. Direct PLE reads are a requirement for the lane, not a nicety.
+- **`flash-prod` branch** (`~/llama.cpp-prod`, `0a418d6c`) = 28243 + 28136 merged cleanly (the
+  earlier "conflict" was git lacking a commit identity). Validated in one window at the pilot
+  config (mtp3 + on-direct, 49k ctx, 1 slot): code 60.3 / fence 38.5 / edit 59.0 / prose 34.5,
+  acceptance 0.657, greedy stream byte-identical to the 28243 mtp3 arm; cold prefill 560 tok/s on
+  23.5k tokens (42 s). Receipts: `experiments/*flashprod*`, `*prefill-qwen38fn-*`, `*lane-ollama-*`.
+- **Residency (measured):** ollama on ryan-spark keeps at most three residents; a fourth of any
+  size evicts 120b, and loading 120b last evicts the rest. The tiny-aux move therefore went to
+  `hermes3:8b-16k` (already resident) for the four kanban/title slots, compression stayed on 27b
+  until the flip. Runbook, flip order, rollback: `~/models/flash-next/README-PILOT.md` on
+  ryan-spark (copy in this dir as `PILOT-FLASH-NEXT-RYAN-SPARK.md`).
+
 ## Re-run trigger (updated 2026-09-05)
 
 1. **PR 28243 merges** → rebuild from master (the worktree pin is a PR head, not

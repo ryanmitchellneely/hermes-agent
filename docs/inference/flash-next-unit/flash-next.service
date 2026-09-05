@@ -1,0 +1,27 @@
+[Unit]
+Description=Qwen3.8-Flash-Next pilot (llama.cpp flash-prod: PR 28243 MTP + PR 28136 direct PLE) on :8898
+Documentation=file:///home/ryanneely1000/models/flash-next/README-PILOT.md
+After=network-online.target
+Wants=network-online.target
+# ollama must NOT hold gpt-oss:120b or qwen3.8:27b while this runs (90 GB + 3 GB head on a 121 GB box).
+# The flip (t_37efebbb) removes those two from every config first; this unit does not evict anything itself.
+
+[Service]
+Type=simple
+User=ryanneely1000
+Group=ryanneely1000
+Environment=CTX=49152
+Environment=NP=1
+ExecStart=/home/ryanneely1000/models/flash-next/serve-udq3-mtp.sh prod
+Restart=always
+RestartSec=15
+TimeoutStartSec=600
+# the model takes ~2 min to load; do not let systemd kill it as "hung"
+TimeoutStopSec=30
+KillSignal=SIGINT
+LimitNOFILE=65536
+StandardOutput=append:/home/ryanneely1000/models/flash-next/flash-next.service.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

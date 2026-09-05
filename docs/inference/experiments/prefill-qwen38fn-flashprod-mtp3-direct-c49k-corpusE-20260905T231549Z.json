@@ -1,0 +1,29 @@
+{
+  "label": "flashprod-mtp3-direct-c49k-corpusE",
+  "model": "qwen3.8-flash-next",
+  "base": "http://127.0.0.1:11439/v1",
+  "corpus_chars": 77540,
+  "prompt_tokens": 23491,
+  "cold": {
+    "prompt_tokens": 23491,
+    "ttft_s": 41.98,
+    "total_s": 42.06,
+    "prompt_tok_s": 559.6
+  },
+  "warm_prompt_tok_s_p50": 596.35,
+  "warm_ttft_s_p50": 39.394999999999996,
+  "rows": [
+    {
+      "prompt_tokens": 23491,
+      "ttft_s": 39.32,
+      "total_s": 39.4,
+      "prompt_tok_s": 597.5
+    },
+    {
+      "prompt_tokens": 23491,
+      "ttft_s": 39.47,
+      "total_s": 39.55,
+      "prompt_tok_s": 595.2
+    }
+  ]
+}

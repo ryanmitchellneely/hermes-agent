@@ -26,6 +26,7 @@
 # USAGE
 #   ./bench_window.sh open [--model gptoss|flash] [mode]   # mode default: ngram-mod (gptoss) / none (flash)
 #   ./bench_window.sh switch <mode>     # swap the served spec mode inside an open window (tunnel stays up)
+#   CTX=32768 NP=1 ./bench_window.sh switch none   # flash: per-slot context / slot count overrides
 #   ./bench_window.sh close
 #   ./bench_window.sh status
 # flash modes: none | mtp2 | mtp3 | mtp4 | mtp{2,3,4}-standalone  (see serve-udq3-mtp.sh)
@@ -56,7 +57,7 @@ BENCH_PORT=11439                            # see THE PORT FENCE above
 MODEL_PORT=8898                             # llama.cpp on spark
 SERVER_PID='/tmp/bench-server.pid'          # remote pidfiles (see start_server for why not pkill -f)
 TUNNEL_PID='/tmp/bench-tunnel.pid'
-RESIDENTS=(gpt-oss:120b qwen3.8:27b hermes3:8b-16k)
+RESIDENTS=(gpt-oss:120b qwen3.8:27b hermes3:8b-16k)   # ollama on this box holds at most these three: a 4th model of ANY size evicts 120b (measured 2026-09-05 with a 1.8 GB model)
 HK="sudo -u t1000 env HERMES_HOME=/opt/t1000/home /opt/t1000/venv/bin/hermes kanban"
 
 say() { printf '\n=== %s\n' "$*"; }
@@ -91,7 +92,8 @@ restore_on_failure() {
 start_server() {
   local mode="$1"
   say "serving $LABEL via llama.cpp (spec: $mode)"
-  ssh "$SPARK" "setsid nohup $SERVE $mode < /dev/null > \$HOME/models/flash-next/bench-window-${MODEL_SEL}-${mode}.log 2>&1 & echo \$! > $SERVER_PID" >/dev/null
+  # CTX / NP from the caller's environment reach the serve script (flash only honors them).
+  ssh "$SPARK" "${CTX:+CTX=$CTX }${NP:+NP=$NP }setsid nohup $SERVE $mode < /dev/null > \$HOME/models/flash-next/bench-window-${MODEL_SEL}-${mode}.log 2>&1 & echo \$! > $SERVER_PID" >/dev/null
   local n=0
   until ssh "$SPARK" "curl -s -m 3 http://127.0.0.1:$MODEL_PORT/v1/models" 2>/dev/null | grep -q "$READY_MATCH"; do
     n=$((n+1)); [ $n -gt 80 ] && die "model never came up; see ~/models/flash-next/bench-window-${MODEL_SEL}-${mode}.log on spark"

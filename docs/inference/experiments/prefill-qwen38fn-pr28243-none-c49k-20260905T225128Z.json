@@ -1,0 +1,35 @@
+{
+  "label": "pr28243-none-c49k",
+  "model": "qwen3.8-flash-next",
+  "base": "http://127.0.0.1:11439/v1",
+  "corpus_chars": 77601,
+  "prompt_tokens": 20739,
+  "cold": {
+    "prompt_tokens": 20739,
+    "ttft_s": 88.78,
+    "total_s": 88.81,
+    "prompt_tok_s": 233.6
+  },
+  "warm_prompt_tok_s_p50": 639.5,
+  "warm_ttft_s_p50": 32.43,
+  "rows": [
+    {
+      "prompt_tokens": 20739,
+      "ttft_s": 32.31,
+      "total_s": 32.37,
+      "prompt_tok_s": 641.9
+    },
+    {
+      "prompt_tokens": 20739,
+      "ttft_s": 32.43,
+      "total_s": 32.46,
+      "prompt_tok_s": 639.5
+    },
+    {
+      "prompt_tokens": 20739,
+      "ttft_s": 32.43,
+      "total_s": 32.48,
+      "prompt_tok_s": 639.5
+    }
+  ]
+}

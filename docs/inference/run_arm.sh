@@ -1,6 +1,8 @@
 #!/bin/bash
 # run_arm.sh <label> — run the full flash-next battery against the bench tunnel.
-# Runs ON THE VPS as t1000 (the only host that can see :11439). One label per
+# Runs ON THE VPS as t1000 (the only host that can see :11439).
+# Env: BASE (endpoint), MODEL (served id), TAG (receipt prefix), LEDGER (identity ledger suffix).
+#   e.g. BASE=http://127.0.0.1:11435/v1 MODEL=gpt-oss:120b TAG=gptoss120b LEDGER=lane run_arm.sh lane-ollama One label per
 # served arm, e.g. pr28243-none, pr28243-mtp2, pr28243-mtp2-standalone.
 # Same three instruments every arm, so within-battery ratios are sound:
 #   1. flash_sidedoor_bakeoff.py   standard battery (code_c1 / devbot_fence / ping)
@@ -9,7 +11,8 @@
 set -uo pipefail
 L=${1:?label}
 BASE=${BASE:-http://127.0.0.1:11439/v1}
-M=qwen3.8-flash-next
+M=${MODEL:-qwen3.8-flash-next}
+TAG=${TAG:-qwen38fn}
 OUT=/opt/t1000/src/docs/inference/experiments
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$OUT"
@@ -20,15 +23,15 @@ echo "=== ARM $L  $(date -u +%FT%TZ)"
 # so acceptance for THIS battery = delta(accepted)/delta(drafted).
 MB=$(mktemp); curl -s -m 8 "${BASE%/v1}/metrics" > "$MB"
 python3 /opt/t1000/home/scripts/flash_sidedoor_bakeoff.py --base "$BASE" --model "$M" \
-  --label "qwen38fn-$L" --repeats 3 --out "$OUT/flash-sidedoor-qwen38fn-$L-$TS.json" 2>&1 | tail -25 \
+  --label "$TAG-$L" --repeats 3 --out "$OUT/flash-sidedoor-$TAG-$L-$TS.json" 2>&1 | tail -25 \
   || echo "SIDEDOOR_FAIL $L"
 python3 /opt/t1000/src/docs/inference/edit_vs_prose_bench.py --base "$BASE" --model "$M" \
-  --label "$L" --repeats 3 --out "$OUT/edit-vs-prose-qwen38fn-$L-$TS.json" 2>&1 | tail -20 \
+  --label "$L" --repeats 3 --out "$OUT/edit-vs-prose-$TAG-$L-$TS.json" 2>&1 | tail -20 \
   || echo "EDITPROSE_FAIL $L"
 python3 /opt/t1000/home/scripts/temp0_identity_check.py --base "$BASE" --model "$M" \
-  --label "$L" --ledger "$OUT/temp0-identity-pr28243.jsonl" 2>&1 | tail -3 \
+  --label "$L" --ledger "$OUT/temp0-identity-${LEDGER:-pr28243}.jsonl" 2>&1 | tail -3 \
   || echo "IDENTITY_FAIL $L"
-MA="$OUT/metrics-qwen38fn-$L-$TS.prom"; curl -s -m 8 "${BASE%/v1}/metrics" > "$MA"
+MA="$OUT/metrics-$TAG-$L-$TS.prom"; curl -s -m 8 "${BASE%/v1}/metrics" > "$MA"
 python3 - "$MB" "$MA" "$L" <<'PY'
 import sys,re
 def load(p):
