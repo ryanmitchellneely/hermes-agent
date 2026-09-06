@@ -321,12 +321,6 @@ class LanePrSummaryTests(unittest.TestCase):
             q = unquote(parse_qs(parsed.query)["q"][0])
             if "is:merged" in q:
                 return {"total_count": 1, "items": []}
-            if "is:closed" in q:
-                # All closed (merged + unmerged) in the window: 101 (merged)
-                # + 102 (closed, never merged) = 2. closed_unmerged is derived
-                # by subtracting the merged count (1) from this, giving 1 —
-                # matching PR 102 below, the actual closed-unmerged one.
-                return {"total_count": 2, "items": []}
             if "is:open" in q:
                 return {
                     "total_count": 1,
@@ -341,6 +335,41 @@ class LanePrSummaryTests(unittest.TestCase):
                     {"number": 103, "created_at": "2026-09-03T00:00:00Z"},
                 ],
             }
+        if parsed.path.endswith("/pulls"):
+            page = parse_qs(parsed.query).get("page", ["1"])[0]
+            if page != "1":
+                return []  # only one page of fixture data
+            # Sorted by updated_at desc, as the real endpoint returns:
+            # 202 (closed, unmerged, in-window) newest, 201 (merged, in-window)
+            # next, 203 (closed, unmerged, OUT of window) oldest — its
+            # updated_at predates the window start, which is what makes the
+            # real function stop paginating after this one page.
+            return [
+                {
+                    "number": 202,
+                    "user": {"login": "k2-dsh-lane[bot]"},
+                    "state": "closed",
+                    "merged_at": None,
+                    "closed_at": "2026-09-03T09:00:00Z",
+                    "updated_at": "2026-09-03T09:00:00Z",
+                },
+                {
+                    "number": 201,
+                    "user": {"login": "k2-dsh-lane[bot]"},
+                    "state": "closed",
+                    "merged_at": "2026-09-02T10:00:00Z",
+                    "closed_at": "2026-09-02T10:00:00Z",
+                    "updated_at": "2026-09-02T10:00:00Z",
+                },
+                {
+                    "number": 203,
+                    "user": {"login": "k2-dsh-lane[bot]"},
+                    "state": "closed",
+                    "merged_at": None,
+                    "closed_at": "2026-08-01T09:00:00Z",
+                    "updated_at": "2026-08-01T09:00:00Z",
+                },
+            ]
         if "/issues/101/comments" in parsed.path:
             return [{"body": "Verdict: APPROVE", "created_at": "2026-09-01T10:30:00Z"}]
         if "/issues/102/comments" in parsed.path:
@@ -348,6 +377,25 @@ class LanePrSummaryTests(unittest.TestCase):
         if "/issues/103/comments" in parsed.path:
             return []
         raise AssertionError(f"unexpected url {url}")
+
+    def test_fetch_closed_unmerged_count_direct(self):
+        """Round-3 unit test: _fetch_closed_unmerged_count() in isolation
+        against a fake single pulls page holding one merged, one
+        closed-unmerged, and one out-of-window PR (per captain's ask)."""
+
+        def fake_pulls_page(url, token):
+            return self._fake_gh_get(url, token)
+
+        count, ok = fem._fetch_closed_unmerged_count(
+            fake_pulls_page,
+            "joinsov/kevin-real-estate-tools",
+            None,
+            "app/k2-dsh-lane",
+            "2026-09-01T00:00:00Z",
+            "2026-09-08T00:00:00Z",
+        )
+        self.assertEqual(count, 1)  # only PR 202 (closed, unmerged, in-window)
+        self.assertTrue(ok)
 
     def test_opened_merged_closed_and_verdict_latency(self):
         metrics, freshness = fem.lane_pr_summary(
