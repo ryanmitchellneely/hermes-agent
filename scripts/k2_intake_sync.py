@@ -210,7 +210,23 @@ CHECKERS = [
                 "that changed after the page was last committed: {sources}. "
                 "Every other source the page lists is out of scope — leave "
                 "those claims alone and do not mention them.\n"
+                "SCOPE CEILING, restated because scope-overrun is a recorded "
+                "close cause on this lane (#5655, #5656, #5659 — a fix that "
+                "spread past its own page and corrupted a sibling): this card "
+                "touches ONLY `{page}`'s frontmatter dates and its "
+                "`## Verification` section. Do not edit, reformat, or 'fix' "
+                "any other file or page you notice along the way, no matter "
+                "how tempting. If the real fix needs more than that, STOP and "
+                "`kanban block` describing what and why — do not widen the "
+                "diff yourself.\n"
                 "ARTIFACT: {page} — the claims deriving from those sources.\n"
+                "DUPLICATE-WORK CHECK, before you start: five of the lane's "
+                "close causes were a card verifying a page a human or another "
+                "card had already handled (stale/superseded — the "
+                "second-largest recorded cause after vacuous). Check for an "
+                "OPEN PR already touching `{page}` before you write anything. "
+                "If one exists, STOP and `kanban block` naming it — do not "
+                "race it and do not duplicate the verification.\n"
                 "RECEIPT, both halves required:\n"
                 "  1. EDIT THE YAML FRONTMATTER at the top of the file (between "
                 "the opening and closing `---`): set `updated:` to now and "
@@ -244,6 +260,7 @@ CHECKERS = [
                 "asserts the check without evidence anyone can re-run, and "
                 "will be rejected. If a `## Verification` section already "
                 "exists, REPLACE it rather than stacking a second one - and when replacing, CARRY EVERY EXISTING ROW FORWARD. A row you cannot re-confirm gets its verdict cell changed to `stale` or `human`, NEVER silently deleted: evidence that shrinks while last_verified advances is quiet evidence-loss (measured 2026-08-31, two PRs in one run deleted rows whose cited code was unchanged at the cited lines). Delete a row ONLY when its cited target no longer exists, and say so in the verdict cell: removed - target gone.\n"
+                "     SHAPE IS ALSO CHECKED: claim | file:line | quote | verdict is the exact shape `scripts/quote_fidelity_check.py` enforces — a row in any other shape fails the gate on format, not content. If the quote cell says `NOT FOUND`, the verdict cell must say `human` or `unchecked`, never `verified`; the same goes for any row with no checkable token and no citation.\n"
                 "  3. CHANGE NOTHING ELSE. Add your section and edit the two "
                 "frontmatter dates; leave every other byte of the document "
                 "exactly as you found it. Do not reflow, retitle, or 'tidy' "
@@ -260,9 +277,16 @@ CHECKERS = [
                 "evidence. A date bump plus a green checker with no table is "
                 "indistinguishable from a whitespace commit — it silences the "
                 "detector instead of doing the job.\n"
-                "If you cannot produce both halves honestly, `kanban block` and "
-                "say why. Silencing the checker without the evidence is the one "
-                "unrecoverable failure here."
+                "FINISH PROTOCOL, unconditional — re-read your own diff before "
+                "you call this done. A diff that changes ONLY the two "
+                "frontmatter dates with no non-empty `## Verification` row is "
+                "VACUOUS, the modal close cause on this lane (#5376, #5580, "
+                "#5717, #5688) — refuse it yourself. A `## Verification` "
+                "section with a header and separator but ZERO data rows is "
+                "HOLLOW (#5688-shape) — same refusal. If you cannot produce "
+                "both halves honestly, `kanban block` and say why. Silencing "
+                "the checker without the evidence is the one unrecoverable "
+                "failure here."
             ),
         },
     },
@@ -365,6 +389,98 @@ CHECKERS = [
                 "pasted output is. If the unit is genuinely not a reusable part, "
                 "the correct deliverable is a COVERAGE_IGNORE entry with the "
                 "reason, not a row."
+            ),
+        },
+    },
+    {
+        "key": "characterization-tests",
+        "title": "K2 scripts/*.py CI gates with zero covering tests",
+        # DRAFT 2026-09-06 (campaign option 1, harness t_39357274/t_da2f74c4).
+        # Candidate list lives HERE, inline, rather than as a new script in the
+        # K2 clone — this checker's dispatch code has no write access to that
+        # repo, and a companion checker script is exactly the kind of new
+        # promoted surface this class is NOT cleared to add yet. `argv` checks
+        # each named module against the repo's own scripts/test_<name>.py
+        # convention with a one-liner, using tools already present in any K2
+        # checkout — zero new files there.
+        #
+        # `scripts/lint_timer_recurrence.py` (the module named on harness card
+        # t_a5d33562, the stalled characterization-test attempt this class is
+        # modeled on) is DELIBERATELY ABSENT from this list: verified live
+        # 2026-09-06 that `scripts/test_lint_timer_recurrence.py` already
+        # exists on origin/main (PR #5734, merged) — the card's own work
+        # shipped after the run that wrote it refused to open a PR over a
+        # dirty workspace. Listing it again here would mint a pointless card
+        # against an already-covered module. The three below were found the
+        # same way (`git grep -L "def test_" scripts/*.py` with no matching
+        # `scripts/test_<name>.py`) and, like lint_timer_recurrence.py, are
+        # live CI gates (`.github/workflows/ci.yml` / `atomic-claim-check.yml`)
+        # with no test at all — the exact "untested guard" failure ADR-065
+        # exists to catch.
+        "argv": [
+            "python3", "-c",
+            "import os, sys\n"
+            "for m in sys.argv[1:]:\n"
+            "    base = os.path.splitext(os.path.basename(m))[0]\n"
+            "    t = os.path.join('scripts', f'test_{base}.py')\n"
+            "    print(('MISSING_TEST ' if not os.path.exists(t) else 'HAS_TEST ') + m)\n",
+            "scripts/check_timer_capacity.py",
+            "scripts/claim_check.py",
+            "scripts/drift_check.py",
+        ],
+        "line_re": r"^MISSING_TEST\s+\S+",
+        # NOT "split": a DRAFT class must never mint a ready, dispatchable
+        # card (build condition (b)) — it must stay on the bucket-only path
+        # (_create_parked_card: born, then immediately blocked needs_input),
+        # same mechanism and same PB-006 guarantee as parts-catalog's paused
+        # entry above. Renaming this key back to "split" is itself the arming
+        # act, and per (b) that may only happen after the captain mints the
+        # candidate-class-registry row and Ryan signs the promotion record —
+        # never by editing this file.
+        "split_DRAFT_needs_promotion": {
+            "cls": 3,
+            "artifact_re": r"^MISSING_TEST\s+(\S+)",
+            "title": "characterization tests: pin current behavior of {artifact}",
+            "receipt": (
+                "SCOPE CEILING: this card touches ONLY ONE new file — "
+                "`scripts/test_<name>.py` for `{artifact}` — and nothing "
+                "else. Do not modify `{artifact}` itself (characterizing it "
+                "means pinning what it does today, unmodified) and do not "
+                "touch any other script you notice along the way. If a real "
+                "fix looks warranted, STOP and `kanban block` describing it — "
+                "that is a different card.\n"
+                "DUPLICATE-WORK CHECK, before you start: check for an OPEN PR "
+                "that already adds `scripts/test_<name>.py` for `{artifact}`. "
+                "If one exists, STOP and `kanban block` naming it rather than "
+                "writing a second, conflicting suite.\n"
+                "PRECONDITION — the workspace must be clean BEFORE you start: "
+                "`git status --porcelain` must be empty. Harness card "
+                "t_a5d33562 (this class's own model case) completed a 20-test "
+                "suite and then refused to open a PR because the workspace "
+                "was already dirty before the run began, and pre-existing "
+                "uncommitted work must never be swept into this card's "
+                "commit. If it is not clean, STOP and `kanban block` saying "
+                "so — do not commit over it and do not clean it yourself.\n"
+                "ARTIFACT: ONE new file, `scripts/test_<name>.py`, pinning the "
+                "CURRENT behavior of `{artifact}` — read the module first and "
+                "characterize what it actually does, not what it should do. "
+                "PIN, DO NOT FIX: if you find a bug, characterize the buggy "
+                "behavior as-is and note it in a comment; this card is not "
+                "licensed to change `{artifact}`.\n"
+                "Include at least one input that PRODUCES a finding/violation "
+                "and one that produces NONE, so the suite is proven able to "
+                "both fire and stay silent — a suite that can never fail is "
+                "worthless here. Use unittest (stdlib), matching the repo's "
+                "other `scripts/test_*.py` files.\n"
+                "RECEIPT: run the new test file and PASTE THE VERBATIM pytest "
+                "(or unittest) result line showing it passes. Saying it "
+                "passes is not the receipt — the pasted output is.\n"
+                "FINISH PROTOCOL, unconditional: the PR must contain ONLY the "
+                "one new test file — no edits to `{artifact}` or any other "
+                "file. If your diff touches anything else, that is scope "
+                "overrun; drop it before you open the PR, or `kanban block` "
+                "if the module cannot be characterized without also touching "
+                "something else."
             ),
         },
     },

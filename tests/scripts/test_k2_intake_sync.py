@@ -137,3 +137,103 @@ def test_real_checker_parsers_against_recorded_output(mod):
     assert len([l for l in premise.splitlines() if re.search(specs["inbox-premise"]["line_re"], l)]) == 1
     assert re.search(specs["deferred-followups"]["summary_re"], deferred).group(1) == "46"
     assert re.search(specs["parts-catalog"]["summary_re"], parts).group(1) == "24"
+
+
+# --- card-template clauses for the 19 close causes (campaign option 1,
+# harness t_39357274/t_da2f74c4) --------------------------------------------
+#
+# Each clause below maps to a close-cause bucket recorded in
+# docs/research/2026-09-05-next-agent-build/VERIFY-code-reader.md target 5's
+# corrected bucketing (vacuous 6, hollow 3, stale/superseded 5, scope-overrun
+# 3, format/gate-parse 1, circular-cite 1 = 19). These tests render the
+# amended wiki-staleness receipt template and assert each new clause survived
+# — a template edit that silently drops a clause is worse than no edit, since
+# nothing would catch it short of a real card going wrong again.
+
+
+def _render_wiki_receipt(mod, **overrides):
+    specs = {s["key"]: s for s in mod.CHECKERS}
+    receipt = specs["wiki-staleness"]["split"]["receipt"]
+    fmt = {
+        "page": "docs/knowledge-base/example.md",
+        "sources": "`scripts/example.py`",
+        "n_sources": 1,
+    }
+    fmt.update(overrides)
+    return receipt.format(**fmt)
+
+
+def test_receipt_restates_scope_ceiling(mod):
+    """scope-overrun (3 close causes: #5655, #5656, #5659)."""
+    rendered = _render_wiki_receipt(mod)
+    assert "SCOPE CEILING" in rendered
+    assert "touches ONLY" in rendered
+    assert "#5655" in rendered and "#5656" in rendered and "#5659" in rendered
+
+
+def test_receipt_has_unconditional_finish_protocol_naming_vacuous_and_hollow(mod):
+    """vacuous (6) + hollow (3) close causes — the modal failure on this lane."""
+    rendered = _render_wiki_receipt(mod)
+    assert "FINISH PROTOCOL, unconditional" in rendered
+    assert "VACUOUS" in rendered
+    assert "HOLLOW" in rendered
+    assert "#5688" in rendered  # the hollow-shape PR
+
+
+def test_receipt_has_duplicate_work_check(mod):
+    """stale/superseded (5 close causes) — a card verifying an already-handled page."""
+    rendered = _render_wiki_receipt(mod)
+    assert "DUPLICATE-WORK CHECK" in rendered
+    assert "OPEN PR" in rendered
+    assert "kanban block" in rendered
+
+
+def test_receipt_keeps_verbatim_quote_and_not_found_rules(mod):
+    """format/gate-parse (1) + circular-cite (1) close causes."""
+    rendered = _render_wiki_receipt(mod)
+    assert "claim | file:line | quote | verdict" in rendered
+    assert "NOT FOUND" in rendered
+    assert "quote_fidelity_check.py" in rendered
+    assert "never `verified`" in rendered
+
+
+# --- DRAFT characterization-tests class: mints blocked, never ready --------
+
+
+def test_characterization_tests_class_has_no_split_key(mod):
+    """A "split" key is what lets a checker mint a READY, assigned card — the
+    routing the campaign's build conditions forbid arming for this DRAFT
+    class. Guard the key name itself so a future edit can't silently arm it
+    by renaming back to "split" without also touching this test."""
+    specs = {s["key"]: s for s in mod.CHECKERS}
+    spec = specs["characterization-tests"]
+    assert "split" not in spec
+    assert "split_DRAFT_needs_promotion" in spec
+
+
+def test_characterization_tests_mints_blocked_not_ready(mod):
+    """The draft class must go create -> block, never create -> (ready, done).
+
+    Same assertion shape as test_finding_creates_card_then_blocks_it for
+    wiki-staleness — this is the create-then-block contract (PB-006) the
+    class relies on for safety instead of any routing-code change.
+    """
+    stub = HermesStub()
+    mod._hermes = stub
+    _fix_checkers(
+        mod,
+        {
+            "characterization-tests": {
+                "count": 2,
+                "samples": [
+                    "MISSING_TEST scripts/claim_check.py",
+                    "MISSING_TEST scripts/drift_check.py",
+                ],
+            }
+        },
+    )
+    counts = mod.sync(force=True)
+    assert counts["new_cards"] == 1
+    assert counts["routed_new"] == 0  # never dispatchable — no routed mint
+    assert stub.verbs() == ["create", "block"]
+    assert "needs_input" in stub.calls[1]
