@@ -100,9 +100,56 @@ script passes `-c CTX*NP` because llama-server otherwise divides one `-c` across
 restart silently gave 2×32k, below the 64K the engine assumes).
 Memory is fine: this architecture's KV is small (16k×4 slots and 65k×1 both sat at ~74 GB used).
 
+## Alerting and the escalate gate (built 2026-09-06 04:00Z, gate verified live 04:16Z)
 
+- **Alerting:** `k2vps:/opt/t1000/home/scripts/t1000_ops_alert_pulse.py` (Hermes cron, every 30 min,
+  Telegram on change) checks `:11439/health` is ok, `:11439/v1/models` lists `qwen3.8-flash-next`
+  (a bench window left on the tunnel would fail this), and `:11435` ollama for the hermes3 aux.
+  It says CHANNEL (tunnel/box), SERVER (unhealthy), or WRONG-MODEL, pages once per distinct state,
+  and sends a 🟢 recovery line. State: `cache/ops-alert-pulse-state.json` (`flash_next_checked_at`).
+  The Spark-side `health.json` remains the local heartbeat; this is the reader it lacked.
+- **Escalate gate:** `k2vps:/opt/t1000/home/scripts/kanban_model_escalate.py` (every 3 min) no
+  longer promotes a LANE failure to a paid rung. Errors matching `infra_error_substrings`
+  (http 404, model not found, connection refused, invalid_grant, token refresh failed, unknown
+  provider, api call failed after, ...) HOLD the card where it is, print one HOLD line per task per
+  6 h (cron stdout = Telegram), and log to `kanban/model_escalate_holds.json`. The stored failure
+  error is generic (pid not alive / protocol violation); the lane error lives only in
+  `boards/<b>/logs/<tid>.log`, so the gate sniffs that tail (v2). `unavailable_providers: [xai-oauth]`
+  in `kanban/model_escalate.json` drops the grok rung until `hermes model` re-auth; the live ladder is
+  sonnet → opus. Selftest 11/11. Verified live: a card pinned to a connection-refused lane crashed
+  twice, parked `blocked`, and was HELD with 0 escalations. Both scripts live only under
+  `/opt/t1000/home/scripts` (not the T1000 repo); patch scripts are kept in
+  `docs/inference/flash-next-unit/` and backups sit beside each script.
 
-- Flip at all, and when (needs a quiet lane and ~15 min).
-- Port: re-label 11439 as the pilot endpoint, or widen the sparklink fence by one port.
-- `install.sh` needs sudo once (unit + sudoers line for the agent account).
-- Kevin's box: DS4 stays; flash-next only ties it on copyable work. Separate call.
+## Alias cleanup (done 2026-09-06 04:22Z) and the estimator label (fixed 11:09Z)
+
+All 142 live cards pinned to `gpt-oss:120b@spark` were re-pinned to `qwen3.8-flash-next@spark` via
+`hermes kanban set-model` (one audit event each). The estimator's hardcoded
+`_LOCAL_MODEL_PREFERENCE["spark"]` in `hermes_cli/kanban_estimate.py` now reads
+`("qwen3.8-flash-next", "gpt-oss:120b", "hermes3:8b-16k")` (T1000 commit e51c342f4, gateway restarted,
+verified: new cards estimate as `Spark · qwen3.8-flash-next`). The only remaining old-name references
+are the chat-profile aliases in `config.yaml` (~L729–786), which resolve to flash-next by design.
+
+## Residency heartbeat (VPS copy paused 2026-09-06 11:11Z)
+
+The `Spark residency heartbeat` Hermes cron on k2vps (`5ad27bc2a170`) runs a Mac-designed tool
+whose drift check needs `ssh` to the Spark; the VPS cannot reach the Spark, so it had self-failed
+silently since deploy (`cache/spark-residency-state.json` → `boxes: {}`). Paused. ryan-spark
+liveness is covered by the ops-pulse flash-next check above. The tool's source of truth is
+`sovereign-consulting/tools/spark-residency` on the Mac (Ryan-write-only); its `manifest/ryan-spark.yaml`
+still pins `gpt-oss:120b` and needs a rewrite for the pilot: pinned `hermes3:8b-16k` only; flash-next is a
+llama.cpp server on `:8898`, not an ollama pin; `gpt-oss-parked:120b` / `qwen38-parked:27b` are
+forbidden residents. That checkout also holds an unrelated, uncommitted nemotron-lane change from Aug 13.
+
+## Open decisions and owed items (Ryan)
+
+- Confirm the Telegram HOLD line arrived (~23:16 CDT Sep 5, "HOLD (lane failure, NOT escalated)").
+- Re-authenticate xAI on k2vps (`hermes model` as t1000); then remove `xai-oauth` from
+  `unavailable_providers` in `kanban/model_escalate.json`.
+- Optional: `sudo bash ~/models/flash-next/unit/install.sh` to move supervision from cron to systemd
+  (then delete the three cron lines).
+- Kevin's box: DS4 stays (flash-next only ties it on copyable work). Say yes and the card closes.
+- Rewrite `manifest/ryan-spark.yaml` in sovereign-consulting (see above).
+- Unrelated, surfaced by the 03:30Z kernel auto-reboot: `sovereign-mc` crash-looping on missing
+  Cloudflare Access env vars, `k2-ci-queue-monitor.service` failed after boot, and whether the
+  unattended 03:30Z reboot window is acceptable for production k2-hub.
