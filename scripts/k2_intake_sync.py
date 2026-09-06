@@ -13,7 +13,7 @@ pr-kanban-sync proved:
     a notification, and notifications never auto-dispatch (PB-006:
     create-then-block sticky; same rule as playbook repair drafting).
   - Count changes get a comment; a clean checker completes its card.
-  - Max 5 new cards per run; internal ~6h throttle (findings move daily,
+  - Max 5 new cards per run; internal ~3h throttle (findings move daily,
     the pulse fires half-hourly).
 
 Since ADR-087 a checker may ALSO carry a "split" block, and then it does two
@@ -46,6 +46,7 @@ Canonical: T1000 repo scripts/. Deploy copy: ~/.t1000/scripts/.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import re
@@ -69,7 +70,10 @@ HEARTBEAT_PATH = DESK / "cache" / "k2-intake-heartbeat.json"
 # and nothing reports it. K2_INTAKE_BOARD still overrides for a one-off.
 BOARD = os.environ.get("K2_INTAKE_BOARD", "devbot")
 HERMES = os.environ.get("K2_INTAKE_HERMES_BIN", str(Path.home() / ".local" / "bin" / "hermes"))
-THROTTLE_SECS = int(os.environ.get("K2_INTAKE_THROTTLE_SECS") or 6 * 3600)
+# 3h not 6h (Ryan, 2026-09-01): the dsh lane clears its queue in under an hour,
+# so a 6h sync left freed slots idle for most of a day; 3h costs one extra
+# read-only clone refresh per day.
+THROTTLE_SECS = int(os.environ.get("K2_INTAKE_THROTTLE_SECS") or 3 * 3600)
 MAX_NEW_CARDS_PER_RUN = 5
 
 # --- Auto-route (ADR-087, harness t_89dc4076) ------------------------------
@@ -78,11 +82,68 @@ MAX_NEW_CARDS_PER_RUN = 5
 # produces from it: one card per artifact, each naming its receipt. A checker
 # without a "split" block is bucket-only and can never mint a routed card.
 ROUTED_ASSIGNEE = os.environ.get("K2_INTAKE_ROUTED_ASSIGNEE", "dsh")
-MAX_NEW_ROUTED_PER_RUN = int(os.environ.get("K2_INTAKE_MAX_ROUTED_PER_RUN") or 3)
-MAX_ROUTED_IN_FLIGHT = int(os.environ.get("K2_INTAKE_MAX_ROUTED_IN_FLIGHT") or 6)
+# Raised 2026-09-02 (Ryan): the lane cleared its queue in under an hour at
+# 6/3 and the cap itself was the binding constraint, not available work.
+MAX_NEW_ROUTED_PER_RUN = int(os.environ.get("K2_INTAKE_MAX_ROUTED_PER_RUN") or 5)
+MAX_ROUTED_IN_FLIGHT = int(os.environ.get("K2_INTAKE_MAX_ROUTED_IN_FLIGHT") or 10)
 # After this many terminal-but-artifact-still-live outcomes, an artifact is
 # parked VISIBLY instead of re-carded forever (t_9de2917f).
 MAX_ROUTE_ATTEMPTS = int(os.environ.get("K2_INTAKE_MAX_ROUTE_ATTEMPTS") or 2)
+
+# --- Outage hold (2026-09-03) ------------------------------------------------
+# Measured 2026-09-03 ~19:30Z: the model host behind the dsh sandbox relay
+# went unreachable, and every routed card the dispatcher then claimed refused
+# at attestation within seconds — a model outage, not artifact failure. Left
+# alone, the blocked-release rule above burns an attempt per artifact for an
+# outage and can park an artifact that never got a real run. MODEL_HOST/
+# MODEL_PORT are the relay's model endpoint; K2_INTAKE_MODEL_PROBE overrides
+# them as "host:port", or disables the probe entirely with "off" (tests).
+MODEL_HOST = "100.125.80.66"
+MODEL_PORT = 11435
+_model_probe_env = (os.environ.get("K2_INTAKE_MODEL_PROBE") or "").strip()
+MODEL_PROBE_DISABLED = _model_probe_env.lower() == "off"
+if _model_probe_env and not MODEL_PROBE_DISABLED:
+    _probe_host, _, _probe_port = _model_probe_env.partition(":")
+    if _probe_host:
+        MODEL_HOST = _probe_host
+    if _probe_port:
+        MODEL_PORT = int(_probe_port)
+
+# The two refusal shapes measured on the incident (attestation refusal and a
+# bare transport error); matched as a substring against the card's latest
+# run summary so either a prefix or an embedded occurrence counts.
+OUTAGE_REFUSAL_PATTERNS = (
+    "sandbox refused: attestation failed for the dsh container: the model "
+    "endpoint is NOT reachable from the container",
+    "dsh: TRANSPORT: Connection error",
+)
+
+
+def _outage_refusal_match(summary: str | None) -> str | None:
+    """The matched pattern when `summary` reads as a model-outage refusal."""
+    if not summary:
+        return None
+    for pat in OUTAGE_REFUSAL_PATTERNS:
+        if pat in summary:
+            return pat
+    return None
+
+
+def _model_relay_reachable() -> bool:
+    """True when the dsh relay's model host is reachable right now.
+
+    K2_INTAKE_MODEL_PROBE=off disables the probe (tests) and reads as
+    reachable, so a disabled probe can never itself trigger an outage hold.
+    """
+    if MODEL_PROBE_DISABLED:
+        return True
+    import socket
+    try:
+        socket.create_connection((MODEL_HOST, MODEL_PORT), timeout=3).close()
+        return True
+    except OSError:
+        return False
+
 
 # Human-gated regardless of class (ADR-087 decision 3). Checked against the
 # repo-relative artifact path; prefix match, so a directory covers its subtree.
@@ -161,13 +222,28 @@ CHECKERS = [
                 "`## Verification` section at the end of the file. Not in your "
                 "reply, not in a kanban comment, not in the PR description — "
                 "those are not the artifact and do not survive into the repo. "
-                "ONE ROW PER CLAIM, each row naming the claim, the source file "
-                "AND line number you checked it against, and the verdict "
-                "(verified / corrected / removed). A summary such as 'all "
+                "ONE ROW PER CLAIM. Each row carries FOUR cells: the claim, the "
+                "source `file:line` you checked it against, a VERBATIM QUOTE "
+                "— a SHORT SPAN (at most ~40 characters, copied exactly, no `...` elision) "
+                "from that exact line, in backticks — and the verdict "
+                "(verified / corrected / removed).\n"
+                "     THE QUOTE IS MANDATORY AND IT IS THE POINT: you cannot "
+                "quote a line you did not open, so the quote is what makes the "
+                "lookup real. It is also checked mechanically — the quoted text "
+                "must actually appear at that line, and a row whose quote does "
+                "not match is refused. Measured 2026-09-01: given the file, this "
+                "model refuses to invent a citation 5 times out of 5; asked for a "
+                "line number WITHOUT being made to read it, it invented five in a "
+                "single PR (#5860, cited pr-gate.yml:103 which is actually "
+                "`uses: actions/setup-python@v5`). The quote closes that gap. Quote a SPAN, not the whole line: on 2026-09-02 a 300-character table row was quoted with `...` in the middle (#5900) and refused — an elided quote is a summary, not evidence the line was read. A claim of ABSENCE (\"markers resolved\", \"no longer present\") cannot be quoted at all: write NOT FOUND + `human`, or cite the commit that removed the thing. EVERY ROW CARRIES ITS OWN CLAIM TEXT — a second source for the same claim repeats the claim in its own row; a blank claim cell (seen 2026-09-02, #5902) is a row that verifies nothing.\n"
+                "     If you cannot find a supporting line, write NOT FOUND in "
+                "the quote cell and `human` in the verdict cell. That is a "
+                "CORRECT and expected answer — it is never a reason to invent "
+                "a line number. A summary such as 'all "
                 "claims checked, no discrepancies' is NOT a receipt — it "
                 "asserts the check without evidence anyone can re-run, and "
                 "will be rejected. If a `## Verification` section already "
-                "exists, REPLACE it rather than stacking a second one.\n"
+                "exists, REPLACE it rather than stacking a second one - and when replacing, CARRY EVERY EXISTING ROW FORWARD. A row you cannot re-confirm gets its verdict cell changed to `stale` or `human`, NEVER silently deleted: evidence that shrinks while last_verified advances is quiet evidence-loss (measured 2026-08-31, two PRs in one run deleted rows whose cited code was unchanged at the cited lines). Delete a row ONLY when its cited target no longer exists, and say so in the verdict cell: removed - target gone.\n"
                 "  3. CHANGE NOTHING ELSE. Add your section and edit the two "
                 "frontmatter dates; leave every other byte of the document "
                 "exactly as you found it. Do not reflow, retitle, or 'tidy' "
@@ -195,6 +271,33 @@ CHECKERS = [
         "title": "inbox items with unprotected progress claims (no Premise line)",
         "argv": ["python3", "scripts/inbox_premise_check.py"],
         "line_re": r"warning:",
+    },
+    {
+        # Expansion pick 1 (Ryan, 2026-08-31, harness t_eb28a382): the wiring
+        # graph's evidence cites drift under every merge and the standing tax
+        # was 2,463 DRIFT findings blocking innocent PRs (#5797). The repair
+        # is fully deterministic (wiring_check.py --fix-all: unique nearest
+        # match repins; ties freeze for a human), so this checker is the FEED
+        # half only — visibility with a count; the repair command is in the
+        # title so the bucket card carries its own runbook.
+        # Added 2026-09-01 after a peer session (PR #4279) lost a CI round to
+        # it: a wiring-graph FATAL — an evidence-token whose cited line was
+        # rewritten (a module docstring, say) — surfaces only as ROOT-TESTS red
+        # via k2-hub/tests -> test_wiring_check.py, never through any check
+        # named for the wiring graph, and the drift checker below watches
+        # DRIFT lines only. A FATAL is the graph being INVALID, not stale, and
+        # it blocks every PR's root-tests until repaired — so it gets its own
+        # key, minted ahead of drift, with the repair in the title.
+        "key": "wiring-fatal",
+        "title": "wiring-graph FATAL evidence-token(s): the graph is INVALID and root-tests is red for everyone until repaired (repair: on a branch, python3 scripts/wiring_check.py --fix for the cited rows, or repoint the token by hand when the cited text was rewritten; commit only docs/sovereign/wiring/*.tsv)",
+        "argv": ["python3", "scripts/wiring_check.py", "--check"],
+        "line_re": r"^FATAL \[",
+    },
+    {
+        "key": "wiring-drift",
+        "title": "drifted wiring-graph evidence cells (deterministic repair: python3 scripts/wiring_check.py --fix-all, commit only docs/sovereign/wiring/*.tsv; TIE/COLLAPSE leftovers need a human)",
+        "argv": ["python3", "scripts/wiring_check.py", "--check"],
+        "line_re": r"^DRIFT \[evidence-drift\]",
     },
     {
         "key": "deferred-followups",
@@ -450,6 +553,244 @@ def _card_status(card_id: str) -> str | None:
         return None
 
 
+def _card_last_run_summary(card_id: str) -> str | None:
+    """Latest non-null task_runs.summary for a card; None on any failure.
+
+    Same read-only peek as `_card_status`, same ordering the kanban engine's
+    own `latest_summary()` uses (hermes_cli/kanban_db.py): most recent run by
+    `ended_at`, falling back to `started_at`/`id` for ties or unfinished
+    rows. None on any failure so a caller that cannot read it behaves
+    exactly as if no summary existed — no outage match, no special-cased
+    slot release.
+    """
+    try:
+        import sqlite3
+        db = DESK / "kanban" / "boards" / BOARD / "kanban.db"
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = conn.execute(
+            "select summary from task_runs where task_id = ? "
+            "and summary is not null and summary != '' "
+            "order by coalesce(ended_at, started_at) desc, id desc limit 1",
+            (card_id,),
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _card_last_event_ts(card_id: str) -> int | None:
+    """Epoch seconds of the most recent task_events row for this card; None on failure.
+
+    Same read-only peek as `_card_status`. A status flip, a comment, a
+    heartbeat-driven event — anything — moves this forward, so it stands in
+    for "has this card shown any sign of life" without caring which kind of
+    event did it. None on any failure, same fail-closed contract as the other
+    peeks here.
+    """
+    try:
+        import sqlite3
+        db = DESK / "kanban" / "boards" / BOARD / "kanban.db"
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = conn.execute(
+            "select max(created_at) from task_events where task_id = ?",
+            (card_id,),
+        ).fetchone()
+        conn.close()
+        return row[0] if row and row[0] is not None else None
+    except Exception:
+        return None
+
+
+def _card_is_stale(held_clock: dict, rkey: str, card_id: str, now: float) -> bool:
+    """True when a held NON-TERMINAL card has shown no activity for a full
+    throttle window (t_b20d2a14).
+
+    A card that is ready/claimed/running/triage, or blocked with no PR yet,
+    holds its routed slot unconditionally — the absence of a PR only means
+    the work isn't finished, not that it failed. Measured 2026-09-05: three
+    duplicate cards (#6131, #6152, #6170) were minted because the old zombie
+    scan read "blocked, no PR" as a zombie on first sight and freed the slot
+    immediately, and the very next 3h pulse — the throttle's OWN cadence —
+    was enough of a gap to look like the artifact was clear again.
+
+    The one thing that DOES eventually free a stuck slot is genuine
+    inactivity. `held_clock[rkey]` remembers the last observed
+    `_card_last_event_ts` and the time we first saw it stop changing; any
+    real activity — a status flip, a comment, anything — resets the clock,
+    so a long but ACTIVE job is never punished. It only reads stale once the
+    card has gone quiet for a whole THROTTLE_SECS window, measured from that
+    last observed change — not from when the card was originally minted, so
+    a card that has been legitimately working for days is judged on its own
+    recent activity, never on its age.
+
+    Fails closed: an unreadable event clock never advances the clock toward
+    staleness, matching `_card_status`/`_pr_state`'s own None-means-hold
+    contract. Mutates `held_clock` in place, same style as the other state
+    dicts `sync()` threads through.
+    """
+    last_change = _card_last_event_ts(card_id)
+    if last_change is None:
+        held_clock.setdefault(rkey, {"ts": None, "since": now})
+        return False
+    prev = held_clock.get(rkey)
+    if prev is None or prev.get("ts") != last_change:
+        held_clock[rkey] = {"ts": last_change, "since": now}
+        return False
+    return (now - prev.get("since", now)) >= THROTTLE_SECS
+
+
+_PR_URL_RE = re.compile(r"pull/(\d+)")
+
+
+def _card_pr_number(card_id: str) -> int | None:
+    """PR number this card produced, or None if it never named one.
+
+    Same read-only peek as `_card_status`. The wrapper records its PR in the
+    card's terminal result ("... git/PR: https://.../pull/5857"); a
+    reviewer-mediated or hand-finished card can leave it only in a comment,
+    so both are read, newest comment first. None on ANY failure — the caller
+    then behaves exactly as it did before this helper existed.
+    """
+    try:
+        import sqlite3
+        db = DESK / "kanban" / "boards" / BOARD / "kanban.db"
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "select result from tasks where id = ?", (card_id,)
+            ).fetchone()
+            m = _PR_URL_RE.search(row[0]) if row and row[0] else None
+            if m:
+                return int(m.group(1))
+            for (body,) in conn.execute(
+                "select body from task_comments where task_id = ? "
+                "order by created_at desc",
+                (card_id,),
+            ):
+                m = _PR_URL_RE.search(body or "")
+                if m:
+                    return int(m.group(1))
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    return None
+
+
+def _bot_env(path: Path) -> dict[str, str]:
+    """Parse a KEY=VALUE desk env file (lines may carry a `export ` prefix).
+
+    Values are credentials and are never printed by anything here.
+    """
+    out: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        ln = raw.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if ln.startswith("export "):
+            ln = ln[len("export "):].lstrip()
+        key, sep, val = ln.partition("=")
+        if not sep:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out[key.strip()] = val
+    return out
+
+
+def _mint_bot_token() -> tuple[object, str]:
+    """(wrapper module, installation token) from the dsh lane's own App identity.
+
+    Borrowed rather than provisioned: the token that opened the PR we are
+    about to read is minted by the deployed wrapper from
+    ~/secrets/dsh-bot.env, so reading the PR back needs no second credential
+    to rotate or leak. Raises on anything missing — the caller fails closed.
+    """
+    import importlib.util
+
+    env_path = Path(
+        os.environ.get("K2_INTAKE_BOT_ENV") or (HOME / "secrets" / "dsh-bot.env")
+    ).expanduser()
+    env = _bot_env(env_path)
+    app_id = (env.get("DSH_BOT_APP_ID") or "").strip()
+    installation_id = (env.get("DSH_BOT_INSTALLATION_ID") or "").strip()
+    key_path = Path((env.get("DSH_BOT_APP_KEY_PATH") or "").strip()).expanduser()
+    if not app_id or not installation_id or not key_path.is_file():
+        raise RuntimeError("bot identity incomplete")
+    wrapper_path = Path(
+        os.environ.get("K2_INTAKE_WRAPPER_PATH") or (HOME / "bin" / "dsh_kanban_worker.py")
+    ).expanduser()
+    spec = importlib.util.spec_from_file_location(
+        "dsh_kanban_worker_for_intake", wrapper_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("wrapper not importable")
+    wrapper = importlib.util.module_from_spec(spec)
+    # Register BEFORE exec: the wrapper declares @dataclass classes, and the
+    # dataclass machinery looks the class's module up in sys.modules — an
+    # unregistered module raises AttributeError on NoneType (measured on the
+    # first production run, 2026-09-01 21:25Z, held as dedup_unverified).
+    sys.modules[spec.name] = wrapper
+    spec.loader.exec_module(wrapper)
+    return wrapper, wrapper._mint_installation_token(app_id, installation_id, key_path)
+
+
+def _pr_state(number: int) -> str | None:
+    """"open" | "closed" | "merged" for a K2 PR; None when unreadable.
+
+    Fail closed in the same direction as `_card_status`: a missing token, an
+    unreadable env file, an HTTP error or an unexpected payload all read as
+    None, and the caller HOLDS the slot rather than acting on a guess. Never
+    logs the token; an error names only its exception type and the PR number.
+    """
+    import urllib.request
+
+    token = (os.environ.get("K2_INTAKE_GH_TOKEN") or "").strip()
+    wrapper = None
+    minted = False
+    if not token:
+        try:
+            wrapper, token = _mint_bot_token()
+            minted = True
+        except Exception as exc:
+            print(
+                f"WARN k2-intake could not mint a token to read PR #{number}: "
+                f"{type(exc).__name__}"
+            )
+            return None
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/joinsov/kevin-real-estate-tools/"
+            f"pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "k2-intake-sync",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:  # fixed github.com host
+            if resp.status != 200:
+                return None
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("merged_at"):
+            return "merged"
+        state = data.get("state")
+        return state if isinstance(state, str) and state else None
+    except Exception as exc:
+        print(f"WARN k2-intake PR #{number} state unreadable: {type(exc).__name__}")
+        return None
+    finally:
+        if minted and wrapper is not None:
+            try:
+                wrapper._revoke_installation_token(token)
+            except Exception:
+                pass
+
+
 def _board_has_workdir() -> bool:
     """True when this board binds tasks to a repo checkout.
 
@@ -536,15 +877,75 @@ def _create_routed_card(spec: dict, artifact: str, sources: list[str] | None = N
     return m.group(1)
 
 
+def _page_has_open_card(rkey: str, last_card: dict) -> str | None:
+    """None when `rkey` is clear to mint; otherwise why the mint is refused.
+
+    Measured 2026-09-04/05 (t_1817dcad): the zombie-release scan in `sync()`
+    frees `routed[rkey]` the moment a card reads blocked-with-no-PR, or
+    done/archived-with-no-open-PR — a decision about IN-FLIGHT BUDGET
+    (freeing capacity for OTHER artifacts), not a claim that the PAGE is
+    finished. Freeing that slot let the very next mint pass treat the page
+    as brand new: cards t_d876036f (11:43) and t_80567e48 (14:47) both
+    targeted docs/knowledge-base/llm-context-windows-and-prompt-caps.md and
+    both opened PRs (#6156, #6170) stamping the same file with different
+    verification tables. `last_card` mirrors `routed[rkey]["card"]` but is
+    NEVER cleared by a free — only ever overwritten by the next mint for
+    that rkey — so this check can re-read the PRIOR card's live status/PR
+    directly instead of trusting a slot flag that capacity-freeing already
+    invalidated. One page keeps at most one open card regardless of how many
+    times its slot has been freed for capacity: the prior card must reach
+    done/archived with its PR merged/closed (or never opened one), or be
+    archived outright, before the page is eligible again. Fails closed like
+    `_card_status`/`_pr_state` themselves: an unreadable board or PR read
+    refuses the mint too, rather than guessing the page is clear.
+    """
+    prev = last_card.get(rkey)
+    if not prev:
+        return None
+    status = _card_status(prev)
+    if status is None:
+        return "unreadable"
+    if status not in ("done", "archived"):
+        return "open"
+    pr = _card_pr_number(prev)
+    if pr is None:
+        return None
+    st = _pr_state(pr)
+    if st is None:
+        return "unreadable"
+    if st == "open":
+        return "open"
+    return None
+
+
 def sync(force: bool = False) -> dict:
     state = _load_state()
     now = time.time()
     if not force and now - state.get("last_run_ts", 0) < THROTTLE_SECS:
+        # Tick-stamp the heartbeat even when throttled: without it, a
+        # throttled pulse and a DEAD one are indistinguishable for up to
+        # THROTTLE_SECS (caught 2026-08-31 — a 2.5h-old heartbeat read as a
+        # stall). `ts` keeps meaning "last real sync"; `tick_ts` means "the
+        # cron reached me". Freshness bars: tick_ts ~90min, ts ~7h.
+        try:
+            import json as _json
+            hb = _json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            hb = {}
+        hb["tick_ts"] = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        hb["tick_note"] = "throttled (by design, ~3h sync interval)"
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_PATH.write_text(_json.dumps(hb), encoding="utf-8")
         return {"skipped": "throttled"}
     counts = {
         "checkers": 0, "failed": 0, "new_cards": 0, "updated": 0, "completed": 0,
         "routed_new": 0, "routed_cleared": 0, "routed_denied": 0,
         "slots_refreed": 0, "held_blocked": 0, "parked_failing": 0, "parked_skipped": 0,
+        "dedup_inflight": 0, "dedup_unverified": 0, "dedup_merged": 0,
+        "blocked_released": 0,
+        "outage_hold": 0, "outage_released": 0, "outage_deferred": 0,
+        "skipped_open_page": 0, "skipped_unreadable": 0,
+        "dedup_nonterminal": 0, "throttle_held": 0,
     }
     cards = state.setdefault("cards", {})
     routed = state.setdefault("routed", {})
@@ -552,6 +953,30 @@ def sync(force: bool = False) -> dict:
     routed_this_run = 0
     attempts = state.setdefault("route_attempts", {})
     parked = state.setdefault("parked_artifacts", {})
+    # rkey -> {"ts": last observed _card_last_event_ts, "since": when it
+    # stopped changing} for a card currently being held non-terminal (t_b20d2a14).
+    # See `_card_is_stale`.
+    held_clock = state.setdefault("held_clock", {})
+    # rkey -> card_id for the LAST card minted per page, kept even after
+    # `routed[rkey]` is freed (see `_page_has_open_card`, t_1817dcad).
+    # Backfilled from `routed` every run so a state file from before this
+    # field existed — or a slot this same pulse is about to free — still
+    # has a pointer to check.
+    last_card = state.setdefault("last_routed_card", {})
+    for _rk, _info in routed.items():
+        last_card[_rk] = _info.get("card")
+    # Probed at most once per pulse, and only if a split checker actually has
+    # a live artifact that could mint — a checker with nothing to mint has no
+    # reason to pay for a network round trip, and most pulses (and every
+    # bucket-only checker) never touch it at all.
+    outage_seen_this_pulse = False
+    _probe_memo: dict[str, bool] = {}
+
+    def _relay_probe_ok_once() -> bool:
+        if "ok" not in _probe_memo:
+            _probe_memo["ok"] = _model_relay_reachable()
+        return _probe_memo["ok"]
+
     for spec in CHECKERS:
         counts["checkers"] += 1
         finding = run_checker(spec, CLONE)
@@ -633,6 +1058,7 @@ def sync(force: bool = False) -> dict:
             del routed[rkey]
             attempts.pop(rkey, None)
             parked.pop(rkey, None)
+            held_clock.pop(rkey, None)
             counts["routed_cleared"] += 1
 
         # A surviving entry is in flight ONLY while its card is still open.
@@ -644,18 +1070,126 @@ def sync(force: bool = False) -> dict:
         # neither clear nor re-mint. A terminal card + live artifact is a
         # zombie slot: free it, count the attempt, and after
         # MAX_ROUTE_ATTEMPTS park the artifact VISIBLY rather than re-carding
-        # a failure forever. Blocked cards keep their slot (a human owes them
-        # an unblock) but are counted in the heartbeat, never silent.
+        # a failure forever. A blocked card only keeps its slot while a PR is
+        # actually open awaiting a human (a fix-round mid-review); measured
+        # 2026-09-03 (t_5c1dbcd7): all ten MAX_ROUTED_IN_FLIGHT slots were
+        # held by blocked cards that had ended in an honest wrapper gate
+        # refusal and never opened a PR at all — the router stalled with
+        # nothing to show for it. A blocked card with no PR, or a PR closed
+        # unmerged, is a finished attempt exactly like a failed done/archived
+        # card, so it is released the same way.
         for rkey in [k for k in routed if k.startswith(f"{spec['key']}::")]:
             zcard = routed[rkey]["card"]
             status = _card_status(zcard)
             if status == "blocked":
-                counts["held_blocked"] += 1
-                continue
-            if status in ("done", "archived"):
+                outage_pat = _outage_refusal_match(_card_last_run_summary(zcard))
+                if outage_pat:
+                    # A model outage, not artifact failure: free the slot
+                    # without charging an attempt or parking — the artifact
+                    # never got a real run.
+                    del routed[rkey]
+                    held_clock.pop(rkey, None)
+                    counts["slots_refreed"] += 1
+                    counts["outage_released"] += 1
+                    outage_seen_this_pulse = True
+                    print(
+                        f"WARN k2-intake outage-released (card {zcard} "
+                        f"blocked, matched {outage_pat!r}): {rkey}"
+                    )
+                    continue
+                pr = _card_pr_number(zcard)
+                if pr is not None:
+                    st = _pr_state(pr)
+                    if st == "open":
+                        counts["held_blocked"] += 1
+                        continue
+                    if st is None:
+                        counts["dedup_unverified"] += 1
+                        print(
+                            f"WARN k2-intake holding slot for {rkey}: card "
+                            f"{zcard} blocked but PR #{pr} state was "
+                            f"unreadable"
+                        )
+                        continue
+                    if st == "merged":
+                        del routed[rkey]
+                        held_clock.pop(rkey, None)
+                        counts["dedup_merged"] += 1
+                        counts["slots_refreed"] += 1
+                        print(
+                            f"K2 INTAKE freed slot (card {zcard} blocked, PR "
+                            f"#{pr} merged) but {rkey} still reads live — it "
+                            f"may re-mint"
+                        )
+                        continue
+                    # st == "closed" (unmerged): a definitively finished
+                    # attempt — release immediately, no staleness grace
+                    # needed, same as before.
+                    tries = attempts.get(rkey, 0) + 1
+                    attempts[rkey] = tries
+                    del routed[rkey]
+                    held_clock.pop(rkey, None)
+                    counts["slots_refreed"] += 1
+                    counts["blocked_released"] += 1
+                    if tries >= MAX_ROUTE_ATTEMPTS:
+                        parked[rkey] = {
+                            "card": zcard, "tries": tries,
+                            "why": f"card blocked x{tries}, PR #{pr} closed unmerged",
+                        }
+                        counts["parked_failing"] += 1
+                        print(f"WARN k2-intake PARKED after {tries} attempts: {rkey}")
+                    else:
+                        print(
+                            f"K2 INTAKE refreed zombie slot (card {zcard} "
+                            f"blocked, PR #{pr} closed unmerged): {rkey}"
+                        )
+                    continue
+                # pr is None: never opened one. Blocked is a normal mid-run
+                # state (needs_input, a paused step, awaiting a dependency),
+                # not proof of a zombie — hold it like any other non-terminal
+                # status below (t_b20d2a14) instead of releasing on first
+                # sight.
+            elif status in ("done", "archived"):
+                # A done card whose PR is still OPEN is IN FLIGHT, not failed.
+                # Measured 2026-09-01: this loop refreed the slot for card
+                # t_4588f937 whose PR (#5857) had simply not merged yet — the
+                # artifact still read stale BECAUSE the fix was unmerged — and
+                # the next pass minted a second card for the same page. Two
+                # agents editing one file, and the second PR (#5860) fabricated
+                # its citations. A terminal card is only a zombie once its PR
+                # is closed unmerged, or if it never opened one at all.
+                pr = _card_pr_number(zcard)
+                if pr is not None:
+                    st = _pr_state(pr)
+                    if st == "open":
+                        counts["dedup_inflight"] += 1
+                        print(
+                            f"K2 INTAKE in-flight (card {zcard} done, PR #{pr} "
+                            f"open): {rkey}"
+                        )
+                        continue
+                    if st is None:
+                        counts["dedup_unverified"] += 1
+                        print(
+                            f"WARN k2-intake holding slot for {rkey}: card "
+                            f"{zcard} {status} but PR #{pr} state was unreadable"
+                        )
+                        continue
+                    if st == "merged":
+                        del routed[rkey]
+                        held_clock.pop(rkey, None)
+                        counts["dedup_merged"] += 1
+                        counts["slots_refreed"] += 1
+                        print(
+                            f"K2 INTAKE freed slot (card {zcard} {status}, PR "
+                            f"#{pr} merged) but {rkey} still reads live — it "
+                            f"may re-mint"
+                        )
+                        continue
                 tries = attempts.get(rkey, 0) + 1
                 attempts[rkey] = tries
                 del routed[rkey]
+                held_clock.pop(rkey, None)
                 counts["slots_refreed"] += 1
                 if tries >= MAX_ROUTE_ATTEMPTS:
                     parked[rkey] = {"card": zcard, "tries": tries,
@@ -664,43 +1198,103 @@ def sync(force: bool = False) -> dict:
                     print(f"WARN k2-intake PARKED after {tries} attempts: {rkey}")
                 else:
                     print(f"K2 INTAKE refreed zombie slot (card {zcard} {status}): {rkey}")
+                continue
+            else:
+                # ready/claimed/running/triage/todo/scheduled: no completed-
+                # vs-failed signal exists yet at all — nothing to check a PR
+                # against, so fall straight to the same staleness watch below.
+                pass
+
+            # Reached only for a card that is NON-TERMINAL and — if blocked —
+            # has never opened a PR: hold the slot unconditionally, regardless
+            # of PR state, until it reaches done/archived or goes quiet for a
+            # full throttle window (t_b20d2a14; see `_card_is_stale`).
+            counts["dedup_nonterminal"] += 1
+            if not _card_is_stale(held_clock, rkey, zcard, now):
+                counts["throttle_held"] += 1
+                continue
+            tries = attempts.get(rkey, 0) + 1
+            attempts[rkey] = tries
+            del routed[rkey]
+            held_clock.pop(rkey, None)
+            counts["slots_refreed"] += 1
+            if tries >= MAX_ROUTE_ATTEMPTS:
+                parked[rkey] = {
+                    "card": zcard, "tries": tries,
+                    "why": f"card {status} x{tries}, no activity for a full throttle window",
+                }
+                counts["parked_failing"] += 1
+                print(f"WARN k2-intake PARKED after {tries} attempts (stalled {status}): {rkey}")
+            else:
+                print(
+                    f"K2 INTAKE refreed stalled slot (card {zcard} {status}, "
+                    f"no activity): {rkey}"
+                )
         in_flight = sum(1 for k in routed if k.startswith(f"{spec['key']}::"))
-        for artifact in live:
-            rkey = _routed_key(spec["key"], artifact)
-            if rkey in routed:
-                continue
-            if rkey in parked:
-                counts["parked_skipped"] += 1
-                continue
-            if is_denied(artifact):
-                counts["routed_denied"] += 1
-                continue
-            if routed_this_run >= MAX_NEW_ROUTED_PER_RUN:
+        if outage_seen_this_pulse or (live and not _relay_probe_ok_once()):
+            # An outage this pulse (a refusal seen, or the relay probe
+            # itself failing) means minting a new routed card would just
+            # hand a worker the same dead relay. Bucket/clear/dedup logic
+            # above is untouched — only new-card minting is held.
+            counts["outage_hold"] = 1
+            deferred = [
+                a for a in live
+                if _routed_key(spec["key"], a) not in routed
+                and _routed_key(spec["key"], a) not in parked
+                and not is_denied(a)
+            ]
+            if deferred:
+                counts["outage_deferred"] += len(deferred)
                 print(
-                    f"WARN k2-intake routed per-run cap reached; deferring "
-                    f"{spec['key']} ({len(live)} artifacts live)"
+                    f"WARN k2-intake outage hold "
+                    f"({'refusal seen' if outage_seen_this_pulse else 'relay probe failed'}); "
+                    f"deferring {len(deferred)} new routed card(s) for {spec['key']}"
                 )
-                break
-            if in_flight >= MAX_ROUTED_IN_FLIGHT:
+        else:
+            for artifact in live:
+                rkey = _routed_key(spec["key"], artifact)
+                if rkey in routed:
+                    continue
+                if rkey in parked:
+                    counts["parked_skipped"] += 1
+                    continue
+                skip_reason = _page_has_open_card(rkey, last_card)
+                if skip_reason == "open":
+                    counts["skipped_open_page"] += 1
+                    continue
+                if skip_reason == "unreadable":
+                    counts["skipped_unreadable"] += 1
+                    continue
+                if is_denied(artifact):
+                    counts["routed_denied"] += 1
+                    continue
+                if routed_this_run >= MAX_NEW_ROUTED_PER_RUN:
+                    print(
+                        f"WARN k2-intake routed per-run cap reached; deferring "
+                        f"{spec['key']} ({len(live)} artifacts live)"
+                    )
+                    break
+                if in_flight >= MAX_ROUTED_IN_FLIGHT:
+                    print(
+                        f"WARN k2-intake routed in-flight cap reached for "
+                        f"{spec['key']} ({in_flight}); deferring the rest"
+                    )
+                    break
+                card_id = _create_routed_card(
+                    spec, artifact, (finding.get("sources_by_artifact") or {}).get(artifact)
+                )
+                if not card_id:
+                    print(f"WARN k2-intake could not mint routed card for {artifact}")
+                    continue
+                routed[rkey] = {"card": card_id, "artifact": artifact}
+                last_card[rkey] = card_id
+                routed_this_run += 1
+                in_flight += 1
+                counts["routed_new"] += 1
                 print(
-                    f"WARN k2-intake routed in-flight cap reached for "
-                    f"{spec['key']} ({in_flight}); deferring the rest"
+                    f"K2 INTAKE routed {BOARD}/{card_id} -> {ROUTED_ASSIGNEE}: "
+                    f"{artifact} (class {spec['split']['cls']})"
                 )
-                break
-            card_id = _create_routed_card(
-                spec, artifact, (finding.get("sources_by_artifact") or {}).get(artifact)
-            )
-            if not card_id:
-                print(f"WARN k2-intake could not mint routed card for {artifact}")
-                continue
-            routed[rkey] = {"card": card_id, "artifact": artifact}
-            routed_this_run += 1
-            in_flight += 1
-            counts["routed_new"] += 1
-            print(
-                f"K2 INTAKE routed {BOARD}/{card_id} -> {ROUTED_ASSIGNEE}: "
-                f"{artifact} (class {spec['split']['cls']})"
-            )
     state["last_run_ts"] = now
     _save_state(state)
     HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
