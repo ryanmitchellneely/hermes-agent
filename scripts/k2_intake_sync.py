@@ -414,9 +414,13 @@ CHECKERS = [
         # against an already-covered module. The three below were found the
         # same way (`git grep -L "def test_" scripts/*.py` with no matching
         # `scripts/test_<name>.py`) and, like lint_timer_recurrence.py, are
-        # live CI gates (`.github/workflows/ci.yml` / `atomic-claim-check.yml`)
-        # with no test at all — the exact "untested guard" failure ADR-065
-        # exists to catch.
+        # live gates with no test at all: check_timer_capacity.py and
+        # claim_check.py run in `.github/workflows/ci.yml` /
+        # `atomic-claim-check.yml`, but drift_check.py's actual gate is
+        # `.githooks/pre-push:221` — NOT either named workflow (corrected
+        # 2026-09-06, router-templates review r1, after the first version of
+        # this comment misnamed it) — the exact "untested guard" failure
+        # ADR-065 exists to catch.
         "argv": [
             "python3", "-c",
             "import os, sys\n"

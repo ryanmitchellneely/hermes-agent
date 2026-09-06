@@ -139,6 +139,27 @@ def test_real_checker_parsers_against_recorded_output(mod):
     assert re.search(specs["parts-catalog"]["summary_re"], parts).group(1) == "24"
 
 
+def test_characterization_tests_parser_against_recorded_output(mod):
+    """Same regression-pin shape as the four checkers above (router-templates
+    review r1, nit 1): a recorded output sample for the checker's own
+    `argv` one-liner, parsed by `line_re`, pinned against an expected count.
+    HAS_TEST lines must NOT count — only MISSING_TEST lines are findings."""
+    import re
+    characterization = (
+        "MISSING_TEST scripts/check_timer_capacity.py\n"
+        "HAS_TEST scripts/wiki_staleness_check.py\n"
+        "MISSING_TEST scripts/claim_check.py\n"
+        "MISSING_TEST scripts/drift_check.py\n"
+    )
+    specs = {s["key"]: s for s in mod.CHECKERS}
+    matches = [
+        l for l in characterization.splitlines()
+        if re.search(specs["characterization-tests"]["line_re"], l)
+    ]
+    assert len(matches) == 3
+    assert all(m.startswith("MISSING_TEST") for m in matches)
+
+
 # --- card-template clauses for the 19 close causes (campaign option 1,
 # harness t_39357274/t_da2f74c4) --------------------------------------------
 #
@@ -235,5 +256,55 @@ def test_characterization_tests_mints_blocked_not_ready(mod):
     counts = mod.sync(force=True)
     assert counts["new_cards"] == 1
     assert counts["routed_new"] == 0  # never dispatchable — no routed mint
+    assert stub.verbs() == ["create", "block"]
+    assert "needs_input" in stub.calls[1]
+
+
+def test_characterization_tests_never_mints_ready_even_with_artifacts(mod, monkeypatch):
+    """Second parked-path pin (router-templates review r1, nit 2), independent
+    of the literal "split" key the class-shape test above guards.
+
+    The critic's own mutation testing (mutation 1) found that the sync-path
+    test above alone would NOT catch an accidental "split" rename, because
+    its stubbed finding carries no "artifacts" key: with the guard mutated
+    away, the splitter loop still iterates zero items on an empty list and
+    the test still passes trivially. This test supplies a real "artifacts"
+    list — the shape a "split"-armed checker needs to mint a routed card —
+    and also forces the two preconditions `_create_routed_card` gates on
+    (`_board_has_workdir`, `_model_relay_reachable`) to succeed, exactly as
+    the critic's own ad hoc mutation driver had to, so a sandbox with no
+    board workdir or no tailnet route can't hide a future arming bug behind
+    an unrelated "can't mint anyway" refusal. On the CODE AS SHIPPED here
+    (the key is "split_DRAFT_needs_promotion", not "split"), `spec.get
+    ("split")` is falsy and `sync()` never reaches any of this — the point
+    of stubbing it is that IF a future edit renamed the key back to "split",
+    this test would then observe the mint attempt directly and fail,
+    catching it independently of the key-name guard above: no card may end
+    `ready`, every minted card stays blocked needs_input, i.e. the class
+    stays "not promoted" until a human arms it deliberately.
+    """
+    monkeypatch.setattr(mod, "_board_has_workdir", lambda: True)
+    monkeypatch.setattr(mod, "_model_relay_reachable", lambda: True)
+    stub = HermesStub()
+    mod._hermes = stub
+    _fix_checkers(
+        mod,
+        {
+            "characterization-tests": {
+                "count": 2,
+                "samples": [
+                    "MISSING_TEST scripts/claim_check.py",
+                    "MISSING_TEST scripts/drift_check.py",
+                ],
+                "artifacts": [
+                    "scripts/claim_check.py",
+                    "scripts/drift_check.py",
+                ],
+            }
+        },
+    )
+    counts = mod.sync(force=True)
+    assert counts["new_cards"] == 1
+    assert counts["routed_new"] == 0
     assert stub.verbs() == ["create", "block"]
     assert "needs_input" in stub.calls[1]
