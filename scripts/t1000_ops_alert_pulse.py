@@ -41,6 +41,12 @@ READONLY_CLONE_STALE_SECS = int(os.environ.get("READONLY_CLONE_STALE_SECS") or 2
 # Distillery intake sweep runs every 6h (hermes cron 534f64030bae); two missed
 # ticks is the page threshold.
 DISTILLERY_INTAKE_STALE_SECS = int(os.environ.get("DISTILLERY_INTAKE_STALE_SECS") or 13 * 3600)
+# Fleet-economics weekly heartbeat (t_da2f74c4): t1000_fleet_economics_weekly.py
+# runs Mondays 13:00 local (hermes cron fd3903262e8b). Two missed Mondays is
+# the page threshold, hence the 8-day default (not 7 — a slightly late Monday
+# run should not page every pulse until it does).
+FLEET_ECON_STALE_SECS = int(os.environ.get("FLEET_ECON_STALE_SECS") or 8 * 24 * 3600)
+FLEET_ECON_HEARTBEAT_PATH = DESK / "cache" / "fleet-economics-weekly-heartbeat.json"
 # Failure-playbook retrieval sweep (t_c3a4b01d) — same Track C piggyback:
 # comments known-failure diagnoses onto blocked/crashed cards; its stdout
 # (hits + stale-entry warns) is a Telegram-worthy surface.
@@ -337,6 +343,57 @@ def _distillery_intake() -> list[str]:
         state_path.write_text(json.dumps(st, indent=2) + "\n", encoding="utf-8")
     except OSError:
         pass
+    return warns
+
+
+def _fleet_economics_heartbeat() -> list[str]:
+    """Fleet-economics weekly heartbeat (t_da2f74c4).
+
+    t1000_fleet_economics_weekly.py answers "how is the fleet's model economy
+    going" and is scheduled Mondays 13:00 local (hermes cron fd3903262e8b),
+    writing {ts, week, inputs: {name: {ok, newest, note}}} to
+    cache/fleet-economics-weekly-heartbeat.json on every run, clean or
+    degraded. This leg pages when the file is missing (the cron never landed
+    here), when ts is older than FLEET_ECON_STALE_SECS (a missed Monday), or
+    when any input reports ok: false (named). k2_spend is a KNOWN gap — the
+    hub has no spend-export path read here yet — so it warns with that
+    context instead of reading as a fresh regression.
+    """
+    if not FLEET_ECON_HEARTBEAT_PATH.is_file():
+        return [
+            f"WARN fleet-economics heartbeat missing at {FLEET_ECON_HEARTBEAT_PATH} "
+            "— cron fd3903262e8b never landed here"
+        ]
+    try:
+        hb = json.loads(FLEET_ECON_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return [f"WARN fleet-economics heartbeat unreadable: {type(exc).__name__}: {exc}"]
+    ts = hb.get("ts")
+    try:
+        age = time.time() - datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except Exception:  # noqa: BLE001
+        return [f"WARN fleet-economics heartbeat has no parseable ts ({ts!r})"]
+    warns: list[str] = []
+    if age > FLEET_ECON_STALE_SECS:
+        warns.append(
+            f"WARN fleet-economics heartbeat STALE age={int(age // 3600)}h "
+            f"(threshold {FLEET_ECON_STALE_SECS // 3600}h) — cron fd3903262e8b not landing"
+        )
+    inputs = hb.get("inputs") or {}
+    for name in sorted(inputs):
+        info = inputs[name]
+        if not isinstance(info, dict) or info.get("ok") is not False:
+            continue
+        note = str(info.get("note") or "")[:200]
+        if name == "k2_spend":
+            warns.append(
+                f"WARN fleet-economics input 'k2_spend' not ok — K2 spend "
+                f"UNAVAILABLE (known gap until the hub exports its summary): {note}"
+            )
+        else:
+            warns.append(f"WARN fleet-economics input '{name}' not ok: {note}")
     return warns
 
 
@@ -900,6 +957,16 @@ def main() -> int:
     old_di_fp = (prev.get("fps") or {}).get("distillery_intake")
     if di_fp and di_fp != old_di_fp:
         lines.append(di_blob)
+
+    # Fleet-economics weekly heartbeat (t_da2f74c4): same fp dedup — a
+    # sustained missing/stale/degraded-input state pages once per content.
+    fe_warns = _fleet_economics_heartbeat()
+    fe_blob = "\n".join(fe_warns).strip()
+    fe_fp = hashlib.sha256(fe_blob.encode()).hexdigest()[:16] if fe_blob else None
+    new_state["fps"]["fleet_economics"] = fe_fp
+    old_fe_fp = (prev.get("fps") or {}).get("fleet_economics")
+    if fe_fp and fe_fp != old_fe_fp:
+        lines.append(fe_blob)
 
     # Checkout-flipper guard (PB-003): a flip is urgent — same fp dedup so a
     # sustained flip notifies once per content, not every 30m.
