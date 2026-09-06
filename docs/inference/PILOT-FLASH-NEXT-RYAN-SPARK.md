@@ -61,15 +61,17 @@ Read: flash-next beats 120b on edit-shaped work (+16 %) and 27b everywhere; 120b
 novel prose; direct PLE reads are what make a 20k-token card wait 35 s instead of 85–90 s.
 MTP output is not bit-identical to non-spec output at temp 0 (equivalent quality on our probes).
 
-## Owed by Ryan (the agent's permission classifier refused these two)
+## Supervision (done 2026-09-06 00:3xZ, Ryan authorized)
 
-1. **Supervision.** Either `crontab -e` and append the three lines in
-   `~/models/flash-next/unit/flash-cron.txt`, or run `sudo bash ~/models/flash-next/unit/install.sh`
-   then `sudo systemctl enable --now flash-next flash-next-health.timer` (systemd is the better home).
-   Until then: no restart-on-crash, no heartbeat schedule.
-2. **Retire the old names:** `ollama rm gpt-oss:120b; ollama rm qwen3.8:27b`. The parked copies
-   (`gpt-oss-parked:120b`, `qwen38-parked:27b`) already exist, so this removes only the names.
-   Until then a direct `:11435` request for either name would load 64 GB beside the 93 GB pilot.
+- **cron + flock**, three lines in the ryanneely1000 crontab (backup `crontab.bak-*` in this dir):
+  server (`*/2`, `CTX=65536 NP=1`, lock `~/.flash-next.lock`), reverse tunnel `:11439` (`*/2`, lock
+  `~/.flash-tunnel.lock`), heartbeat (`* * * * *` → `health.json`). A crash or reboot recovers within 2 min.
+- **Old ollama names removed** (`gpt-oss:120b`, `qwen3.8:27b`); the blobs live on as
+  `gpt-oss-parked:120b` / `qwen38-parked:27b`. Nothing can load 64 GB beside the pilot any more.
+- Upgrade path to systemd is still `sudo bash unit/install.sh` (remove the three cron lines afterwards).
+- ⚠️ The server MUST be started under the same flock the cron line uses. A bare `nohup` server does
+  not hold the lock, so cron launches a second copy that loads 90 GB before it finds the port taken.
+  That nearly happened at 00:30Z; the fix is the cron line itself, run by hand.
 
 ## Open decisions (Ryan)
 
