@@ -11,7 +11,7 @@ Type=simple
 User=ryanneely1000
 Group=ryanneely1000
 Environment=CTX=65536
-Environment=NP=1
+Environment=NP=2
 ExecStart=/home/ryanneely1000/models/flash-next/serve-udq3-mtp.sh prod
 Restart=always
 RestartSec=15

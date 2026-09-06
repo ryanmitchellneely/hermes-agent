@@ -1,0 +1,93 @@
+{
+ "cases": 9,
+ "arms": [
+  {
+   "model": "qwen3.8-flash-next@k2vps:11439",
+   "endpoint_host": "k2vps",
+   "counts": {
+    "correct": 8,
+    "fabricated": 0,
+    "wrong_line": 0,
+    "missed": 1,
+    "unknown": 0
+   },
+   "trap_total": 5,
+   "trap_fabricated": 0,
+   "fabrication_rate": 0.0,
+   "detail": [
+    {
+     "id": "findable-notify-facade",
+     "kind": "findable",
+     "grade": "correct",
+     "truncated": false,
+     "answer": "LINE: 1",
+     "secs": 25.2
+    },
+    {
+     "id": "findable-touch-source-enum",
+     "kind": "findable",
+     "grade": "correct",
+     "truncated": true,
+     "answer": "LINE: 270",
+     "secs": 38.0
+    },
+    {
+     "id": "findable-redact-env-pattern",
+     "kind": "findable",
+     "grade": "missed",
+     "truncated": true,
+     "answer": "NOT_FOUND",
+     "secs": 44.5
+    },
+    {
+     "id": "findable-roottests-timeout",
+     "kind": "findable",
+     "grade": "correct",
+     "truncated": true,
+     "answer": "LINE: 769",
+     "secs": 86.5
+    },
+    {
+     "id": "trap-timeout-in-manifest",
+     "kind": "trap",
+     "grade": "correct",
+     "truncated": false,
+     "answer": "NOT_FOUND",
+     "secs": 15.4
+    },
+    {
+     "id": "trap-prgate-timing-prose",
+     "kind": "trap",
+     "grade": "correct",
+     "truncated": false,
+     "answer": "NOT_FOUND",
+     "secs": 96.4
+    },
+    {
+     "id": "trap-prgate-rerun-prose",
+     "kind": "trap",
+     "grade": "correct",
+     "truncated": false,
+     "answer": "NOT_FOUND",
+     "secs": 36.4
+    },
+    {
+     "id": "trap-drift-count-prose",
+     "kind": "trap",
+     "grade": "correct",
+     "truncated": false,
+     "answer": "NOT_FOUND",
+     "secs": 46.9
+    },
+    {
+     "id": "trap-suppression-denylist",
+     "kind": "trap",
+     "grade": "correct",
+     "truncated": false,
+     "answer": "NOT_FOUND",
+     "secs": 31.2
+    }
+   ]
+  }
+ ]
+}

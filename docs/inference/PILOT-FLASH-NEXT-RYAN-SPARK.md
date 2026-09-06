@@ -90,7 +90,15 @@ the card when that happens; the rule's home in config has not been located yet.
 First real card on flash-next (t_37ce841e, 02:02–02:04Z): 85 s wall, 24.6k prompt tokens, 1.5k
 generated, MTP acceptance 0.70, output correct and honest.
 
-## Open decisions (Ryan)
+## Slots: NP=2, not 1 (measured 2026-09-06 03:00Z)
+
+Under two concurrent worker cards on a single slot, every agent turn re-prefilled its whole
+~25k-token context because the one KV cache thrashed between the two conversations: prompt tokens
+climbed to 785k while generation stayed ~39k, `requests_deferred` sat at 1–3, and cards that take
+1.5–5 min alone took 7–10 min. Two slots (`NP=2`, 65k each) give each conversation its own cache.
+Memory is fine: this architecture's KV is small (16k×4 slots and 65k×1 both sat at ~74 GB used).
+
+
 
 - Flip at all, and when (needs a quiet lane and ~15 min).
 - Port: re-label 11439 as the pilot endpoint, or widen the sparklink fence by one port.
