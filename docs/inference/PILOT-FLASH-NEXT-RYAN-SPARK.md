@@ -43,7 +43,7 @@ Bench canon: T1000 repo `docs/inference/BAKEOFF-DS4-VS-QWEN38-FLASH-NEXT.md`.
 
 ## Rollback (≤ 5 min, no downloads)
 
-1. Restore the config backup on k2vps. 2. `sudo systemctl disable --now flash-next flash-next-health.timer`.
+1. Restore the config backup on k2vps AND every `profiles/*/config.yaml.bak-pre-flash-flip-*`. 2. `sudo systemctl disable --now flash-next flash-next-health.timer`.
 3. Reload ollama residents **120b first**, then 27b, then hermes3 (`curl :11434/api/generate {"model":…}`).
 4. Verify `:11435` answers and `ollama ps` shows three. Everything flash-next stays on disk.
 
@@ -72,6 +72,23 @@ MTP output is not bit-identical to non-spec output at temp 0 (equivalent quality
 - ⚠️ The server MUST be started under the same flock the cron line uses. A bare `nohup` server does
   not hold the lock, so cron launches a second copy that loads 90 GB before it finds the port taken.
   That nearly happened at 00:30Z; the fix is the cron line itself, run by hand.
+
+## Profiles have their own provider tables (learned 2026-09-06 02:00Z)
+
+`/opt/t1000/home/config.yaml` is NOT the only place provider `spark` lives. Every profile under
+`/opt/t1000/home/profiles/*/config.yaml` (worker, orchestrator, k2, proof, sov, q38, flash, grok,
+sonnet, mac-nail, dsh) carries its own `providers:` block. The kanban worker runs under the
+`worker` profile, so the first live card 404'd at ollama `:11435` three times while the root
+config already pointed at flash-next. All profiles are now flipped (backups
+`config.yaml.bak-pre-flash-flip-*` next to each). **Rollback must restore the profile backups too.**
+
+Second finding from the same card: after the `failure_limit` (2) local crashes the dispatcher
+escalated the retry to `claude-acp / sonnet` on its own. A broken local lane therefore spends
+frontier budget silently and can report a "success" that never touched the local model. Block
+the card when that happens; the rule's home in config has not been located yet.
+
+First real card on flash-next (t_37ce841e, 02:02–02:04Z): 85 s wall, 24.6k prompt tokens, 1.5k
+generated, MTP acceptance 0.70, output correct and honest.
 
 ## Open decisions (Ryan)
 
