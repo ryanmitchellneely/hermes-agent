@@ -98,6 +98,27 @@ DS4_LIVENESS_TOKEN_ENV = Path(
     os.environ.get("DS4_LIVENESS_TOKEN_ENV") or (DESK / "secrets" / "model-proxy.env")
 )
 DS4_LIVENESS_TOKEN_KEY = "K2_LOCAL_API_KEY"
+# flash-next pilot (t_37efebbb, 2026-09-06): Qwen3.8-Flash-Next served by llama.cpp on
+# ryan-spark :8898, reached from k2vps ONLY through the sparklink reverse tunnel :11439.
+# It is provider `spark` for the whole T1000 engine, so if this is down every local
+# kanban card is down. :11435 is the small-model ollama (hermes3 aux) on the same box.
+FLASH_HEALTH_URL = os.environ.get("FLASH_HEALTH_URL", "http://127.0.0.1:11439/health")
+FLASH_METRICS_URL = os.environ.get("FLASH_METRICS_URL", "http://127.0.0.1:11439/metrics")
+FLASH_MODELS_URL = os.environ.get("FLASH_MODELS_URL", "http://127.0.0.1:11439/v1/models")
+SPARK_OLLAMA_URL = os.environ.get("SPARK_OLLAMA_URL", "http://127.0.0.1:11435/api/version")
+FLASH_TIMEOUT_S = float(os.environ.get("FLASH_TIMEOUT_S", "10"))
+# flash-next completion liveness (harness t_83348309, 2026-09-06): the
+# _flash_next_liveness() leg above only proves /health and /v1/models answer
+# -- it does not prove a real completion works. This leg mirrors
+# _ds4_liveness(): one tiny real chat completion through the same :11439
+# tunnel. No auth token: the tunnel is local-only and unauthenticated
+# (measured live 2026-09-06 with a bare curl POST).
+FLASHNEXT_LIVENESS_URL = os.environ.get(
+    "FLASHNEXT_LIVENESS_URL", "http://127.0.0.1:11439/v1/chat/completions"
+)
+FLASHNEXT_LIVENESS_MODEL = os.environ.get("FLASHNEXT_LIVENESS_MODEL", "qwen3.8-flash-next")
+FLASHNEXT_LIVENESS_TIMEOUT_S = float(os.environ.get("FLASHNEXT_LIVENESS_TIMEOUT_S", "25"))
+FLASHNEXT_LIVENESS_MAX_TOKENS = int(os.environ.get("FLASHNEXT_LIVENESS_MAX_TOKENS", "8"))
 
 
 def _iso() -> str:
@@ -578,6 +599,113 @@ def _ds4_liveness() -> list[str]:
     return []
 
 
+def _http_get(url: str, timeout: float) -> tuple[int, str]:
+    import urllib.request
+    req = urllib.request.Request(url, headers={"Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        return resp.status, resp.read().decode("utf-8", "replace")
+
+
+def _flash_next_liveness() -> list[str]:
+    """flash-next pilot liveness through the :11439 tunnel. Silent when healthy.
+    Tells CHANNEL (tunnel/box unreachable) apart from SERVER (answers but not ok)
+    apart from MODEL (health ok but the served model list is wrong)."""
+    warns: list[str] = []
+    try:
+        code, body = _http_get(FLASH_HEALTH_URL, FLASH_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001
+        warns.append(
+            "WARN flash-next (provider spark, ALL local kanban cards): CHANNEL unreachable at "
+            f"{FLASH_HEALTH_URL} ({type(exc).__name__}) — sparklink tunnel :11439 down, ryan-spark "
+            "down, or llama-server not listening on :8898. Spark cron relaunches both within 2 min; "
+            "if this persists, look at ~/models/flash-next/flash-next.service.log on the Spark."
+        )
+    else:
+        if code != 200 or '"ok"' not in body:
+            warns.append(f"WARN flash-next: /health answered HTTP {code} {body[:120]!r} — server up but not healthy")
+        else:
+            try:
+                _, models = _http_get(FLASH_MODELS_URL, FLASH_TIMEOUT_S)
+                if "qwen3.8-flash-next" not in models:
+                    warns.append(
+                        f"WARN flash-next: :11439 healthy but serves {models[:120]!r}, not qwen3.8-flash-next — "
+                        "the tunnel points at the wrong server (bench window left open?)"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                warns.append(f"WARN flash-next: /health ok but /v1/models failed ({type(exc).__name__})")
+    try:
+        code, _ = _http_get(SPARK_OLLAMA_URL, FLASH_TIMEOUT_S)
+        if code != 200:
+            warns.append(f"WARN spark ollama (:11435, hermes3 aux): HTTP {code}")
+    except Exception as exc:  # noqa: BLE001
+        warns.append(
+            f"WARN spark ollama (:11435, hermes3 aux for kanban estimator/titles): unreachable ({type(exc).__name__})"
+        )
+    return warns
+
+
+def _flashnext_completion_request() -> dict:
+    """The single network seam for the flash-next completion liveness check --
+    kept module-level and parameterised so tests stub exactly one thing (same
+    pattern as `_ds4_completion_request`). Raises on connection failure,
+    timeout, or any non-2xx (urllib raises HTTPError for those natively). No
+    auth token: the :11439 tunnel is local-only and unauthenticated.
+    """
+    import json
+    import urllib.request
+
+    req = urllib.request.Request(
+        FLASHNEXT_LIVENESS_URL,
+        data=json.dumps(
+            {
+                "model": FLASHNEXT_LIVENESS_MODEL,
+                "messages": [{"role": "user", "content": "reply with OK"}],
+                "max_tokens": FLASHNEXT_LIVENESS_MAX_TOKENS,
+            }
+        ).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=FLASHNEXT_LIVENESS_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _flashnext_liveness() -> list[str]:
+    """flash-next real-inference liveness (t_83348309, 2026-09-06): a tiny
+    chat completion through the :11439 tunnel, mirroring `_ds4_liveness()`.
+    Success is silent; failure is told honestly -- CHANNEL when the tunnel or
+    box itself is unreachable, MODEL when the endpoint answers but the
+    completion failed (rule 4: an unreachable channel is never confused with
+    a broken model).
+    """
+    import urllib.error
+
+    try:
+        body = _flashnext_completion_request()
+    except urllib.error.HTTPError as exc:
+        return [
+            f"WARN flash-next completion: MODEL endpoint returned HTTP {exc.code} "
+            "-- server up but the completion path errored"
+        ]
+    except Exception as exc:  # noqa: BLE001 -- connection refused/timeout/DNS/etc.
+        return [
+            "WARN flash-next completion: CHANNEL unreachable via :11439 tunnel "
+            f"({type(exc).__name__}) -- sparklink tunnel down, ryan-spark down, "
+            "or llama-server not listening on :8898; state is UNKNOWN, not bad"
+        ]
+
+    if "error" in body:
+        return [
+            f"WARN flash-next completion: MODEL returned an error: {str(body.get('error'))[:160]}"
+        ]
+    if not body.get("choices"):
+        return [
+            "WARN flash-next completion: MODEL returned no choices -- real "
+            "inference path is not working"
+        ]
+    return []
+
+
 def _dsh_verdict_waste() -> list[str]:
     """Page when N+ dsh-lane PRs have sat unverdicted for longer than the age.
 
@@ -820,6 +948,32 @@ def main() -> int:
     old_ds4_fp = (prev.get("fps") or {}).get("ds4_liveness")
     if ds4_fp and ds4_fp != old_ds4_fp:
         lines.append(ds4_blob)
+
+    # flash-next pilot liveness (t_37efebbb, 2026-09-06): provider `spark` for the whole
+    # engine now lives behind :11439. Same fp dedup; plus an explicit recovery line,
+    # because "it came back" is the one message the DS4 pattern never sends.
+    fn_warns = _flash_next_liveness()
+    fn_blob = "\n".join(fn_warns).strip()
+    fn_fp = hashlib.sha256(fn_blob.encode()).hexdigest()[:16] if fn_blob else None
+    new_state["fps"]["flash_next"] = fn_fp
+    new_state["flash_next_checked_at"] = _iso()
+    old_fn_fp = (prev.get("fps") or {}).get("flash_next")
+    if fn_fp and fn_fp != old_fn_fp:
+        lines.append(fn_blob)
+    elif not fn_fp and old_fn_fp:
+        lines.append("🟢 flash-next: :11439 healthy again (provider spark restored)")
+
+    # flash-next completion liveness (t_83348309, 2026-09-06): a second,
+    # independent leg proving real inference (not just health/models) through
+    # the same :11439 tunnel -- same fp dedup pattern as ds4_liveness.
+    fnx_warns = _flashnext_liveness()
+    fnx_blob = "\n".join(fnx_warns).strip()
+    fnx_fp = hashlib.sha256(fnx_blob.encode()).hexdigest()[:16] if fnx_blob else None
+    new_state["fps"]["flashnext_liveness"] = fnx_fp
+    new_state["flashnext_liveness_checked_at"] = _iso()
+    old_fnx_fp = (prev.get("fps") or {}).get("flashnext_liveness")
+    if fnx_fp and fnx_fp != old_fnx_fp:
+        lines.append(fnx_blob)
 
     for kind, path in ALERTS:
         fp = _fp(path)
