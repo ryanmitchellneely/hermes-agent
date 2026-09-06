@@ -57,7 +57,7 @@ BENCH_PORT=11439                            # see THE PORT FENCE above
 MODEL_PORT=8898                             # llama.cpp on spark
 SERVER_PID='/tmp/bench-server.pid'          # remote pidfiles (see start_server for why not pkill -f)
 TUNNEL_PID='/tmp/bench-tunnel.pid'
-RESIDENTS=(gpt-oss:120b qwen3.8:27b hermes3:8b-16k)   # ollama on this box holds at most these three: a 4th model of ANY size evicts 120b (measured 2026-09-05 with a 1.8 GB model)
+RESIDENTS=(hermes3:8b-16k)   # since the 2026-09-05 flip. Pre-flip set was (gpt-oss:120b qwen3.8:27b hermes3:8b-16k); ollama holds at most three, load 120b FIRST if you ever restore it
 HK="sudo -u t1000 env HERMES_HOME=/opt/t1000/home /opt/t1000/venv/bin/hermes kanban"
 
 say() { printf '\n=== %s\n' "$*"; }
@@ -166,6 +166,11 @@ open_window() {
   Override with BENCH_FORCE=1 only if you are watching the box."
   fi
 
+  # 2026-09-05: spark :8898 is the flash-next PRODUCTION server (cron+flock). A window would
+  # evict it and fight its supervisor. Refuse unless the operator has stopped the pilot.
+  if ssh "$SPARK" "ss -ltn | grep -q ':$MODEL_PORT '"; then
+    die "spark :$MODEL_PORT is already serving (the flash-next pilot). Stop its cron lines + process first (see README-PILOT.md) — a bench window is now a production outage."
+  fi
   say "preflight: devbot lane must be quiet"
   local busy; busy=$(lane_busy)
   [ "$busy" = "0" ] || die "devbot lane has $busy dispatchable card(s). Wait for it to drain — evicting now would kill a running job."

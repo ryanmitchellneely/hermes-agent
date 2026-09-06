@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next pilot on ryan-spark — what is staged, how to flip, how to roll back
 
-**Status (2026-09-05 23:20Z):** staged and VALIDATED (window 23:12–23:20Z), NOT flipped. Decision + evidence trail: models card `t_37efebbb`.
+**Status (2026-09-05 ~23:45Z):** FLIPPED (Ryan: "go!"). Supervision = cron+flock (no sudo yet); `unit/install.sh` upgrades it to systemd when Ryan runs it. Decision + evidence trail: models card `t_37efebbb`.
 Bench canon: T1000 repo `docs/inference/BAKEOFF-DS4-VS-QWEN38-FLASH-NEXT.md`.
 
 ## What is on this box now

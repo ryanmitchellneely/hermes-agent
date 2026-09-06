@@ -7,6 +7,14 @@ Every bench on this fleet needs the same sequence. Done by hand on 2026-08-27 it
 took five windows, two OOM kills, and one blocked security fence. The script is
 that sequence made mechanical; this page is the part a script cannot carry.
 
+## ⚠️ 2026-09-05: :8898 / :11439 is PRODUCTION now
+
+The flash-next pilot serves on spark `:8898` and is the `spark` provider for the whole T1000
+engine via `:11439` (cron+flock supervised, `~/models/flash-next/README-PILOT.md`). `bench_window.sh
+open` REFUSES while :8898 is listening. Benching another model now means taking production down:
+stop the three `flash` cron lines first, and put them back. Ollama holds only `hermes3:8b-16k`
+(aux); `gpt-oss:120b`/`qwen3.8:27b` are PARKED tags (`*-parked:*`) so nothing can reload them.
+
 ## The one-liner
 
 ```bash
@@ -50,7 +58,7 @@ k2vps to a model on ryan-spark is a reverse tunnel the Spark opened:
 |---|---|---|
 | `11435` | spark ollama :11434 | **the live devbot lane** — never repoint this |
 | `11436` | cadenspc ollama | |
-| `11439` | spark llama.cpp :8898 | **bench only** (added 2026-08-27) |
+| `11439` | spark llama.cpp :8898 | **PILOT: Qwen3.8-Flash-Next production endpoint since 2026-09-05** (was bench-only 08-27→09-05). Provider `spark` in config.yaml points here. |
 
 So a model served on any other Spark port is invisible to the worker, no matter
 how healthy it looks locally.
