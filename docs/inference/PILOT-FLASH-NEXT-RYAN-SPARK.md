@@ -95,7 +95,9 @@ generated, MTP acceptance 0.70, output correct and honest.
 Under two concurrent worker cards on a single slot, every agent turn re-prefilled its whole
 ~25k-token context because the one KV cache thrashed between the two conversations: prompt tokens
 climbed to 785k while generation stayed ~39k, `requests_deferred` sat at 1–3, and cards that take
-1.5–5 min alone took 7–10 min. Two slots (`NP=2`, 65k each) give each conversation its own cache.
+1.5–5 min alone took 7–10 min. Two slots (`NP=2`, 65k each) give each conversation its own cache. **`CTX` is per-slot**: the serve
+script passes `-c CTX*NP` because llama-server otherwise divides one `-c` across slots (the first NP=2
+restart silently gave 2×32k, below the 64K the engine assumes).
 Memory is fine: this architecture's KV is small (16k×4 slots and 65k×1 both sat at ~74 GB used).
 
 
