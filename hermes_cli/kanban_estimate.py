@@ -36,7 +36,7 @@ _ESTIMATE_SYSTEM_PROMPT = (
     '- "local": clear acceptance criteria; localized/mechanical code edits; '
     "boilerplate; well-scoped multi-file work without architecture ambiguity; "
     "no security-sensitive design judgment. Good candidates for local models "
-    "(DeepSeek V4 Flash/Pro, Spark gpt-oss:120b, MBP coder).\n"
+    "(DeepSeek V4 Flash/Pro, Spark Qwen3.8-Flash-Next, MBP coder).\n"
     '- "frontier": ambiguous requirements; architecture/trade-off design; '
     "security-sensitive changes; novel multi-system reasoning; needs peak IQ "
     "or live web judgment. Prefer Grok 4.5 / Claude Max (ACP).\n"
@@ -154,7 +154,9 @@ _LOCAL_PROVIDER_PREFERENCE = (
 # Preferred model id per local provider when the provider lists several.
 _LOCAL_MODEL_PREFERENCE = {
     "kevin-spark": ("deepseek-v4-flash", "deepseek-v4-pro"),
-    "spark": ("gpt-oss:120b", "qwen2.5-coder:32b", "hermes3:8b-16k"),
+    # 2026-09-06 (t_37efebbb): provider `spark` is Qwen3.8-Flash-Next (llama.cpp, :11439).
+    # gpt-oss:120b stays as an alias name the same server answers to.
+    "spark": ("qwen3.8-flash-next", "gpt-oss:120b", "hermes3:8b-16k"),
     "mbp-ollama": ("qwen3-coder:30b", "hf.co/NousResearch/Hermes-4.3-36B-GGUF:Q4_K_M", "hermes3:8b"),
 }
 
