@@ -100,6 +100,16 @@ script passes `-c CTX*NP` because llama-server otherwise divides one `-c` across
 restart silently gave 2×32k, below the 64K the engine assumes).
 Memory is fine: this architecture's KV is small (16k×4 slots and 65k×1 both sat at ~74 GB used).
 
+## Slots: NP=3 and --cache-reuse (real traffic, 2026-09-06 13:50Z)
+
+Prefix reuse works on a warm slot (turn 2 of a conversation: 667 prompt tokens / 15 s vs 20,742 / 59 s
+for turn 1), but with only two slots any third conversation — a probe, an aux call, or prefix drift
+inside a worker's own turns — evicts one, and the evicted conversation re-prefills its whole 20–46k
+context at a contended 290–460 tok/s (a 101 s re-prefill of 46,634 tokens is in the log). That is
+why same-class cards ran ~4x slower than 120b did. Now `NP=3` (3×65k, ~39 GB free) and
+`--cache-reuse 256` (partial-prefix reuse) in the `prod` serve line; cron and unit updated.
+Rule: never send probe requests to `:11439` while real cards are running.
+
 ## Alerting and the escalate gate (built 2026-09-06 04:00Z, gate verified live 04:16Z)
 
 - **Alerting:** `k2vps:/opt/t1000/home/scripts/t1000_ops_alert_pulse.py` (Hermes cron, every 30 min,
