@@ -1,0 +1,6 @@
+# flash-next pilot (2026-09-05, t_37efebbb) — cron-based supervision for ryan-spark.
+# Append to `crontab -e` as ryanneely1000, OR skip this and use systemd via install.sh.
+# Same flock pattern as the existing :11435 / :11436 tunnel lines.
+*/2 * * * * CTX=65536 NP=1 /usr/bin/flock -n $HOME/.flash-next.lock $HOME/models/flash-next/serve-udq3-mtp.sh prod >> $HOME/models/flash-next/flash-next.service.log 2>&1
+*/2 * * * * /usr/bin/flock -n $HOME/.flash-tunnel.lock /usr/bin/ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -i $HOME/.ssh/id_ed25519_k2vps -R 127.0.0.1:11439:127.0.0.1:8898 sparklink@177.7.37.126
+* * * * * $HOME/models/flash-next/unit/flash-next-health.sh >/dev/null 2>&1

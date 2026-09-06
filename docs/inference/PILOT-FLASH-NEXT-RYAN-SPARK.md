@@ -26,7 +26,7 @@ Bench canon: T1000 repo `docs/inference/BAKEOFF-DS4-VS-QWEN38-FLASH-NEXT.md`.
 ## The flip (runbook — do in this order, devbot lane quiet)
 
 1. **Config first, models second.** On k2vps `/opt/t1000/home/config.yaml` (backup with a timestamp):
-   - add provider `spark-flash`: `api: http://127.0.0.1:11439/v1`, `api_key: local`, `models: [qwen3.8-flash-next]`, `context_length: 49152`
+   - add provider `spark-flash`: `api: http://127.0.0.1:11439/v1`, `api_key: local`, `models: [qwen3.8-flash-next]`, `context_length: 65536` (Hermes refuses main-agent models under 64K)
      (11439 is the only free port ryan-spark's sparklink key may bind; it is labelled BENCH in
      MODEL-BENCH-LANE.md — re-label it PILOT there, or widen the fence by one port: a human call)
    - every `provider: spark` + `model: gpt-oss:120b` or `qwen3.8:27b` (profiles ~L729-786, moa
@@ -55,11 +55,21 @@ Bench canon: T1000 repo `docs/inference/BAKEOFF-DS4-VS-QWEN38-FLASH-NEXT.md`.
 | qwen3.8:27b (ollama) | 37.5 | 41.2 | 18.4 | | |
 | flash-next PR 28243 mtp3 @16k | 60.2 | 60.2 | 35.5 | 238 tok/s → **83 s** | |
 | flash-next PR 28136 on-direct | | | | **594 tok/s → 35 s** | |
-| **flash-next flash-prod (mtp3 + on-direct) @49k, 1 slot** | **60.3** | **59.0** | **34.5** | **560 tok/s → 42 s** (23.5k tok) | acceptance 0.657 |
+| **flash-next flash-prod (mtp3 + on-direct) @65k, 1 slot** | **60.3** | **59.0** | **34.5** | **560 tok/s → 42 s** (23.5k tok) | acceptance 0.657 |
 
 Read: flash-next beats 120b on edit-shaped work (+16 %) and 27b everywhere; 120b is ~1.9× faster on
 novel prose; direct PLE reads are what make a 20k-token card wait 35 s instead of 85–90 s.
 MTP output is not bit-identical to non-spec output at temp 0 (equivalent quality on our probes).
+
+## Owed by Ryan (the agent's permission classifier refused these two)
+
+1. **Supervision.** Either `crontab -e` and append the three lines in
+   `~/models/flash-next/unit/flash-cron.txt`, or run `sudo bash ~/models/flash-next/unit/install.sh`
+   then `sudo systemctl enable --now flash-next flash-next-health.timer` (systemd is the better home).
+   Until then: no restart-on-crash, no heartbeat schedule.
+2. **Retire the old names:** `ollama rm gpt-oss:120b; ollama rm qwen3.8:27b`. The parked copies
+   (`gpt-oss-parked:120b`, `qwen38-parked:27b`) already exist, so this removes only the names.
+   Until then a direct `:11435` request for either name would load 64 GB beside the 93 GB pilot.
 
 ## Open decisions (Ryan)
 
