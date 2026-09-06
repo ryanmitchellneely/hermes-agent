@@ -588,6 +588,66 @@ def _percentile(values: list[float], q: float) -> Optional[float]:
     return float(ordered[min(rank, len(ordered)) - 1])
 
 
+def _fetch_closed_unmerged_count(
+    fetch: Callable[[str, Optional[str]], Any],
+    repo: str,
+    token: Optional[str],
+    author: str,
+    since_iso: str,
+    until_iso: str,
+    *,
+    max_pages: int = 20,
+) -> tuple[int, bool]:
+    """(count, fetch_ok) of lane PRs closed WITHOUT a merge, ``closed_at`` in
+    [since_iso, until_iso) — via the REST pulls list, not Search.
+
+    Round-3 fix (captain-caught): Search's ``author:app/<slug>`` qualifier
+    does not reliably match ``<slug>[bot]``-authored PRs that were closed
+    without a merge event (merged ones matched fine, which is why round 2's
+    ``is:closed`` minus ``is:merged`` subtraction silently looked internally
+    consistent at 35 == 35 while actually missing an entire class of PRs — a
+    live REST check of named PRs the captain supplied, e.g. #6131 and #5918,
+    confirmed they ARE state=closed/merged_at=null/closed_at-in-window,
+    authored by ``k2-dsh-lane[bot]``).
+
+    Sorted by ``updated_at`` descending and paginated until a whole page's
+    oldest ``updated_at`` predates the window start — sound because closing
+    OR merging a PR always bumps ``updated_at`` to at least that moment, so
+    once a full page is entirely older than the window, every later page is
+    too. Measured live: 7 pages / 700 PRs covers a 7-day window on this
+    repo's actual traffic; ``max_pages=20`` is headroom, not the expected
+    depth.
+    """
+    login_prefix = author.split("/", 1)[-1].lower()  # "app/k2-dsh-lane" -> "k2-dsh-lane"
+    count = 0
+    any_page_ok = False
+    for page in range(1, max_pages + 1):
+        url = (
+            f"{GITHUB_API}/repos/{repo}/pulls?state=closed&sort=updated"
+            f"&direction=desc&per_page=100&page={page}"
+        )
+        try:
+            batch = fetch(url, token) or []
+        except Exception:
+            batch = []
+        if not batch:
+            break
+        any_page_ok = True
+        for pr in batch:
+            login = ((pr.get("user") or {}).get("login") or "").lower()
+            if not login.startswith(login_prefix):
+                continue
+            closed_at = pr.get("closed_at") or ""
+            if not (since_iso <= closed_at < until_iso):
+                continue
+            if not pr.get("merged_at"):
+                count += 1
+        oldest_updated = batch[-1].get("updated_at") or ""
+        if len(batch) < 100 or (oldest_updated and oldest_updated < since_iso):
+            break
+    return count, any_page_ok
+
+
 def lane_pr_summary(
     week_start: datetime,
     week_end: datetime,
@@ -656,26 +716,28 @@ def lane_pr_summary(
         merged = search(
             f"repo:{repo} is:pr is:merged author:{author} merged:{since_iso}..{until_iso}"
         )
-        # "closed" is derived by subtraction, NOT the `is:unmerged` qualifier
-        # (round-2 fix, captain-caught defect 3): `is:closed is:unmerged
-        # closed:<range>` measured 0 against a live `is:closed closed:<range>`
-        # of 35 == merged's own 35 for ISO week 36 — i.e. `is:unmerged`
-        # agreed with the direct closed-in-window count that week, so the
-        # bug wasn't a broken qualifier, it's what "closed" should even mean:
-        # captain's own formula is "state closed AND merged_at null, closed_at
-        # in window" — closed_at is a single field a merged PR shares with
-        # merged_at, so (is:closed count in window) - (is:merged count in the
-        # SAME window) is an exact, not approximate, derivation of that
-        # formula without a second maybe-stale qualifier or per-item paging.
-        closed_total = search(
-            f"repo:{repo} is:pr is:closed author:{author} closed:{since_iso}..{until_iso}"
-        )
         open_now = search(f"repo:{repo} is:pr is:open author:{author}", max_pages=5)
 
         opened_items = opened.get("items", []) or []
         open_items = open_now.get("items", []) or []
-        closed_unmerged_count = max(
-            0, (closed_total.get("total_count") or 0) - (merged.get("total_count") or 0)
+
+        # "closed" via the REST pulls list, NOT the Search API (round-3 fix,
+        # captain-caught defect: round 2's `is:closed closed:<range>` minus
+        # `is:merged merged:<range>` measured 0 for this exact window — but a
+        # live REST check of named PRs (#6131, #5918, ...) showed them
+        # correctly as state=closed, merged_at=null, closed_at IN the window,
+        # authored by k2-dsh-lane[bot]. Search's `author:app/<slug>`
+        # qualifier does not reliably match `<slug>[bot]`-authored PRs that
+        # were closed WITHOUT a merge event (merged ones matched fine, which
+        # is why round 2's number silently looked internally consistent —
+        # 35 == 35 — while actually missing an entire class of PRs). The
+        # Pulls endpoint has no such gap. Paginated by `updated_at` desc and
+        # stopped once a whole page is older than the window start, since
+        # closing OR merging a PR always bumps `updated_at` to at least that
+        # moment — verified live: 7 pages / 700 PRs to cover this window on
+        # this repo's actual traffic.
+        closed_unmerged_count, closed_fetch_ok = _fetch_closed_unmerged_count(
+            fetch, repo, token, author, since_iso, until_iso
         )
 
         def has_verdict_comment(number: int, created_at: str) -> Optional[float]:
@@ -721,7 +783,7 @@ def lane_pr_summary(
             if has_verdict_comment(number, created_at) is None:
                 zero_verdict_open += 1
 
-        fetch_ok = bool(opened) or bool(merged) or bool(closed_total) or bool(open_now)
+        fetch_ok = bool(opened) or bool(merged) or bool(open_now) or closed_fetch_ok
         metrics = {
             "opened": opened.get("total_count", len(opened_items)),
             "merged": merged.get("total_count", 0),
