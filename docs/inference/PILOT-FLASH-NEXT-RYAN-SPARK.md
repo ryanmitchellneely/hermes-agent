@@ -151,9 +151,33 @@ still pins `gpt-oss:120b` and needs a rewrite for the pilot: pinned `hermes3:8b-
 llama.cpp server on `:8898`, not an ollama pin; `gpt-oss-parked:120b` / `qwen38-parked:27b` are
 forbidden residents. That checkout also holds an unrelated, uncommitted nemotron-lane change from Aug 13.
 
+## Day 1 (2026-09-06 00:05Z → 2026-09-07 20:58Z)
+
+Unattended since 13:50Z on 09-06 (after the NP=3 restart). No engine errors, no escalation of a
+spark-lane card, health and both tunnels green on every tick.
+
+| | |
+|---|---:|
+| tokens generated since the flip | 249,460 |
+| prompt tokens: uncached / served from cache | 682k / 2.85M |
+| MTP acceptance (cumulative, real traffic) | 0.746 |
+| spark-lane worker cards completed | 26 (p50 6.7 min, p90 12.8, max 17.4) |
+| crashes on spark-pinned cards | 28 — all infra: 26 on mesh (grok token dead → re-pinned; 2 killed by my NP=3 restart), 2 gate tests |
+| server restarts | 6 `load_model` lines total; every one is a bench arm or my NP/CTX change; the current process started at the 13:40Z NP=3 restart and has not been relaunched by cron since |
+| 12 AUTO-REPAIR cards (playbook-sweep), wall minutes in order | 12.8, 10.5, 6.5, 13.9, 17.4, 10.3, 17.1, 6.8, 3.0, 6.0, 5.3, 6.9 (the last four ran after NP=3 + cache-reuse) |
+
+**Finding:** ollama on the Spark was found holding `qwen2.5-coder:32b-64k` (24 GB) beside the 93 GB
+server, leaving 4 GB free — one allocation from the GPU wedge. Loaded twice on 09-06 (21:29Z, 22:46Z)
+by a client on the Spark itself via the native `/api/chat` (i.e. `ollama run`, not the engine; no
+gateway log line, no pinned card). Evicted 09-07 21:05Z (29 GB free after). The ops pulse now carries a
+**residency guard**: any ollama resident other than `hermes3:8b-16k` (and the two 1.7b aux tags) pages
+with its name and size within 30 min.
+
 ## Open decisions and owed items (Ryan)
 
 - Confirm the Telegram HOLD line arrived (~23:16 CDT Sep 5, "HOLD (lane failure, NOT escalated)").
+- Who ran `ollama run qwen2.5-coder:32b-64k` on the Spark on Sat 09-06 ~17:45 CDT? If it was you and you
+  need a coder model there, it has to be budgeted (the box has ~29 GB free with flash-next resident).
 - Re-authenticate xAI on k2vps (`hermes model` as t1000); then remove `xai-oauth` from
   `unavailable_providers` in `kanban/model_escalate.json`.
 - Optional: `sudo bash ~/models/flash-next/unit/install.sh` to move supervision from cron to systemd
