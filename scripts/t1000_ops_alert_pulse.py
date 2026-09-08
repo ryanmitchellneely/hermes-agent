@@ -112,6 +112,16 @@ FLASH_HEALTH_URL = os.environ.get("FLASH_HEALTH_URL", "http://127.0.0.1:11439/he
 FLASH_METRICS_URL = os.environ.get("FLASH_METRICS_URL", "http://127.0.0.1:11439/metrics")
 FLASH_MODELS_URL = os.environ.get("FLASH_MODELS_URL", "http://127.0.0.1:11439/v1/models")
 SPARK_OLLAMA_URL = os.environ.get("SPARK_OLLAMA_URL", "http://127.0.0.1:11435/api/version")
+SPARK_OLLAMA_PS_URL = os.environ.get("SPARK_OLLAMA_PS_URL", "http://127.0.0.1:11435/api/ps")
+# Residents allowed beside the flash-next server (2026-09-07). A 32b coder loaded by hand on
+# 2026-09-06 left the box at 4 GB free — one allocation from the GPU wedge. Anything else pages.
+# 2026-09-08 attribution: qwen3-embedding (9 GB) is Pulp — /opt/juice/bridges/buzz_acp_pulp.py
+# embeds its memory via :11435 with EMBED_MODEL hardcoded; plain hermes3:8b is what a T1000
+# k2-profile worker falls to when xai-oauth is unavailable. Both legitimate, both small.
+SPARK_ALLOWED_RESIDENTS = set(
+    (os.environ.get("SPARK_ALLOWED_RESIDENTS")
+     or "hermes3:8b-16k,hermes3:8b,qwen3-embedding:latest,qwen3-embedding,qwen3-aux:1.7b,qwen3:1.7b").split(",")
+)
 FLASH_TIMEOUT_S = float(os.environ.get("FLASH_TIMEOUT_S", "10"))
 # flash-next completion liveness (harness t_83348309, 2026-09-06): the
 # _flash_next_liveness() leg above only proves /health and /v1/models answer
@@ -698,6 +708,26 @@ def _flash_next_liveness() -> list[str]:
         warns.append(
             f"WARN spark ollama (:11435, hermes3 aux for kanban estimator/titles): unreachable ({type(exc).__name__})"
         )
+        return warns
+    # Residency guard: the flash-next server holds ~93 GB of the 121 GB box; a stray ollama
+    # resident is a memory hazard, so name it (and its size) rather than let it sit.
+    try:
+        import json as _json
+        _, ps_body = _http_get(SPARK_OLLAMA_PS_URL, FLASH_TIMEOUT_S)
+        residents = _json.loads(ps_body).get("models") or []
+        stray = [
+            f"{m.get('name')} ({int((m.get('size') or 0) / 1e9)} GB)"
+            for m in residents
+            if (m.get("name") or "") not in SPARK_ALLOWED_RESIDENTS
+        ]
+        if stray:
+            warns.append(
+                "WARN ryan-spark residency: ollama holds " + ", ".join(stray)
+                + " beside the 93 GB flash-next server — memory hazard (GPU wedge class). "
+                "Evict with `ollama stop <name>` on the Spark; if a config lists it under a :11435 provider, remove it."
+            )
+    except Exception as exc:  # noqa: BLE001
+        warns.append(f"WARN ryan-spark residency: /api/ps unreadable ({type(exc).__name__})")
     return warns
 
 
