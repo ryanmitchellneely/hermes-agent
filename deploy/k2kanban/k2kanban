@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# k2kanban — the K2SharedKanban CLI on k2vps.
+#
+# The shared kanban (17 boards under /opt/t1000/home/kanban/boards) is served by
+# the T1000 engine's `hermes kanban` verb and MUST run as the t1000 user: a
+# root-run hermes writes root-owned files into /opt/t1000/home and breaks every
+# t1000-owned process with EACCES (179 files chowned back 2026-08-21, 14 more on
+# 2026-09-08). This wrapper makes the safe form the only form.
+#
+#   k2kanban list --board k2 --status ready
+#   k2kanban --board models comment t_37efebbb 'text'
+#   k2kanban boards list
+set -euo pipefail
+HOME_DIR=/opt/t1000/home
+HERMES=/opt/t1000/venv/bin/hermes
+if [ "$(id -un)" = "t1000" ]; then
+  exec env HERMES_HOME="$HOME_DIR" "$HERMES" kanban "$@"
+fi
+exec sudo -u t1000 env HERMES_HOME="$HOME_DIR" "$HERMES" kanban "$@"
