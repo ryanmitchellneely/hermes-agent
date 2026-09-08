@@ -24,6 +24,12 @@ WorkingDirectory=/opt/t1000/src
 # Exit 0 on clean or repaired; non-zero surfaces drift/refuse to journal.
 # Timer stays armed either way (OnUnitActiveSec).
 ExecStart=/opt/t1000/venv/bin/python -m hermes_cli.reconciler --fix --role vps
+# The unit runs as root (it must, to systemctl enable/disable), but the heartbeat
+# it writes lands in the t1000-owned engine home. A root-owned file there breaks
+# every t1000 process with EACCES -- 179 files had to be chowned back 2026-08-21,
+# and this unit was the source of a recurring one found 2026-09-08. Hand it back
+# after every run. Leading '-' so ownership repair can never fail the unit.
+ExecStartPost=-/bin/chown -R t1000:t1000 /opt/t1000/home/reconciler
 Nice=10
 
 [Install]
