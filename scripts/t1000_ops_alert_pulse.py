@@ -673,6 +673,69 @@ def _http_get(url: str, timeout: float) -> tuple[int, str]:
         return resp.status, resp.read().decode("utf-8", "replace")
 
 
+def _engine_home_root_owned() -> list[str]:
+    """Root-owned files in the t1000 engine home. Silent when there are none.
+
+    WHY THIS EXISTS (2026-09-08). A root-run process writing into
+    /opt/t1000/home leaves root-owned files, and every t1000-owned process then
+    fails with EACCES. It has happened three times: 179 files on 2026-08-21, a
+    recurring reconciler heartbeat found 2026-09-08, and root-run `hermes -z`
+    build seats the same day. Each time it was found by a human looking, not by
+    an instrument -- so each time it had already been breaking things for a
+    while. The fix for the reconciler is an ExecStartPost chown in its unit; this
+    leg is what makes a REGRESSION of that fix, or a new offender, loud.
+
+    Inverted probe: it fires while the bad state exists, so it cannot rot into a
+    green that means nothing. It names the offending paths and the live root
+    process most likely responsible, because "some file is root-owned" costs a
+    session to chase and "this unit wrote it" does not.
+    """
+    warns: list[str] = []
+    home = "/opt/t1000/home"
+    try:
+        found = subprocess.run(
+            ["find", home, "-user", "root"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:  # noqa: BLE001
+        return [f"WARN engine-home ownership: could not scan ({type(exc).__name__})"]
+    paths = [x for x in (found.stdout or "").splitlines() if x.strip()]
+    if not paths:
+        return warns
+    shown = ", ".join(paths[:5]) + (f" (+{len(paths) - 5} more)" if len(paths) > 5 else "")
+    culprit = ""
+    try:
+        ps = subprocess.run(
+            ["pgrep", "-u", "root", "-af", "hermes"],
+            capture_output=True, text=True, timeout=15,
+        )
+        # Only a root hermes writing into THIS home is a suspect. The hermes-k2
+        # docker container runs its own s6 init as root against /opt/data and is
+        # NOT one -- naming it sends the reader to the wrong lane, which this
+        # probe did on its first negative-control run (2026-09-08).
+        # Positive match, not a blocklist: a suspect is a root process running
+        # THIS engine's interpreter or CLI. The hermes-k2 container's s6 tree
+        # matched a blocklist-based version on both attempts (2026-09-08), which
+        # is why this asks what the process IS rather than what it is not.
+        live = [
+            x for x in (ps.stdout or "").splitlines()
+            if "pgrep" not in x
+            and ("/opt/t1000/" in x or "/usr/local/bin/hermes" in x)
+        ]
+        if live:
+            culprit = f" A root-run hermes is live NOW: {live[0][:90]}."
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    warns.append(
+        f"WARN engine-home ownership: {len(paths)} root-owned file(s) under {home} "
+        f"-- {shown}." + culprit +
+        " Every t1000 process hits EACCES on these. Fix: chown -R t1000:t1000 the paths, "
+        "then find what ran as root (a unit missing ExecStartPost chown, or `hermes` run "
+        "as root instead of `sudo -u t1000`). See K2 inbox 6157."
+    )
+    return warns
+
+
 def _flash_next_liveness() -> list[str]:
     """flash-next pilot liveness through the :11439 tunnel. Silent when healthy.
     Tells CHANNEL (tunnel/box unreachable) apart from SERVER (answers but not ok)
@@ -1059,6 +1122,20 @@ def main() -> int:
         lines.append(fn_blob)
     elif not fn_fp and old_fn_fp:
         lines.append("🟢 flash-next: :11439 healthy again (provider spark restored)")
+
+    # engine-home ownership (2026-09-08): the forcing function for the root-owned
+    # EACCES class. Inverted probe -- loud while the bad state exists. Same fp dedup,
+    # plus a recovery line so a repair is visible and not just silence.
+    ro_warns = _engine_home_root_owned()
+    ro_blob = "\n".join(ro_warns).strip()
+    ro_fp = hashlib.sha256(ro_blob.encode()).hexdigest()[:16] if ro_blob else None
+    new_state["fps"]["engine_home_root_owned"] = ro_fp
+    new_state["engine_home_root_owned_checked_at"] = _iso()
+    old_ro_fp = (prev.get("fps") or {}).get("engine_home_root_owned")
+    if ro_fp and ro_fp != old_ro_fp:
+        lines.append(ro_blob)
+    elif not ro_fp and old_ro_fp:
+        lines.append("🟢 engine home: no root-owned files (EACCES class clear)")
 
     # flash-next completion liveness (t_83348309, 2026-09-06): a second,
     # independent leg proving real inference (not just health/models) through
