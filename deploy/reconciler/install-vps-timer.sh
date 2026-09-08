@@ -26,6 +26,10 @@ SRC="${REMOTE_SRC}"
 ls -la "\$SRC/deploy/reconciler/"
 cp "\$SRC/deploy/reconciler/juice-doctor-reconcile.service" /etc/systemd/system/
 cp "\$SRC/deploy/reconciler/juice-doctor-reconcile.timer" /etc/systemd/system/
+# K2SharedKanban CLI: keep the safe (sudo -u t1000) form the only form on PATH.
+if [ -f "\$SRC/deploy/k2kanban/k2kanban" ]; then
+  install -m 0755 "\$SRC/deploy/k2kanban/k2kanban" /usr/local/bin/k2kanban
+fi
 mkdir -p /opt/t1000/home/reconciler
 chown -R t1000:t1000 /opt/t1000/home/reconciler 2>/dev/null || true
 chown -R t1000:t1000 "\$SRC/deploy/reconciler" "\$SRC/hermes_cli/reconciler.py" "\$SRC/scripts/juice-doctor" 2>/dev/null || true
