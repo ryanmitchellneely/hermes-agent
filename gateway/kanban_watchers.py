@@ -54,6 +54,63 @@ def _write_dispatcher_heartbeat(**fields: Any) -> None:
         logger.exception("kanban dispatcher: heartbeat write failed")
 
 
+def _per_host_caps_preview(max_in_progress_per_profile: Any) -> "dict[str, dict[str, int]]":
+    """Extract just the per-host portion of a (possibly nested)
+    ``kanban.max_in_progress_per_profile`` value, for the dispatcher's
+    startup log line only — this is never used for an actual cap decision
+    here (that's ``kanban_db._resolve_profile_host_cap``, read fresh per
+    dispatch, per Phase 2 R5 — docs/build-plans/2026-09-03-sandbox-mesh-
+    phase2.md "Dispatcher side"). Returns ``{}`` for the plain-int / classic
+    mapping shapes (nothing new to show) and never raises — a bad or
+    unimportable normalizer must not break dispatcher startup, only leave
+    this preview empty.
+    """
+    try:
+        from hermes_cli.kanban_db import _normalize_per_profile_cap
+    except Exception:
+        return {}
+    try:
+        normalized = _normalize_per_profile_cap(max_in_progress_per_profile)
+    except Exception:
+        return {}
+    if not isinstance(normalized, dict):
+        return {}
+    preview: "dict[str, dict[str, int]]" = {}
+    for profile, entry in normalized.items():
+        if isinstance(entry, dict) and entry.get("per_host"):
+            preview[profile] = dict(entry["per_host"])
+    return preview
+
+
+def _resolve_pool_hosts(kanban_home) -> list:
+    """Load the reviewed ``sandbox_hosts.yaml`` once, for the dispatcher's
+    startup log line (Phase 2 R5). Fails safe to ``[]`` — a load error here
+    must never crash dispatcher startup; it only means the operator-visible
+    pool-host line is empty, matching ``sandbox_hosts.load_sandbox_hosts``'s
+    own "missing/unparsable file -> no hosts" contract.
+    """
+    try:
+        from hermes_cli import sandbox_hosts as _sh
+    except Exception:
+        return []
+    try:
+        return _sh.load_sandbox_hosts(_sh.sandbox_hosts_path(kanban_home))
+    except Exception:
+        return []
+
+
+def _pool_hosts_log_payload(hosts) -> "list[str]":
+    """The exact value logged for ``pool hosts enabled=...`` at dispatcher
+    startup -- names only (round 3, 2026-09-05). ``SandboxHost.
+    identity_file`` and ``.host_key`` are opaque, secret-adjacent strings
+    (an SSH key path and a host's public key material) that must never
+    reach a log line; this is the one seam both the real startup log call
+    and this module's own tests go through, so a future edit to that log
+    line can't reintroduce them by accident.
+    """
+    return [h.name for h in hosts]
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1351,6 +1408,24 @@ class GatewayKanbanWatchersMixin:
                         "kanban dispatcher: max_in_progress_per_profile=%s",
                         max_in_progress_per_profile,
                     )
+
+        # Per-host pool caps + the reviewed sandbox_hosts.yaml list (Phase 2
+        # R5, docs/build-plans/2026-09-03-sandbox-mesh-phase2.md "Dispatcher
+        # side"): read once at dispatcher start, same point as every other
+        # config knob above, and logged so an operator can see what the
+        # running dispatcher believes without guessing from config.yaml.
+        # Names only — never identity_file/host_key/address/account; those
+        # are the transport leg's business (R1-R4), not this log line's,
+        # and are opaque/secret-adjacent on the row (round 3, 2026-09-05 —
+        # see hermes_cli.sandbox_hosts module docstring).
+        _host_caps_preview = _per_host_caps_preview(max_in_progress_per_profile)
+        if _host_caps_preview:
+            logger.info("kanban dispatcher: per-host caps=%s", _host_caps_preview)
+        _pool_hosts = _resolve_pool_hosts(_kb.kanban_home())
+        logger.info(
+            "kanban dispatcher: pool hosts enabled=%s",
+            _pool_hosts_log_payload(_pool_hosts),
+        )
 
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify

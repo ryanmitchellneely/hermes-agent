@@ -9853,8 +9853,43 @@ def _normalize_per_profile_cap(raw):
     throttle): per-profile caps with an optional "default" key, e.g.
     {"sonnet": 6, "default": 2}. A profile absent from the map falls back to
     "default"; no "default" means that profile is UNCAPPED. Invalid entries
-    are dropped rather than poisoning the whole cap. Returns int, dict, or
-    None (no cap at all).
+    are dropped rather than poisoning the whole cap.
+
+    A profile's own value may ALSO be a mapping (2026-09-05, Phase 2 R5 —
+    docs/build-plans/2026-09-03-sandbox-mesh-phase2.md "Dispatcher side"):
+    ``{"default": int, "per_host": {<host name>: int}}``. ``"default"`` here
+    replaces what a plain int would have meant for that profile (the
+    profile's overall in-flight cap, host-agnostic — see
+    ``_resolve_profile_cap``); ``"per_host"`` narrows that further for one
+    pooled sandbox host. Fail closed throughout — never silently uncapped:
+
+    - One host's own figure that doesn't parse as a positive int —
+      including a YAML boolean literal (``true``/``false``), since
+      Python's ``bool`` is an ``int`` subclass and would otherwise pass a
+      naive ``int(v)`` — normalizes to ``0`` for that host only. See
+      ``_normalize_profile_host_entry``.
+    - A ``per_host`` value that is present but isn't a mapping at all (a
+      list, a string, a plain int/bool) normalizes the WHOLE profile's
+      per-host data to a distinct sentinel — never "no per-host data",
+      never dropped down to the outer "default" profile. See
+      ``_normalize_profile_host_entry`` and ``_resolve_profile_host_cap``.
+    - A host that resolves to neither its own valid ``per_host`` figure
+      nor a usable ``"default"`` to fall back on also refuses, rather than
+      reading as unconstrained — closing an asymmetry a 2026-09-05 review
+      found with this function's own profile→"default" fallback.
+      ``_resolve_profile_host_cap`` documents the single resolution rule
+      this applies uniformly, including for a plain-int entry.
+
+    ``"default"`` itself keeps the top-level fail-OPEN behaviour (a bad
+    top-level int falls back to uncapped), since it is exactly the
+    plain-int cap under a different key. A profile-mapping entry with no
+    usable ``"default"`` and no ``per_host`` data at all (never configured
+    — distinct from configured-and-malformed) is dropped like any other
+    invalid entry.
+
+    Returns int, dict, or None (no cap at all). Every existing config (a
+    plain int, or a mapping of plain ints) normalizes byte-identically to
+    before this extension — the mapping-of-mapping shape is additive.
     """
     if raw is None:
         return None
@@ -9863,6 +9898,11 @@ def _normalize_per_profile_cap(raw):
     if isinstance(raw, dict):
         clean = {}
         for k, v in raw.items():
+            if isinstance(v, dict):
+                entry = _normalize_profile_host_entry(v)
+                if entry is not None:
+                    clean[str(k)] = entry
+                continue
             try:
                 iv = int(v)
             except (TypeError, ValueError):
@@ -9873,13 +9913,159 @@ def _normalize_per_profile_cap(raw):
     return None
 
 
+def _normalize_profile_host_entry(entry):
+    """Normalize one profile's ``{"default": int, "per_host": {...}}``
+    mapping — see ``_normalize_per_profile_cap``. Returns
+    ``{"default": int|None, "per_host": {host: int}|None}``, or ``None``
+    when the entry has neither a usable ``"default"`` nor any ``per_host``
+    data at all (dropped like any other invalid top-level entry — this is
+    the ONLY case that drops; a malformed ``per_host`` block never does,
+    see below).
+
+    ``per_host`` normalizes to one of three shapes, and the difference is
+    load-bearing for ``_resolve_profile_host_cap``:
+
+    - ``{}`` — ``per_host`` was absent (or explicitly ``None``/``null``):
+      no host-specific data was ever configured for this profile. A host
+      queried against this falls through to the profile's own
+      ``"default"``, exactly as if ``per_host`` had never existed.
+    - ``{host: int, ...}`` — a real mapping. Each host's own figure fails
+      CLOSED, never dropped, on either of two edges: a value that doesn't
+      parse as a positive int (``"junk"``, ``None``, a nested dict/list,
+      ``0``, a negative number) normalizes to ``0`` (refuse that host);
+      and a YAML boolean literal (``true``/``false``) is refused the same
+      way EVEN THOUGH ``int(True) == 1`` — Python's ``bool`` is an ``int``
+      subclass, so a naive ``int(v)`` would otherwise silently accept a
+      fat-fingered ``sov-core-01: true`` as a real cap of ``1``.
+    - ``None`` — the ``per_host`` value was PRESENT but wasn't a mapping
+      at all (a list, a string, a plain int/bool): the operator's intent
+      was clearly to set per-host caps, but the shape can't be trusted at
+      all, so this is a distinct sentinel from ``{}`` — never "no
+      host-specific data" (which would let ``_resolve_profile_host_cap``
+      fall back to ``"default"``), always "unparsable; refuse every host
+      for this profile" (``_resolve_profile_host_cap`` returns ``0`` for
+      any host once it sees this, regardless of whether ``"default"`` is
+      itself valid — a bad ``per_host`` block must not be reachable
+      around by having set a good ``"default"``).
+
+    ``"default"`` keeps the existing fail-OPEN behaviour of a bad
+    top-level int (falls back to uncapped), since it is exactly the
+    plain-int cap under a different key — and an entry is kept (never
+    dropped to fall through to the outer "default" profile) whenever
+    EITHER half has anything to say, including a malformed ``per_host``
+    sentinel by itself: dropping it would silently reopen every host to
+    whatever the outer "default" profile allows, which is exactly the
+    fail-open outcome this sentinel exists to prevent.
+    """
+    default_val = None
+    if "default" in entry:
+        try:
+            dv = int(entry["default"])
+        except (TypeError, ValueError):
+            dv = None
+        else:
+            if dv <= 0:
+                dv = None
+        default_val = dv
+    raw_per_host = entry.get("per_host")
+    if raw_per_host is None:
+        per_host_clean = {}
+    elif isinstance(raw_per_host, dict):
+        per_host_clean = {}
+        for host_name, host_val in raw_per_host.items():
+            if isinstance(host_val, bool):
+                # YAML bool is an int subclass in Python (int(True) == 1) —
+                # refuse rather than silently accept it as a typed figure.
+                hv = 0
+            else:
+                try:
+                    hv = int(host_val)
+                    if hv <= 0:
+                        raise ValueError("per_host cap must be positive")
+                except (TypeError, ValueError):
+                    hv = 0  # fail closed: unparsable/non-positive => refuse this host
+            per_host_clean[str(host_name)] = hv
+    else:
+        # The whole per_host block is unparsable (list/string/int/bool) —
+        # sentinel: _resolve_profile_host_cap refuses every host for this
+        # profile. Distinct from {} (no per_host data at all, ever).
+        per_host_clean = None
+    if default_val is None and per_host_clean == {}:
+        return None
+    return {"default": default_val, "per_host": per_host_clean}
+
+
 def _resolve_profile_cap(cap, profile):
-    """Effective cap for one profile under int-or-mapping semantics."""
+    """Effective cap for one profile under int-or-mapping semantics.
+
+    A profile's own entry may itself be the Phase 2 R5 host-aware mapping
+    (``{"default": int|None, "per_host": {...}}`` — see
+    ``_normalize_per_profile_cap``); this returns just its ``"default"``,
+    i.e. the profile's overall in-flight cap, host-agnostic. Use
+    ``_resolve_profile_host_cap`` for the per-host figure.
+    """
     if cap is None:
         return None
     if isinstance(cap, dict):
-        return cap.get(profile, cap.get("default"))
+        entry = cap.get(profile, cap.get("default"))
+        if isinstance(entry, dict):
+            return entry.get("default")
+        return entry
     return cap
+
+
+def _resolve_profile_host_cap(cap, profile, host):
+    """Effective per-(profile, host) cap. ONE resolution rule, applied the
+    same way for every entry shape a profile can have (closes a
+    2026-09-05 review's finding that this function skipped
+    ``_resolve_profile_cap``'s own profile→``"default"`` fallback):
+
+    1. Resolve this profile's entry exactly as ``_resolve_profile_cap``
+       does — ``cap.get(profile, cap.get("default"))`` — so a profile
+       absent from ``cap`` inherits the outer ``"default"`` entry, if any,
+       before anything below even looks at ``host``.
+    2. An int entry (today's plain-cap shape — including when it's the
+       outer ``"default"`` profile itself that's a plain int) — that cap
+       applies FOR EVERY HOST: there is no host-scoped data to narrow it
+       with, so nothing host-specific ever overrides it.
+    3. A mapping entry (the Phase 2 R5 ``{"default": int|None, "per_host":
+       {...}}`` shape — see ``_normalize_profile_host_entry``) resolves
+       most-specific-wins:
+         - ``per_host[host]`` if ``host`` is a key in it. A fail-closed
+           ``0`` counts as "present" exactly like a positive cap does —
+           both were deliberately resolved, neither is missing data.
+         - else the entry's own ``"default"``, if it is a usable
+           (non-``None``) int — the profile's overall cap doubling as
+           this otherwise-unlisted host's cap.
+         - else ``0`` — REFUSE. A bare ``None`` here would read as
+           "unconstrained", which is never a safe reading of a shape that
+           exists specifically to constrain hosts. This is also exactly
+           where ``_normalize_profile_host_entry``'s malformed-``per_host``
+           sentinel (``entry["per_host"] is None``) lands: every host is
+           refused for a profile whose per_host block couldn't be parsed,
+           checked BEFORE the ``"default"`` fallback so a valid
+           ``"default"`` can never paper over an unparsable ``per_host``.
+    4. Anything else — ``cap`` isn't a dict, ``host`` is falsy, or the
+       resolved entry is neither an int nor a dict (no cap configured for
+       this profile OR the outer "default", at all) — returns ``None``:
+       truly no data, as opposed to data that failed to parse.
+    """
+    if not isinstance(cap, dict) or not host:
+        return None
+    entry = cap.get(profile, cap.get("default"))
+    if isinstance(entry, int):
+        return entry
+    if not isinstance(entry, dict):
+        return None
+    per_host = entry.get("per_host")
+    if per_host is None:
+        return 0  # malformed per_host block (see _normalize_profile_host_entry)
+    if host in per_host:
+        return per_host[host]
+    default_val = entry.get("default")
+    if isinstance(default_val, int):
+        return default_val
+    return 0
 
 
 def dispatch_once(
