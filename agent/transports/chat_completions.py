@@ -585,6 +585,23 @@ class ChatCompletionsTransport(ProviderTransport):
         if overrides:
             api_kwargs.update(overrides)
 
+        from agent.thinking_control import apply_thinking_control, lookup_provider_entry
+
+        _tc_in = api_kwargs.get("extra_body")
+        if not isinstance(_tc_in, dict):
+            _tc_in = {}
+        _tc_out = apply_thinking_control(
+            _tc_in,
+            reasoning_config,
+            lookup_provider_entry(
+                params.get("provider_name") or params.get("provider"),
+                params.get("base_url"),
+            ),
+        )
+        if _tc_out is not _tc_in:
+            api_kwargs["extra_body"] = _tc_out
+            api_kwargs.pop("reasoning_effort", None)
+
         _add_prompt_cache_key(
             api_kwargs,
             messages=sanitized,
@@ -711,6 +728,20 @@ class ChatCompletionsTransport(ProviderTransport):
                     extra_body.update(v)
                 else:
                     api_kwargs[k] = v
+
+        from agent.thinking_control import apply_thinking_control, lookup_provider_entry
+
+        _tc_out = apply_thinking_control(
+            extra_body,
+            reasoning_config,
+            lookup_provider_entry(
+                params.get("provider_name") or params.get("provider"),
+                params.get("base_url"),
+            ),
+        )
+        if _tc_out is not extra_body:
+            extra_body = _tc_out
+            api_kwargs.pop("reasoning_effort", None)
 
         if extra_body:
             # Native Gemini (generativelanguage.googleapis.com, non-/openai)

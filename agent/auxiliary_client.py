@@ -8083,6 +8083,16 @@ def _build_call_kwargs(
                 sticky_key = None
             if sticky_key:
                 merged_extra["session_id"] = sticky_key
+    from agent.thinking_control import apply_thinking_control, lookup_provider_entry
+
+    _tc_out = apply_thinking_control(
+        merged_extra,
+        reasoning_config,
+        lookup_provider_entry(provider, effective_base or base_url),
+    )
+    if _tc_out is not merged_extra:
+        merged_extra = _tc_out
+        kwargs.pop("reasoning_effort", None)
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
