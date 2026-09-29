@@ -26,7 +26,7 @@ Agent init also POSTs `{"name": "stub-model"}` at the stub (model-metadata probe
 
 ## Golden bytes for B5
 
-`tests/fixtures/provider_wire_body/golden/*.body` are the raw socket bytes for aux, main-stream, main-nonstream, and moa with no `extra_body` and no `thinking_control`, captured on this branch while the engine still matched `fork/main`. Two back-to-back runs (different stub ports) hashed identical. The main-agent system prompt embeds this machine's temp `HERMES_HOME`, the OS line, and the frozen date `Tuesday, September 29, 2026` (`hermes_time.now` pinned inside the probe). A re-run of the same probe on this machine matches those bytes; a different temp root would not.
+`tests/fixtures/provider_wire_body/golden/*.body` are the raw socket bytes for aux, main-stream, main-nonstream, and moa with no `extra_body` and no `thinking_control`, captured on this branch while the engine still matched `fork/main`. Two back-to-back runs (different stub ports) hashed identical. The probe pins `HERMES_HOME` to `/tmp/hermes-thinking-control-probe` (not `tempfile.gettempdir()`), because `scripts/run_tests.sh` starts from `env -i` and drops `TMPDIR`; a `$TMPDIR`-based home would change the system prompt and fail B5 under the test runner. The main-agent system prompt still embeds that path, the OS line (`macOS (15.5)`), and the frozen date `Tuesday, September 29, 2026` (`hermes_time.now` pinned inside the probe). A re-run of this probe on this machine matches those bytes.
 
 ## Spec note carried into Stage B
 

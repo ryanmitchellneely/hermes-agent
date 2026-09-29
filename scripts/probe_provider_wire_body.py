@@ -15,7 +15,6 @@ import locale
 import logging
 import os
 import sys
-import tempfile
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,7 +22,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROBE_HOME = Path(tempfile.gettempdir()) / "hermes-thinking-control-probe"
+PROBE_HOME = Path("/tmp/hermes-thinking-control-probe")
 FROZEN_NOW = datetime(2026, 9, 29, 15, 0, tzinfo=timezone.utc)
 STAGE_A_PATHS = ("aux", "main-stream", "moa")
 ALL_PATHS = ("aux", "main-stream", "main-nonstream", "moa")
@@ -301,7 +300,9 @@ def _judge(path: str, body: dict | None, warnings: list[str], args: argparse.Nam
             return True, "reasoning_effort xhigh, never high"
         return False, f"expected reasoning_effort xhigh and never high, got ctk={ctk} top={top_effort!r}"
     if args.reasoning == "minimal" or (args.thinking_control == "ds4" and args.reasoning == "low"):
-        named = any(args.reasoning in line for line in warnings)
+        named = any(
+            "dropped unmapped" in line and args.reasoning in line for line in warnings
+        )
         if ctk.get(switch) is True and "reasoning_effort" not in ctk and "reasoning_effort" not in body and named:
             return True, f"no effort key; WARNING names {args.reasoning}"
         if "reasoning_effort" in ctk or "reasoning_effort" in body:
