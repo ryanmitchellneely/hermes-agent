@@ -1,0 +1,9 @@
+{
+  "messages": [
+    {
+      "content": "Reply with the single word pong.",
+      "role": "user"
+    }
+  ],
+  "model": "stub-model"
+}
