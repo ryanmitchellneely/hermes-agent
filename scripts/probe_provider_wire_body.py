@@ -22,8 +22,33 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROBE_HOME = Path("/tmp/hermes-thinking-control-probe")
-FROZEN_NOW = datetime(2026, 9, 29, 15, 0, tzinfo=timezone.utc)
+
+
+def _probe_home() -> Path:
+    raw = os.environ.get("HERMES_PROBE_HOME", "").strip()
+    path = Path(raw).expanduser() if raw else Path("/tmp/hermes-thinking-control-probe")
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    resolved = path.resolve()
+    banned = (Path("/opt/t1000"), Path.home() / ".t1000")
+    for root in banned:
+        if resolved == root or root in resolved.parents:
+            raise RuntimeError(f"refusing probe home under {root}: {resolved}")
+    if resolved in {Path("/"), Path.home()} or len(resolved.parts) < 3:
+        raise RuntimeError(f"refusing probe home {resolved}")
+    return path
+
+
+def _frozen_now() -> datetime:
+    raw = os.environ.get("HERMES_PROBE_FROZEN_NOW", "").strip()
+    if not raw:
+        return datetime(2026, 9, 29, 15, 0, tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 STAGE_A_PATHS = ("aux", "main-stream", "moa")
 ALL_PATHS = ("aux", "main-stream", "main-nonstream", "moa")
 
@@ -32,19 +57,39 @@ QWEN_THINKING = {
     "switch_key": "enable_thinking",
     "effort_key": "reasoning_effort",
     "effort_map": {
+        "minimal": "low",
         "low": "low",
         "medium": "medium",
         "high": "xhigh",
         "xhigh": "xhigh",
         "max": "xhigh",
+        "ultra": "xhigh",
     },
 }
 DS4_THINKING = {
     "kind": "chat_template_kwargs",
     "switch_key": "thinking",
     "effort_key": "reasoning_effort",
-    "effort_map": {"high": "high", "xhigh": "max", "max": "max"},
+    "effort_map": {
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "ultra": "max",
+    },
 }
+# Qwen map with minimal removed, so bar B3 still has a valid effort the map does not cover.
+PARTIAL_THINKING = {
+    "kind": "chat_template_kwargs",
+    "switch_key": "enable_thinking",
+    "effort_key": "reasoning_effort",
+    "effort_map": {
+        key: value for key, value in QWEN_THINKING["effort_map"].items() if key != "minimal"
+    },
+}
+_SYSTEM_PLACEHOLDER = "<system-message>"
 
 
 def _scrub_provider_env() -> None:
@@ -178,9 +223,7 @@ def _write_config(home: Path, base_url: str, args: argparse.Namespace) -> None:
     if not args.omit_extra_body and args.mode == "stage-a":
         provider["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     if args.mode == "stage-b":
-        provider["thinking_control"] = dict(
-            DS4_THINKING if args.thinking_control == "ds4" else QWEN_THINKING
-        )
+        provider["thinking_control"] = dict(_thinking_block(args))
     config: dict = {
         "model": {"provider": "stub", "default": "stub-model"},
         "providers": {"stub": provider},
@@ -206,7 +249,8 @@ def _freeze_clock() -> None:
     import hermes_time
 
     hermes_time.reset_cache()
-    hermes_time.now = lambda: FROZEN_NOW
+    frozen = _frozen_now()
+    hermes_time.now = lambda: frozen
 
 
 def _snapshot() -> int:
@@ -255,10 +299,16 @@ def _detail(body: dict | None) -> str:
     )
 
 
-def _switch_key(args: argparse.Namespace) -> str:
+def _thinking_block(args: argparse.Namespace) -> dict:
     if args.thinking_control == "ds4":
-        return "thinking"
-    return "enable_thinking"
+        return DS4_THINKING
+    if args.thinking_control == "partial":
+        return PARTIAL_THINKING
+    return QWEN_THINKING
+
+
+def _switch_key(args: argparse.Namespace) -> str:
+    return str(_thinking_block(args).get("switch_key") or "enable_thinking")
 
 
 def _judge(path: str, body: dict | None, warnings: list[str], args: argparse.Namespace) -> tuple[bool, str]:
@@ -284,22 +334,11 @@ def _judge(path: str, body: dict | None, warnings: list[str], args: argparse.Nam
         if ctk.get(switch) is False and "reasoning_effort" not in ctk and "reasoning_effort" not in body:
             return True, f"chat_template_kwargs.{switch} is false and no reasoning_effort"
         return False, f"expected {switch}=false and no reasoning_effort, got ctk={ctk} top={top_effort!r}"
-    if args.reasoning == "low" and args.thinking_control != "ds4":
-        ok = (
-            ctk.get(switch) is True
-            and effort_in_ctk == "low"
-            and "reasoning_effort" not in body
-        )
-        if ok:
-            return True, "enable_thinking true, reasoning_effort low"
-        return False, f"expected enable_thinking true and reasoning_effort low, got ctk={ctk} top={top_effort!r}"
-    if args.reasoning == "high" and args.thinking_control != "ds4":
-        raw_high = effort_in_ctk == "high" or top_effort == "high"
-        ok = ctk.get(switch) is True and effort_in_ctk == "xhigh" and not raw_high
-        if ok:
-            return True, "reasoning_effort xhigh, never high"
-        return False, f"expected reasoning_effort xhigh and never high, got ctk={ctk} top={top_effort!r}"
-    if args.reasoning == "minimal" or (args.thinking_control == "ds4" and args.reasoning == "low"):
+    effort_map = _thinking_block(args).get("effort_map")
+    if not isinstance(effort_map, dict):
+        effort_map = {}
+    mapped = effort_map.get(args.reasoning)
+    if mapped is None:
         named = any(
             "dropped unmapped" in line and args.reasoning in line for line in warnings
         )
@@ -310,14 +349,15 @@ def _judge(path: str, body: dict | None, warnings: list[str], args: argparse.Nam
         if not named:
             return False, f"no WARNING naming {args.reasoning}"
         return False, f"expected {switch}=true and no effort key, got ctk={ctk}"
-    if args.thinking_control == "ds4" and args.reasoning == "high":
-        ok = ctk.get(switch) is True and effort_in_ctk == "high" and "reasoning_effort" not in body
-        if ok:
-            return True, "thinking true, reasoning_effort high"
-        return False, f"expected DS4 high mapping, got ctk={ctk} top={top_effort!r}"
-    if args.thinking_control == "ds4" and args.reasoning == "none":
-        return _judge(path, body, warnings, args)
-    return False, f"no judge for mode={args.mode} reasoning={args.reasoning}"
+    sent_raw_high = effort_in_ctk == "high" or top_effort == "high"
+    ok = ctk.get(switch) is True and effort_in_ctk == mapped and "reasoning_effort" not in body
+    if args.reasoning == "high" and mapped != "high":
+        if ok and not sent_raw_high:
+            return True, "reasoning_effort xhigh, never high"
+        return False, f"expected reasoning_effort xhigh and never high, got ctk={ctk} top={top_effort!r}"
+    if ok:
+        return True, f"{switch} true, reasoning_effort {mapped}"
+    return False, f"expected {switch}=true and reasoning_effort {mapped}, got ctk={ctk} top={top_effort!r}"
 
 
 class _WarningTap(logging.Handler):
@@ -439,24 +479,84 @@ def _save_raw(directory: Path, path: str, raw: bytes) -> None:
     (directory / f"{path}.body").write_bytes(raw)
 
 
+def _mask_system_text(body: dict) -> dict:
+    """Replace system-message text with a fixed placeholder.
+
+    That text embeds the host OS, the probe HERMES_HOME path, and the date.
+    Every other field is left unchanged so the comparison stays exact.
+    """
+    masked = dict(body)
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return masked
+    rewritten = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            replaced = dict(message)
+            replaced["content"] = _SYSTEM_PLACEHOLDER
+            rewritten.append(replaced)
+        else:
+            rewritten.append(message)
+    masked["messages"] = rewritten
+    return masked
+
+
+def _describe_mismatch(expected, actual, where: str = "$") -> str:
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        for key in list(expected) + [key for key in actual if key not in expected]:
+            if key not in actual:
+                return f"{where}.{key}: missing"
+            if key not in expected:
+                return f"{where}.{key}: unexpected"
+            found = _describe_mismatch(expected[key], actual[key], f"{where}.{key}")
+            if found:
+                return found
+        return ""
+    if isinstance(expected, list) and isinstance(actual, list):
+        if len(expected) != len(actual):
+            return f"{where}: length {len(actual)} != {len(expected)}"
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            found = _describe_mismatch(left, right, f"{where}[{index}]")
+            if found:
+                return found
+        return ""
+    if expected != actual:
+        left = repr(expected)
+        right = repr(actual)
+        if len(left) > 120:
+            left = left[:117] + "..."
+        if len(right) > 120:
+            right = right[:117] + "..."
+        return f"{where}: {right} != {left}"
+    return ""
+
+
 def _check_raw(directory: Path, path: str, raw: bytes) -> str | None:
     target = directory / f"{path}.body"
     if not target.is_file():
         return f"missing golden {target}"
-    expected = target.read_bytes()
-    if expected != raw:
-        return f"byte mismatch against {target} ({len(raw)} != {len(expected)})"
+    try:
+        expected = json.loads(target.read_bytes().decode("utf-8"))
+        actual = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return f"golden compare could not parse {path}: {exc}"
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return f"golden compare expected objects for {path}"
+    mismatch = _describe_mismatch(_mask_system_text(expected), _mask_system_text(actual))
+    if mismatch:
+        return f"field mismatch against {target}: {mismatch}"
     return None
 
 
 def _prepare_home(base_url: str, args: argparse.Namespace) -> None:
-    if PROBE_HOME.exists():
+    home = _probe_home()
+    if home.exists():
         import shutil
 
-        shutil.rmtree(PROBE_HOME)
-    PROBE_HOME.mkdir(parents=True)
-    _write_config(PROBE_HOME, base_url, args)
-    os.environ["HERMES_HOME"] = str(PROBE_HOME)
+        shutil.rmtree(home)
+    home.mkdir(parents=True)
+    _write_config(home, base_url, args)
+    os.environ["HERMES_HOME"] = str(home)
     os.environ["HERMES_TIMEZONE"] = "UTC"
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
@@ -470,7 +570,6 @@ def run(args: argparse.Namespace) -> int:
     _scrub_provider_env()
     _pin_locale()
     _StubHandler.records = []
-    jsonl_path = PROBE_HOME / "wire.jsonl"
     server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
     host, port = server.server_address[:2]
     if host != "127.0.0.1":
@@ -482,7 +581,7 @@ def run(args: argparse.Namespace) -> int:
     thread.start()
     try:
         _prepare_home(base_url, args)
-        jsonl_path = PROBE_HOME / "wire.jsonl"
+        jsonl_path = _probe_home() / "wire.jsonl"
         _StubHandler.jsonl_path = jsonl_path
         logging.basicConfig(level=logging.WARNING, stream=sys.stderr, force=True)
         paths = tuple(args.paths.split(",")) if args.paths else (
@@ -535,7 +634,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mode", choices=("stage-a", "stage-b", "golden"), default="stage-a")
     parser.add_argument("--omit-extra-body", action="store_true")
     parser.add_argument("--reasoning", default="")
-    parser.add_argument("--thinking-control", choices=("qwen", "ds4", "none"), default="qwen")
+    parser.add_argument(
+        "--thinking-control",
+        choices=("qwen", "ds4", "partial", "none"),
+        default="qwen",
+    )
     parser.add_argument("--paths", default="")
     parser.add_argument("--save-fixtures", default="")
     parser.add_argument("--save-golden", default="")

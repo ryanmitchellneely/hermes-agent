@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,21 +20,31 @@ QWEN = {
     "switch_key": "enable_thinking",
     "effort_key": "reasoning_effort",
     "effort_map": {
+        "minimal": "low",
         "low": "low",
         "medium": "medium",
         "high": "xhigh",
         "xhigh": "xhigh",
         "max": "xhigh",
+        "ultra": "xhigh",
     },
 }
 DS4 = {
     "kind": "chat_template_kwargs",
     "switch_key": "thinking",
     "effort_key": "reasoning_effort",
-    "effort_map": {"high": "high", "xhigh": "max", "max": "max"},
+    "effort_map": {
+        "minimal": "high",
+        "low": "high",
+        "medium": "high",
+        "high": "high",
+        "xhigh": "max",
+        "max": "max",
+        "ultra": "max",
+    },
 }
 MAPS = {"qwen": QWEN, "ds4": DS4}
-EFFORTS = ("none", "low", "high", "max", "minimal")
+EFFORTS = ("none", "low", "high", "max", "minimal", "unknown")
 
 
 def _reasoning(effort: str) -> dict:
@@ -166,7 +178,12 @@ def test_b1b_caller_kwargs_win_and_merge(monkeypatch, builder):
 
 
 def test_b3_unmapped_effort_logs_once_for_the_call(monkeypatch, caplog):
-    _install(monkeypatch, QWEN)
+    # minimal is in the corrected Qwen map. Drop it so this bar still sees an unmapped effort.
+    partial = {
+        **QWEN,
+        "effort_map": {key: value for key, value in QWEN["effort_map"].items() if key != "minimal"},
+    }
+    _install(monkeypatch, partial)
     with caplog.at_level(logging.WARNING, logger="agent.thinking_control"):
         kwargs = _aux("minimal")
     extra = kwargs["extra_body"]
@@ -183,7 +200,10 @@ def test_inactive_block_returns_the_same_object():
     assert apply_thinking_control(body, {"enabled": True, "effort": "high"}, {}) is body
 
 
-def _probe(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _probe(args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    proc_env = os.environ.copy()
+    if env:
+        proc_env.update(env)
     return subprocess.run(
         [sys.executable, str(ROOT / "scripts/probe_provider_wire_body.py"), *args],
         cwd=ROOT,
@@ -191,7 +211,17 @@ def _probe(args: list[str]) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=180,
         check=False,
+        env=proc_env,
     )
+
+
+def _system_text(raw: bytes) -> str:
+    body = json.loads(raw.decode("utf-8"))
+    for message in body.get("messages") or []:
+        if isinstance(message, dict) and message.get("role") == "system":
+            content = message.get("content")
+            return content if isinstance(content, str) else json.dumps(content)
+    return ""
 
 
 @pytest.mark.parametrize("reasoning", ("none", "low", "high"))
@@ -213,7 +243,7 @@ def test_b3_probe_unmapped_effort_on_the_wire():
     proc = _probe([
         "--mode", "stage-b",
         "--reasoning", "minimal",
-        "--thinking-control", "qwen",
+        "--thinking-control", "partial",
         "--paths", "aux",
     ])
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -222,13 +252,30 @@ def test_b3_probe_unmapped_effort_on_the_wire():
     assert "minimal" in proc.stdout
 
 
-def test_b5_golden_bytes_without_thinking_control():
-    proc = _probe([
+def test_b5_golden_bytes_without_thinking_control(tmp_path):
+    golden = [
         "--mode", "golden",
         "--check-golden",
         "tests/fixtures/provider_wire_body/golden",
-    ])
+    ]
+    proc = _probe(golden)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    other_home = tmp_path / "alt-hermes-home"
+    captured = tmp_path / "captured"
+    alt = _probe(
+        [*golden, "--save-golden", str(captured)],
+        env={
+            "HERMES_PROBE_HOME": str(other_home),
+            "HERMES_PROBE_FROZEN_NOW": "2019-07-04T01:02:03+00:00",
+        },
+    )
+    assert alt.returncode == 0, alt.stdout + alt.stderr
+    saved = _system_text((captured / "main-stream.body").read_bytes())
+    committed = _system_text((ROOT / "tests/fixtures/provider_wire_body/golden/main-stream.body").read_bytes())
+    assert str(other_home) in saved
+    assert "Thursday, July 04, 2019" in saved
+    assert saved != committed
 
 
 def _write_provider(home: Path, block: dict) -> None:
@@ -282,35 +329,17 @@ def test_b7_partial_map_warns_and_complete_map_does_not(tmp_path, monkeypatch, c
     ]
     assert len(partial) == 1
     assert partial[0].startswith("providers.stub.thinking_control:")
-    for effort in missing:
-        assert effort in partial[0]
-    assert "low" not in partial[0].split("missing efforts ", 1)[1].split(", ")
+    named = partial[0].split("missing efforts ", 1)[1].split(", ")
+    assert named == missing
 
-    caplog.clear()
-    complete = {
-        "kind": "chat_template_kwargs",
-        "switch_key": "enable_thinking",
-        "effort_key": "reasoning_effort",
-        "effort_map": {effort: effort for effort in VALID_REASONING_EFFORTS},
-    }
-    _write_provider(tmp_path / "complete", complete)
-    with caplog.at_level(logging.WARNING, logger="agent.thinking_control"):
-        _load_fresh(monkeypatch, tmp_path / "complete")
-    assert not [
-        rec for rec in caplog.records
-        if rec.name == "agent.thinking_control" and "effort_map is missing" in rec.getMessage()
-    ]
-
-    caplog.clear()
     for name, block in (("qwen", QWEN), ("ds4", DS4)):
+        caplog.clear()
         _write_provider(tmp_path / name, block)
         with caplog.at_level(logging.WARNING, logger="agent.thinking_control"):
             _load_fresh(monkeypatch, tmp_path / name)
-    printed = [
-        rec.getMessage()
-        for rec in caplog.records
-        if rec.name == "agent.thinking_control" and "effort_map is missing" in rec.getMessage()
-    ]
-    assert len(printed) == 2
-    assert any("minimal" in line and "ultra" in line for line in printed)
-    assert any("minimal" in line and "low" in line and "medium" in line for line in printed)
+        printed = [
+            rec.getMessage()
+            for rec in caplog.records
+            if rec.name == "agent.thinking_control" and "effort_map is missing" in rec.getMessage()
+        ]
+        assert printed == [], name
