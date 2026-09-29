@@ -2498,6 +2498,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                         {"id": "pareto-router", "min_coding_score": _ps}
                     ]
 
+            from agent.thinking_control import apply_thinking_control, lookup_provider_entry
+
+            _tc_summary_in = summary_extra_body if isinstance(summary_extra_body, dict) else {}
+            _tc_summary_out = apply_thinking_control(
+                _tc_summary_in,
+                agent.reasoning_config if isinstance(getattr(agent, "reasoning_config", None), dict) else None,
+                lookup_provider_entry(getattr(agent, "provider", None), getattr(agent, "base_url", None)),
+                getattr(agent, "model", None),
+            )
+            if _tc_summary_out is not _tc_summary_in:
+                summary_extra_body = _tc_summary_out or {}
+                summary_kwargs.pop("reasoning_effort", None)
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
 
