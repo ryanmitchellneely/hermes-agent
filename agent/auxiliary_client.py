@@ -8089,6 +8089,7 @@ def _build_call_kwargs(
         merged_extra,
         reasoning_config,
         lookup_provider_entry(provider, effective_base or base_url),
+        model,
     )
     if _tc_out is not merged_extra:
         merged_extra = _tc_out

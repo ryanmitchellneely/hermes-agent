@@ -597,6 +597,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 params.get("provider_name") or params.get("provider"),
                 params.get("base_url"),
             ),
+            model,
         )
         if _tc_out is not _tc_in:
             api_kwargs["extra_body"] = _tc_out
@@ -738,6 +739,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 params.get("provider_name") or params.get("provider"),
                 params.get("base_url"),
             ),
+            model,
         )
         if _tc_out is not extra_body:
             extra_body = _tc_out

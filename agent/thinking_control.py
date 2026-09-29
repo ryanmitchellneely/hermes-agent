@@ -73,6 +73,7 @@ def lookup_provider_entry(provider_name: str | None, base_url: str | None) -> di
 def _resolve_when_active(
     extra_body: dict | None,
     reasoning_config: dict | None,
+    model: str | None = None,
 ) -> dict | None:
     if isinstance(reasoning_config, dict):
         return reasoning_config
@@ -87,7 +88,10 @@ def _resolve_when_active(
     from hermes_cli.config import load_config
     from hermes_constants import resolve_reasoning_config
 
-    return resolve_reasoning_config(load_config() or {}, "")
+    # Empty model would resolve against the config's main model and ignore a
+    # per-model override for the model this request is actually calling.
+    requested = model.strip() if isinstance(model, str) else ""
+    return resolve_reasoning_config(load_config() or {}, requested)
 
 
 def _mapped_effort(effort_map: dict, effort: str) -> Any:
@@ -104,12 +108,17 @@ def apply_thinking_control(
     extra_body: dict | None,
     reasoning_config: dict | None,
     provider_entry: dict | None,
+    model: str | None = None,
 ) -> dict | None:
     block = thinking_control_block(provider_entry)
     if block is None:
         return extra_body
     source = extra_body if isinstance(extra_body, dict) else None
-    resolved = _resolve_when_active(source, reasoning_config if isinstance(reasoning_config, dict) else None)
+    resolved = _resolve_when_active(
+        source,
+        reasoning_config if isinstance(reasoning_config, dict) else None,
+        model,
+    )
     if not isinstance(resolved, dict):
         return extra_body
     body = dict(source or {})
@@ -133,6 +142,12 @@ def apply_thinking_control(
                 )
             else:
                 generated[effort_key.strip()] = mapped
+    if "chat_template_kwargs" in body and not isinstance(body.get("chat_template_kwargs"), dict):
+        logger.warning(
+            "thinking_control: provider %s left non-dict chat_template_kwargs unchanged",
+            _provider_label(provider_entry),
+        )
+        return body
     existing = body.get("chat_template_kwargs")
     if not isinstance(existing, dict):
         existing = {}
