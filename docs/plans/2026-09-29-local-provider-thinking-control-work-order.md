@@ -31,6 +31,9 @@ Bars:
 - A3 (reviewer-executed): crew-reviewer reruns A1 and A2 in its own detached worktree at the PR head and confirms the same exit codes.
 - A4 (human-gated deploy, NOT part of the build): only if A1-A3 pass, ryan-claude proposes to Ryan the live change `providers.spark.extra_body.chat_template_kwargs.enable_thinking: false` in `/opt/t1000/home/config.yaml` (edited as `sudo -u t1000`, never as root), with finn's vLLM counters (`request_success_total` by `finished_reason`, plus request count) snapshotted immediately before and 24 h after. Success = the `length` share over the 24 h window is at most HALF of the pre-change share (measured today at 83% over 24 h), reported with both absolute shares and request counts so a traffic-mix change is visible. If any path in A1 lacked the key, Stage A is dead and only Stage B ships.
 
+### Stage A outcome (build, 2026-09-29, BUILD-FINDINGS.md): DEAD as a deploy option
+A1 failed on the auxiliary path: `call_llm` copies `providers.<name>` base_url/api_key only, not `extra_body` (`_get_task_extra_body` reads `auxiliary.<task>.extra_body` plus the caller's argument). Main-agent and MoA paths did carry it. Since auxiliary calls are the bulk of finn's traffic, A4 is not proposed; only Stage B ships. The probe and fixtures stay: they are Stage B's wire evidence.
+
 ## 3. Stage B: engine-proof reasoning mapping for local providers (code)
 
 Goal: T1000's per-model reasoning setting (`none` / `low` / `medium` / `high` / `xhigh` / `max`) takes effect on vLLM AND TensorFold for local providers, with per-family vocabulary, on all three paths.
@@ -44,7 +47,7 @@ Spec:
         kind: chat_template_kwargs
         switch_key: enable_thinking        # DS4 uses: thinking
         effort_key: reasoning_effort       # omit to never send effort
-        effort_map: {low: low, medium: medium, high: xhigh, xhigh: xhigh, max: xhigh}
+        effort_map: {minimal: low, low: low, medium: medium, high: xhigh, xhigh: xhigh, max: xhigh, ultra: xhigh}
   ```
 - When a request targets a provider with `thinking_control.kind == chat_template_kwargs` and a `reasoning_config` is resolved:
   - `enabled: False` → `extra_body.chat_template_kwargs[switch_key] = False`; no effort key.
@@ -57,13 +60,13 @@ Spec:
 - At config load, a `thinking_control` block whose `effort_key` is set but whose `effort_map` does not cover every non-`none` effort `parse_reasoning_effort()` can return is logged once at WARNING, naming the provider and each missing effort (an unmapped effort at request time falls back to the template's default, which for Qwen is `xhigh`, the most expensive).
 
 Bars:
-- B1 (builder-executed): unit tests over the three builders × {`none`, `low`, `high`, `max`, an unknown effort} × {Qwen-style map, DS4-style map (`switch_key: thinking`, `effort_map: {high: high, xhigh: max, max: max}`)}: assert the exact `chat_template_kwargs` by equality (so `switch_key` is `false` for `none` and `true` for every other effort, and the mapped effort value is exact) and the ABSENCE of `reasoning` / `reasoning_effort` (seeded fixture: every case has a known expected body, so absence is asserted against a case that would carry the key if the guard were missing).
+- B1 (builder-executed): unit tests over the three builders × {`none`, `low`, `high`, `max`, an unknown effort} × {Qwen-style map, DS4-style map (`switch_key: thinking`, `effort_map: {minimal: high, low: high, medium: high, high: high, xhigh: max, max: max, ultra: max}`)}: assert the exact `chat_template_kwargs` by equality (so `switch_key` is `false` for `none` and `true` for every other effort, and the mapped effort value is exact) and the ABSENCE of `reasoning` / `reasoning_effort` (seeded fixture: every case has a known expected body, so absence is asserted against a case that would carry the key if the guard were missing).
 - B1a (builder-executed, no effort key configured): a `thinking_control` block WITHOUT `effort_key` and an override of `low` / `high` must produce `chat_template_kwargs: {enable_thinking: true}` and NO `reasoning_effort` anywhere in the body (neither inside `chat_template_kwargs` nor top level).
 - B1b (builder-executed, merge precedence): a config/caller-supplied `chat_template_kwargs: {enable_thinking: true}` plus an override of `none` must produce `enable_thinking: true` on the wire (caller wins); and a caller-supplied `chat_template_kwargs: {foo: 1}` plus override `low` must produce `{foo: 1, enable_thinking: true, reasoning_effort: low}` (merge, not replace).
 - B2 (builder-executed): the Stage A probe extended to Stage B, with the main-agent path exercised BOTH streaming and non-streaming (every request-building branch in `chat_completions.py` the probe can reach): stub provider with the Qwen-style `thinking_control`, override `none` → captured body has `enable_thinking: false`; override `low` → `enable_thinking: true, reasoning_effort: low`; T1000 default `high` → `reasoning_effort: xhigh`, never `high`.
 - B3 (builder-executed): unmapped effort (e.g. `minimal`) → no effort key in the captured body, and a WARNING naming the dropped value is logged for that call (asserted with a log capture scoped to the single call).
 - B4 (reviewer-executed): mutation proofs, each failing at an assertion (rc=1, not a collection error): (i) delete the `effort_map` lookup so raw E passes through → B1/B2 fail; (ii) re-enable the legacy `reasoning` object → B1 fails; (iii) swap the merge order so generated keys overwrite caller keys → B1b fails; (iv) remove the helper call from `chat_completions.py` only → the main-agent case of B2 fails because the captured main-agent body lacks `chat_template_kwargs.enable_thinking`, while the auxiliary and MoA cases in the same run still pass (the reviewer reports both outcomes; a run where everything fails, or where the failure is a crash, does not count as this proof).
-- B5 (reviewer-executed): for a provider WITHOUT `thinking_control`, the request body is byte-identical to fork/main's for the same inputs (golden captured on fork/main by the probe, committed as a fixture).
+- B5 (reviewer-executed): for a provider WITHOUT `thinking_control`, the request body equals fork/main's for the same inputs. Portable comparison: every field compared exactly EXCEPT the text of the system message, which embeds the host OS, the probe's HERMES_HOME path and the date and is replaced by a fixed placeholder on both sides before comparing (the committed goldens are captured on fork/main code and masked the same way). The test must pass on a Linux runner as well as on the Mac.
 - B7 (builder-executed): a config with `effort_map: {low: low}` produces the load-time WARNING naming the missing efforts; the full Qwen and DS4 maps in this order produce none.
 - B6 (reviewer-executed): the repo's own test runner, `scripts/run_tests.sh` on the touched test files plus `tests/agent/test_auxiliary_client.py`, is green, and nothing previously passing now fails.
 
