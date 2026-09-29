@@ -278,6 +278,16 @@ def test_b5_golden_bytes_without_thinking_control(tmp_path):
     assert saved != committed
 
 
+def _write_config(home: Path, payload: dict) -> None:
+    import yaml
+
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 def _write_provider(home: Path, block: dict) -> None:
     import yaml
 
@@ -343,3 +353,193 @@ def test_b7_partial_map_warns_and_complete_map_does_not(tmp_path, monkeypatch, c
             if rec.name == "agent.thinking_control" and "effort_map is missing" in rec.getMessage()
         ]
         assert printed == [], name
+
+
+def test_b8_requested_model_override_beats_the_main_model(tmp_path, monkeypatch):
+    """Aux and MoA with no caller reasoning_config use the requested model's override.
+
+    Main model x-ai/grok-main plus a global high must not leak onto spark-qwen,
+    whose override is none. A second local model with no override gets high
+    mapped through the Qwen map (xhigh). An explicit caller config still wins.
+    """
+    from hermes_constants import resolve_reasoning_config
+
+    home = tmp_path / "b8"
+    _write_config(
+        home,
+        {
+            "model": "x-ai/grok-main",
+            "agent": {
+                "reasoning_effort": "high",
+                "reasoning_overrides": {"spark-qwen": "none"},
+            },
+            "providers": {
+                "spark": {
+                    "base_url": STUB_URL,
+                    "api_key": "stub-key",
+                    "thinking_control": QWEN,
+                }
+            },
+        },
+    )
+    cfg = _load_fresh(monkeypatch, home)
+    assert resolve_reasoning_config(cfg, "") == {"enabled": True, "effort": "high"}
+    assert resolve_reasoning_config(cfg, "spark-qwen") == {"enabled": False}
+    assert resolve_reasoning_config(cfg, "spark-plain") == {"enabled": True, "effort": "high"}
+
+    messages = [{"role": "user", "content": "ping"}]
+
+    def wire(model: str, **extra):
+        kwargs = _build_call_kwargs(
+            "spark",
+            model,
+            messages,
+            base_url=STUB_URL,
+            **extra,
+        )
+        body = kwargs.get("extra_body") or {}
+        assert "reasoning" not in body
+        assert "reasoning_effort" not in kwargs
+        return body.get("chat_template_kwargs")
+
+    assert wire("spark-qwen") == {"enable_thinking": False}
+    assert wire("spark-qwen", task="moa_reference") == {"enable_thinking": False}
+    assert wire("spark-plain") == {"enable_thinking": True, "reasoning_effort": "xhigh"}
+    assert wire("spark-plain", task="moa_reference") == {
+        "enable_thinking": True,
+        "reasoning_effort": "xhigh",
+    }
+    assert wire("spark-qwen", reasoning_config={"enabled": True, "effort": "low"}) == {
+        "enable_thinking": True,
+        "reasoning_effort": "low",
+    }
+
+
+def test_b9_iteration_summary_maps_kwargs_on_the_socket(tmp_path, monkeypatch):
+    """The hand-built iteration-limit summary posts mapped kwargs to the stub."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    captured: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or "0")
+            raw = self.rfile.read(length)
+            body = json.loads(raw.decode("utf-8"))
+            captured.append(body)
+            payload = {
+                "id": "chatcmpl-stub",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "spark-qwen",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "pong"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+            data = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    host, port = server.server_address[:2]
+    assert host == "127.0.0.1"
+    base_url = f"http://127.0.0.1:{port}/v1"
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        home = tmp_path / "b9"
+        _write_config(
+            home,
+            {
+                "model": "spark-qwen",
+                "agent": {"reasoning_effort": "high"},
+                "providers": {
+                    "spark": {
+                        "base_url": base_url,
+                        "api_key": "stub-key",
+                        "thinking_control": QWEN,
+                    }
+                },
+            },
+        )
+        _load_fresh(monkeypatch, home)
+        from agent.chat_completion_helpers import handle_max_iterations
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            provider="spark",
+            api_key="stub-key",
+            base_url=base_url,
+            api_mode="chat_completions",
+            model="spark-qwen",
+            reasoning_config={"enabled": True, "effort": "high"},
+            quiet_mode=True,
+            skip_memory=True,
+            skip_context_files=True,
+            skip_background_review=True,
+            max_iterations=2,
+            save_trajectories=False,
+        )
+        try:
+            text = handle_max_iterations(
+                agent,
+                [{"role": "user", "content": "ping"}],
+                2,
+            )
+        finally:
+            close = getattr(agent, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        assert text == "pong"
+        posted = [body for body in captured if isinstance(body, dict) and body.get("messages")]
+        assert posted, "stub socket received no summary request"
+        for body in posted:
+            assert body.get("chat_template_kwargs") == {
+                "enable_thinking": True,
+                "reasoning_effort": "xhigh",
+            }
+            assert "reasoning" not in body
+            assert "reasoning_effort" not in body
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_b10_nondict_caller_kwargs_reach_the_wire_unchanged(monkeypatch, caplog):
+    _install(monkeypatch, QWEN)
+    with caplog.at_level(logging.WARNING, logger="agent.thinking_control"):
+        kwargs = _build_call_kwargs(
+            "stub",
+            "stub-model",
+            [{"role": "user", "content": "ping"}],
+            extra_body={"chat_template_kwargs": "x", "keep": 1},
+            reasoning_config=_reasoning("low"),
+            base_url=STUB_URL,
+        )
+    extra = kwargs["extra_body"]
+    assert extra["chat_template_kwargs"] == "x"
+    assert extra.get("keep") == 1
+    assert "reasoning" not in extra
+    assert "enable_thinking" not in extra
+    warnings = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "agent.thinking_control" and "non-dict" in rec.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "stub" in warnings[0]
