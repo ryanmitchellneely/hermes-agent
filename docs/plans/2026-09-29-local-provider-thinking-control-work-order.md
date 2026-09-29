@@ -18,17 +18,18 @@ Goal: stop Flash-Next from thinking on T1000 calls today, with no code change, i
 
 Spec:
 - A probe script, `scripts/probe_provider_wire_body.py`, starts a local stub OpenAI-compatible server on 127.0.0.1 (stdlib `http.server`) that records each request body verbatim to a JSONL file and answers with a minimal valid chat completion. The script writes a temporary `HERMES_HOME` whose `config.yaml` declares provider `stub` pointing at the stub, with `extra_body: {chat_template_kwargs: {enable_thinking: false}}`, and drives three real call paths against it:
-  (a) one auxiliary call (e.g. `title_generation` routed to `stub`);
-  (b) one main-agent turn with `model.provider: stub`;
-  (c) one MoA reference call with `stub` as a reference model and `max_tokens: 4096`.
+  (a) one auxiliary call through the real public entry `agent.auxiliary_client.call_llm(...)` (task `title_generation` routed to `stub`);
+  (b) one main-agent turn through the real agent entry that uses `agent/transports/chat_completions.py` (a single-turn `AIAgent`/`run_agent` invocation with `model.provider: stub`);
+  (c) one MoA reference call through `agent/moa_loop.py`'s public entry with `stub` as a reference model and `max_tokens: 4096`. MoA builds its requests via `call_llm` (`agent/moa_loop.py:20`, `:477`), so (c) must also go through that function, not around it.
+  The probe must NOT construct any request body itself. Config reaches the code only through the temporary `HERMES_HOME` the real loader reads (env var `HERMES_HOME`), and the only thing the probe inspects is what the stub server received on the socket.
 - It prints, per path, the captured body's top-level keys, `chat_template_kwargs`, `reasoning`, `reasoning_effort` and `max_tokens`, and exits non-zero unless all three captured bodies carry `chat_template_kwargs.enable_thinking == false`.
 - It never touches `/opt/t1000/home` and never uses the network beyond 127.0.0.1.
 
 Bars:
 - A1 (builder-executed): the probe runs green on this branch and the three captured bodies are committed as a fixture (`tests/fixtures/provider_wire_body/*.json`).
-- A2 (builder-executed, negative): with the `extra_body` removed from the temp config, the probe exits non-zero and names which path lacks the key. Proves the probe can fail.
+- A2 (builder-executed, negative): the ONLY change is deleting the `extra_body` block from the temp `config.yaml`. The probe must then exit non-zero and name every path whose captured body lacks the key. Proves both that the probe can fail and that the key in A1 came from config, not from the probe.
 - A3 (reviewer-executed): crew-reviewer reruns A1 and A2 in its own detached worktree at the PR head and confirms the same exit codes.
-- A4 (human-gated deploy, NOT part of the build): only if A1-A3 pass, ryan-claude proposes to Ryan the live change `providers.spark.extra_body.chat_template_kwargs.enable_thinking: false` in `/opt/t1000/home/config.yaml` (edited as `sudo -u t1000`, never as root), with finn's vLLM counters (`request_success_total` by `finished_reason`) captured before and 24 h after. Success = `length` share below 20% (Fable test 2). If any path in A1 lacked the key, Stage A is dead and only Stage B ships.
+- A4 (human-gated deploy, NOT part of the build): only if A1-A3 pass, ryan-claude proposes to Ryan the live change `providers.spark.extra_body.chat_template_kwargs.enable_thinking: false` in `/opt/t1000/home/config.yaml` (edited as `sudo -u t1000`, never as root), with finn's vLLM counters (`request_success_total` by `finished_reason`, plus request count) snapshotted immediately before and 24 h after. Success = the `length` share over the 24 h window is at most HALF of the pre-change share (measured today at 83% over 24 h), reported with both absolute shares and request counts so a traffic-mix change is visible. If any path in A1 lacked the key, Stage A is dead and only Stage B ships.
 
 ## 3. Stage B: engine-proof reasoning mapping for local providers (code)
 
@@ -51,14 +52,15 @@ Spec:
   - Also set top-level `reasoning_effort` ONLY when `thinking_control.top_level_effort: true` (default false). Both engines accept `chat_template_kwargs`, and one form is enough.
   - The legacy `extra_body.reasoning` object is NOT sent for such providers.
   - Caller- or config-supplied `chat_template_kwargs` keys win over generated ones: merge, don't overwrite.
-- Applies in all three builders: `agent/auxiliary_client.py` (`_build_call_kwargs`), `agent/transports/chat_completions.py` (main agent), and the MoA reference/aggregator calls (`agent/moa_loop.py`, which routes through one of the above; confirm which, and cover it).
+- One shared helper, `agent/thinking_control.py::apply_thinking_control(extra_body, reasoning_config, provider_entry) -> dict`, holds all of the mapping logic. It is called from exactly two request builders: `agent/auxiliary_client.py::_build_call_kwargs` (auxiliary tasks AND MoA reference/aggregator calls, which reach it via `call_llm`: `agent/moa_loop.py:20`, `:477`) and `agent/transports/chat_completions.py` (main agent). No mapping logic lives in either builder.
 - Providers without `thinking_control` behave exactly as today (byte-identical request bodies; bar B5).
 
 Bars:
 - B1 (builder-executed): unit tests over the three builders × {`none`, `low`, `high`, `max`, an unknown effort} × {Qwen-style map, DS4-style map (`switch_key: thinking`, `effort_map: {high: high, xhigh: max, max: max}`)}: assert the exact `chat_template_kwargs` and the ABSENCE of `reasoning` / `reasoning_effort` (seeded fixture: every case has a known expected body, so absence is asserted against a case that would carry the key if the guard were missing).
+- B1b (builder-executed, merge precedence): a config/caller-supplied `chat_template_kwargs: {enable_thinking: true}` plus an override of `none` must produce `enable_thinking: true` on the wire (caller wins); and a caller-supplied `chat_template_kwargs: {foo: 1}` plus override `low` must produce `{foo: 1, enable_thinking: true, reasoning_effort: low}` (merge, not replace).
 - B2 (builder-executed): the Stage A probe extended to Stage B: stub provider with the Qwen-style `thinking_control`, override `none` → captured body has `enable_thinking: false`; override `low` → `enable_thinking: true, reasoning_effort: low`; T1000 default `high` → `reasoning_effort: xhigh`, never `high`.
 - B3 (builder-executed): unmapped effort (e.g. `minimal`) → no effort key and exactly one WARNING log line.
-- B4 (reviewer-executed): mutation proofs, each failing at an assertion (rc=1, not a collection error): (i) delete the `effort_map` lookup so raw E passes through → B1/B2 fail; (ii) re-enable the legacy `reasoning` object → B1 fails; (iii) swap the merge order so generated keys overwrite caller keys → a dedicated merge test fails.
+- B4 (reviewer-executed): mutation proofs, each failing at an assertion (rc=1, not a collection error): (i) delete the `effort_map` lookup so raw E passes through → B1/B2 fail; (ii) re-enable the legacy `reasoning` object → B1 fails; (iii) swap the merge order so generated keys overwrite caller keys → B1b fails; (iv) remove the helper call from `chat_completions.py` only → the main-agent case of B2 fails (proves each builder is covered independently).
 - B5 (reviewer-executed): for a provider WITHOUT `thinking_control`, the request body is byte-identical to fork/main's for the same inputs (golden captured on fork/main by the probe, committed as a fixture).
 - B6 (reviewer-executed): the repo's own test runner, `scripts/run_tests.sh` on the touched test files plus `tests/agent/test_auxiliary_client.py`, is green, and nothing previously passing now fails.
 
@@ -73,4 +75,4 @@ Bars:
 
 ## 5. Deploy notes (steer, after review; human-gated)
 
-The live VPS runs `/opt/t1000/src` on branch `ryan/herald-0.20-cutover` (local HEAD `aba713606`, with uncommitted edits), not `fork/main`. Stage B therefore lands in two steps: a PR to `fork/main`, then a cherry-pick onto the running branch in an announced window, as `sudo -u t1000`. Config for `spark` (Qwen map) and the DS4 provider (DS4 map) is added at the same time. Measure finn's `finished_reason` split before and 24 h after.
+The live VPS runs `/opt/t1000/src` on branch `ryan/herald-0.20-cutover` (local HEAD `aba713606`, with uncommitted edits), not `fork/main`. Stage B therefore lands in two steps: a PR to `fork/main`, then a cherry-pick onto the running branch in an announced window, as `sudo -u t1000`. Ordering: (1) before the cherry-pick, verify the RUNNING code ignores an unknown provider key by loading a copy of the live config with a `thinking_control` block through the running branch's config loader in a throwaway `HERMES_HOME` (no error, no behavior change); (2) cherry-pick and restart; (3) confirm the running code reports the new helper active; (4) only then add `thinking_control` for `spark` (Qwen map) and the DS4 provider (DS4 map). Rollback = remove the config block first, then revert the commit. Measure finn's `finished_reason` split before and 24 h after, same rule as A4.
